@@ -2999,8 +2999,9 @@ move_oauth_account() {  # move_oauth_account <target-config-dir> <target-label>
   if [[ ! -f "$mine" ]]; then
     # A fresh machine has no ~/.claude.json until the first bare `claude` run.
     # The pointer IS the switch, so create the file with nothing but the claim;
-    # Claude Code fills in the rest on its next launch (mode 600 like its own).
-    if ! (umask 077 && printf '{}\n' > "$mine"); then
+    # Claude Code fills in the rest on its next launch (it holds no secret: the
+    # credential lives in the seat dir, so the CLI's own 644 is fine).
+    if ! printf '{}\n' > "$mine"; then
       die "cannot switch: ~/.claude.json does not exist and could not be created. Nothing was changed."
     fi
     printf 'created ~/.claude.json (it did not exist yet: fresh machine) to hold the active-seat pointer\n' >&2
