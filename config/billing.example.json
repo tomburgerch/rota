@@ -1,0 +1,61 @@
+{
+  "_comment": "Billing facts for your seat pool. Quota is measured live by rota-engine.sh; THIS file holds the half that no API exposes: what each seat costs and when it renews. Copy it to $CFG_DIR/billing.json (default ~/.config/claude-failover/billing.json) and keep it in step with reality. A wrong renewal date here is worse than none, because it reads as measured.",
+
+  "_fields": {
+    "accounts": "Keyed by the seat's login email, exactly as `rota usage --json` reports it in the `email` field. Seats missing here still show in the table, flagged 'billing unknown'.",
+    "plan": "Free text, the plan name as shown on the billing page (e.g. 'Max 5x', 'Max 20x').",
+    "renews_day": "Day of month (1-31) the seat is charged. The next charge is that day in the next month the seat is still active.",
+    "amount_display": "What was actually charged, including tax, in the currency billed. Shown verbatim in the table.",
+    "usd_approx": "Number, USD, used only for the monthly total.",
+    "status": "'active' or 'cancelled'. A cancelled seat needs `ends`.",
+    "ends": "ISO date (YYYY-MM-DD) after which a cancelled seat stops working. Only used for cancelled seats; a charge that would land on or after this date is dropped from the total.",
+    "source": "Free text: where you read the numbers from and when, so the next person knows how stale they are.",
+    "not_in_the_pool": "Optional. Seats you pay for but do NOT pool (a family member's Pro seat, say). Never read by rota; listed so nobody counts that receipt as a pool seat."
+  },
+
+  "_how_to_re_measure": [
+    "PREFERRED: the receipt emails. The ACCOUNT is the recipient address of the receipt. The receipt BODY never names the seat, it lists only the payer, so scraping bodies mis-attributes every row.",
+    "TRAP: a mail client's conversation date may be last-activity, not the message date. Use the message's own delivered time.",
+    "FALLBACK: the billing page. Sign in as the seat, Settings > Billing. Needed for any seat whose receipts do not reach a mailbox you read.",
+    "Renewal is a DAY OF MONTH, so the next charge is that day in the next month the seat is still active."
+  ],
+
+  "currency_note": "amount_display is what was actually charged, including tax and in the currency billed. usd_approx is only for totalling.",
+
+  "accounts": {
+    "work@example.com": {
+      "plan": "Max 20x",
+      "renews_day": 7,
+      "amount_display": "$200.00",
+      "usd_approx": 200.00,
+      "status": "active",
+      "source": "receipt emails, two consecutive months"
+    },
+    "personal@example.com": {
+      "plan": "Max 5x",
+      "renews_day": 15,
+      "amount_display": "$100.00",
+      "usd_approx": 100.00,
+      "status": "active",
+      "source": "billing page, read on the 15th"
+    },
+    "team@example.com": {
+      "plan": "Max 20x",
+      "renews_day": 1,
+      "amount_display": "EUR 180.00",
+      "usd_approx": 200.00,
+      "status": "cancelled",
+      "ends": "2026-10-01",
+      "source": "billing page; cancelled, runs until the end date"
+    }
+  },
+
+  "not_in_the_pool": {
+    "family@example.com": {
+      "plan": "Pro",
+      "renews_day": 22,
+      "amount_display": "$20.00",
+      "note": "Somebody else's own seat. Listed so nobody counts it as a pool seat or wonders what the 22nd receipt is."
+    }
+  }
+}

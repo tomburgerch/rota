@@ -1,0 +1,26 @@
+# rota accounts file: the roster of seats this machine may launch on.
+#
+# Install at ~/.config/claude-failover/accounts (or wherever CLAUDE_FAILOVER_HOME
+# points), one seat per line:
+#
+#     <label>|<config_dir>
+#
+#   label       the email the seat is logged in as. It is what `rota usage`,
+#               `rota switch` and the accounts map key on, and `rota reconcile`
+#               rewrites it from the dir's own identity if the two ever drift.
+#   config_dir  the CLAUDE_CONFIG_DIR that seat lives in. One dir per seat,
+#               under one pool root, with no spaces anywhere in the path. The
+#               dir's basename is the alias you type: `rota switch work`.
+#
+# Order matters: put the seat whose weekly window resets SOONEST first, so its
+# headroom is spent before it expires. Lines starting with # and blank lines
+# are ignored. `rota pool-init` creates every dir listed here (and the shared
+# settings/transcript links inside it) but never touches a credential; each
+# seat is logged in once with `rota login <alias>`.
+#
+# Replace the emails below with the seats you own and pay for. Two or three
+# rows is typical; the tool has no upper limit.
+
+personal@example.com|~/.claude-pool/personal
+work@example.com|~/.claude-pool/work
+team@example.com|~/.claude-pool/team

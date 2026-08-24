@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.rota.cred-guard</string>
+
+    <!-- __ROTA_HOME__ is the checkout this file was rendered from (install.sh
+         substitutes it, along with __HOME__). The job runs the script in place,
+         so a `git pull` of the checkout ships fixes with no reinstall. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-lc</string>
+        <string>exec __ROTA_HOME__/lib/rota-cred-guard.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__</string>
+
+    <!-- launchd hands a job PATH=/usr/bin:/bin:/usr/sbin:/sbin, where jq does
+         not resolve on an older macOS and neither does anything in
+         ~/.local/bin. That exact omission silently killed an overnight job
+         once (2026-08-07), so the PATH is set BOTH here and inside the script. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:__HOME__/.local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+    </dict>
+
+    <!-- Every 5 minutes. The window that matters is between a token rotation
+         and the next thing that could invalidate it, which is minutes, not
+         hours. The run is cheap and idempotent: it only writes when a
+         credential's BYTES changed, so a quiet box does a handful of shasums
+         and exits. launchd runs one instance per label at a time, so runs can
+         never overlap. -->
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <!-- Snapshot immediately on load/boot, so a reboot cannot land between the
+         last rotation and the first scheduled run with nothing archived. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/rota/cred-guard.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/rota/cred-guard.err.log</string>
+</dict>
+</plist>

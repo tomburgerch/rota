@@ -1,0 +1,80 @@
+# keeper.conf: knobs for rota-keeper.sh, the 10-minute launchd daemon.
+#
+# Location: $CLAUDE_FAILOVER_HOME/keeper.conf, i.e. ~/.config/claude-failover/
+# keeper.conf by default (install.sh copies this file there when none exists).
+# The file is SOURCED by bash, so keep it to KEY=value lines. Every knob below
+# is shown with its default; a knob set in the ENVIRONMENT wins over this file,
+# so a one-off run can override without editing anything:
+#
+#   AUTO_SWITCH_PCT=95 rota keeper
+#
+# Seats are referred to by the label in the accounts file (an email).
+
+# ── the whole daemon ────────────────────────────────────────────────────────
+
+# 1 = every tick exits immediately after writing "disabled" to keeper-status.
+# The launchd job stays loaded; this is the pause switch.
+KEEPER_DISABLE=0
+
+# A keeper lock (keeper.lock in the config dir) older than this many seconds
+# is treated as a crashed run's and taken over, but only when the pid it
+# recorded is genuinely gone. A live pid with an old lock is a long tick.
+KEEPER_LOCK_STALE_SECS=1800
+
+# ── auto-switch (step 4) ────────────────────────────────────────────────────
+
+# When the ACTIVE seat's weekly OR five-hour utilization reaches this percent,
+# the keeper moves the launch pointer to another seat.
+AUTO_SWITCH_PCT=90
+
+# 1 = after switching, restart IDLE panes so they pick up the new seat at once
+# (mid-work panes are never touched; step 4b catches them once they go idle).
+AUTO_SWITCH_RESTART_IDLE=1
+
+# Target selection. The pick is the seat whose weekly window resets SOONEST
+# among the seats that pass both of these gates (weekly quota is
+# use-it-or-lose-it, so the seat expiring next is the one to burn first):
+#   never switch ONTO a seat whose weekly utilization is above this percent
+AUTO_SWITCH_TARGET_MAX_PCT=80
+#   never switch onto a seat with less than this percent of its weekly
+#   allowance LEFT (30 means "at most 70% spent")
+AUTO_SWITCH_TARGET_MIN_LEFT_PCT=30
+
+# Hysteresis: never switch back onto the seat just left within this many
+# seconds, so two seats near the wall cannot ping-pong every tick.
+AUTO_SWITCH_BOUNCE_SECS=1800
+
+# ── pane convergence (step 4b, tmux only) ───────────────────────────────────
+
+# 1 = each tick, restart idle tmux panes whose claude process is still pinned
+# to a seat other than the active one. 0 = never restart a pane automatically.
+PANE_CONVERGE=1
+
+# The tmux session whose panes converge. UNSET = pane convergence is a silent
+# no-op, which is the right default on a machine without a long-lived tmux
+# session. `export` it so the engine (a child process) sees it.
+#export ROTA_TMUX_SESSION=main
+
+# ── keepalive (step 2) ──────────────────────────────────────────────────────
+
+# 0 = never nudge dormant seats to rotate their access token. OFF by default
+# since 2026-08-16: measured over one day on two machines the nudge rotated
+# nothing in ~201 attempts and husked 23 credential files. Live sessions
+# refresh their own chains, so nothing is lost with it off. 1 restores the
+# old behaviour unchanged, for anyone who wants to validate a fix.
+KEEPALIVE_ENABLED=0
+
+# When enabled: nudge a dormant seat whose access token expires within this
+# many minutes.
+KEEPALIVE_MIN=90
+
+# ── window warming (step 6) ─────────────────────────────────────────────────
+
+# The five-hour window starts at the first request. At the first tick at or
+# after this local time (HH:MM), each cold seat gets exactly ONE minimal
+# request so a window opened at 03:00 has reset again by 08:00 and the
+# morning starts against a fresh one. Once per day per seat.
+WARM_AT=03:00
+
+# Which seats to warm: all | active
+WARM_ACCOUNTS=all

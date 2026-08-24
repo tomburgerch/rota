@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.rota.keeper</string>
+
+    <!-- __ROTA_HOME__ is the checkout this file was rendered from (install.sh
+         substitutes it, along with __HOME__). The job runs the script in place,
+         so a `git pull` of the checkout ships fixes with no reinstall. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-lc</string>
+        <string>exec __ROTA_HOME__/lib/rota-keeper.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__</string>
+
+    <!-- launchd hands a job PATH=/usr/bin:/bin:/usr/sbin:/sbin, where jq does
+         not resolve and neither does anything in ~/.local/bin. That exact
+         omission silently killed an overnight job once (2026-08-07), so the
+         PATH is set BOTH here and inside the script. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:__HOME__/.local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+    </dict>
+
+    <!-- Every 10 minutes. The tick is cheap when nothing needs doing (a
+         reconcile no-op, a handful of jq reads, one usage fetch per seat, well
+         under the ~1 call/min/token budget) and the keeper holds its own
+         lockfile, so an overlapping start exits immediately. -->
+    <key>StartInterval</key>
+    <integer>600</integer>
+
+    <!-- Run at load/boot too: the first tick after a reboot is what fixes a
+         stale map, refreshes the cache, and re-arms auto-switch for the day. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/rota/keeper.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/rota/keeper.err.log</string>
+</dict>
+</plist>

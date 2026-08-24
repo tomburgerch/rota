@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# rota: one command in front of a pool of Claude Code seats you own and pay for.
+#
+#   rota usage                measure every seat's quota live (alias: accounts)
+#   rota switch [seat]        point new launches at the best seat, or at <seat>
+#   rota login <seat>         open a claude session pinned to <seat> so you can /login
+#   rota billing              quota + renewal + cost, one table (--json, --local)
+#   rota status               seats, which is current, each login state
+#
+# Everything else is a thin passthrough to the lib scripts; `rota help` lists it all.
+set -uo pipefail
+
+# --- resolve our own physical path through the symlink chain -----------------
+# macOS has no reliable `readlink -f`, so walk it by hand (same idiom as the shim).
+_self="${BASH_SOURCE[0]}"
+while [ -h "$_self" ]; do
+  _d="$(cd -P "$(dirname "$_self")" 2>/dev/null && pwd)" || break
+  _link="$(readlink "$_self")" || break
+  case "$_link" in
+    /*) _self="$_link" ;;
+    *)  _self="$_d/$_link" ;;
+  esac
+done
+_selfdir="$(cd -P "$(dirname "$_self")" 2>/dev/null && pwd)" || _selfdir="$(pwd)"
+ROTA_ROOT="$(cd "$_selfdir/.." && pwd)"
+ROTA_LIB="${ROTA_LIB:-$ROTA_ROOT/lib}"
+export ROTA_ROOT ROTA_LIB
+
+CFG_DIR="${CLAUDE_FAILOVER_HOME:-$HOME/.config/claude-failover}"
+ACCOUNTS_FILE="$CFG_DIR/accounts"
+
+ENGINE="$ROTA_LIB/rota-engine.sh"
+KEEPER="$ROTA_LIB/rota-keeper.sh"
+GUARD="$ROTA_LIB/rota-cred-guard.sh"
+BILLING="$ROTA_LIB/rota-billing.sh"
+
+die() { printf 'rota: %s\n' "$*" >&2; exit "${2:-1}"; }
+
+need() { [ -x "$1" ] || die "missing or not executable: $1 (is this a complete checkout?)" 1; }
+
+usage_text() {
+  cat <<'H'
+rota <verb> [args]
+
+  usage | accounts       measure every seat's quota live (--json, --no-refresh)
+  switch [seat]          bare: switch to the best seat; with a seat: switch-all <seat> [flags]
+  login <seat>           open `claude` pinned to <seat>'s config dir so you can run /login
+  billing [--json]       quota + renewal + cost in one table (--local reads this box)
+  status                 seats, which is current, each login state
+  keeper-status          last keeper tick + the tail of keeper.log
+  keeper                 run one keeper tick now
+  cred-guard             run the credential guard once
+  cred-restore <seat>    restore <seat>'s credential from its backup
+  reconcile              rewrite the accounts file from the dirs' real identities
+  normalize              untangle two pool dirs holding each other's seats
+  pool-init              create ~/.claude-pool dirs + the accounts file from $CFG_DIR/accounts
+  adopt-shared           adopt the shared ~/.claude identity into the pool
+  pane-converge          re-pin tmux panes to the current seat (no-op without ROTA_TMUX_SESSION)
+  repair-nested          repair a pool dir nested inside another
+  roster                 print the seat roster
+  active                 print the seat new launches will use
+  next                   print the seat the picker would choose
+  failover <verb...>     raw passthrough to the engine
+  help                   this text
+  version                print the rota version
+H
+}
+
+# --- login: resolve a seat to its config dir --------------------------------
+# The accounts file is `<label>|<dir>` per line. A seat may be given as the
+# label (usually the login email) or as the dir's basename (the alias, e.g.
+# `work`). `~` in the dir is expanded.
+resolve_seat_dir() {
+  local seat="$1" label dir
+  [ -f "$ACCOUNTS_FILE" ] || return 1
+  while IFS='|' read -r label dir; do
+    label="${label// }"; dir="${dir// }"
+    [ -z "$label" ] || [ "${label:0:1}" = "#" ] && continue
+    dir="${dir/#\~/$HOME}"
+    if [ "$label" = "$seat" ] || [ "$(basename "$dir")" = "$seat" ]; then
+      printf '%s\n' "$dir"; return 0
+    fi
+  done < "$ACCOUNTS_FILE"
+  return 1
+}
+
+cmd_login() {
+  local seat="${1:-}"; [ -n "$seat" ] || die "usage: rota login <seat>" 2
+  local dir
+  if [ ! -f "$ACCOUNTS_FILE" ]; then
+    die "no accounts file at $ACCOUNTS_FILE. Copy $ROTA_ROOT/config/accounts.example to $ACCOUNTS_FILE and edit it, then re-run." 2
+  fi
+  dir="$(resolve_seat_dir "$seat")" || die "seat '$seat' is not in $ACCOUNTS_FILE (labels and dir basenames both work)" 2
+  if [ ! -d "$dir" ]; then
+    # the seat is listed but its dir was never created: build the pool, then check again
+    need "$ENGINE"; "$ENGINE" pool-init || die "pool-init failed" 1
+    [ -d "$dir" ] || die "seat '$seat' resolves to $dir, which still does not exist after pool-init" 2
+  fi
+  printf 'rota: you are logging in seat %s (%s); run /login inside this session.\n' "$seat" "$dir"
+  exec env CLAUDE_CONFIG_DIR="$dir" claude
+}
+
+cmd_keeper_status() {
+  local st="$CFG_DIR/keeper-status" log="$CFG_DIR/keeper.log"
+  if [ -f "$st" ]; then cat "$st"; else echo "no keeper status at $st"; fi
+  echo
+  if [ -f "$log" ]; then tail -20 "$log"; else echo "no keeper log at $log"; fi
+}
+
+verb="${1:-help}"; [ $# -gt 0 ] && shift
+case "$verb" in
+  help|-h|--help)   usage_text ;;
+  version|--version) cat "$ROTA_ROOT/VERSION" ;;
+  usage|accounts)   need "$ENGINE"; exec "$ENGINE" usage "$@" ;;
+  switch)
+    need "$ENGINE"
+    # bare, or flags only (e.g. --dry-run): let the picker choose; a seat name first: switch-all
+    case "${1:-}" in ""|-*) exec "$ENGINE" switch-auto "$@" ;; esac
+    exec "$ENGINE" switch-all "$@" ;;
+  login)            cmd_login "$@" ;;
+  billing)          need "$BILLING"; exec "$BILLING" "$@" ;;
+  status)           need "$ENGINE"; exec "$ENGINE" status "$@" ;;
+  keeper-status)    cmd_keeper_status ;;
+  keeper)           need "$KEEPER"; exec "$KEEPER" "$@" ;;
+  cred-guard)       need "$GUARD"; exec "$GUARD" run "$@" ;;
+  cred-restore)     need "$GUARD"; [ $# -ge 1 ] || die "usage: rota cred-restore <seat>" 2; exec "$GUARD" restore "$@" ;;
+  reconcile|normalize|pool-init|adopt-shared|pane-converge|repair-nested|roster|active|next)
+                    need "$ENGINE"; exec "$ENGINE" "$verb" "$@" ;;
+  failover)         need "$ENGINE"; exec "$ENGINE" "$@" ;;
+  *)                printf 'rota: unknown verb: %s\n\n' "$verb" >&2; usage_text >&2; exit 2 ;;
+esac
