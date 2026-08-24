@@ -27,7 +27,7 @@ Requirements: macOS (launchd is used for the daemon; the CLI itself also runs on
 git clone https://github.com/tomburgerch/rota ~/.local/share/rota && ~/.local/share/rota/install.sh
 ```
 
-The installer symlinks `rota` and the `claude` shim into `~/.local/bin`, creates `~/.config/claude-failover/`, and installs two launchd agents (the keeper, every 10 min, and a credential watchdog, every 5 min). It tells you if `~/.local/bin` is not ahead of the real `claude` on your `PATH`; that ordering is the whole trick, so fix it before going on. `install.sh --uninstall` reverses everything and leaves your logins alone.
+The installer symlinks `rota` and the `claude` shim into `~/.local/bin`, creates `~/.config/claude-failover/`, and installs two launchd agents (the keeper, every 10 min, and a credential watchdog, every 5 min). It tells you if `~/.local/bin` is not ahead of the real `claude` on your `PATH`; that ordering is the whole trick, so fix it before going on. `install.sh --uninstall` reverses everything and leaves your logins alone; `install.sh --no-agents` installs the commands and the shim without the daemons, for a box you only want to switch by hand.
 
 Then describe your seats, one per line, as `<label>|<directory>`:
 
