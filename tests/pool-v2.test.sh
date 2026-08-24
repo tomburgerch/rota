@@ -1023,10 +1023,13 @@ rm -f "$RUN/.claude.json"                      # no claim file at all
 set +e
 OUT="$(bash "$FAILOVER" switch-all wk 2>&1)"; RC=$?
 set -e
-[ "$RC" -ne 0 ] && grep -q 'no claim to rewrite' <<<"$OUT" \
-  && [ -f "$RUN/.claude/.credentials.json" ] \
-  && ok "pointer-die → a missing ~/.claude.json dies before deletion too" \
-  || bad "pointer-die → no-root branch (got $RC: $OUT)"
+# a fresh machine has no ~/.claude.json yet: the switch creates it (0600) holding
+# only the claim, so the README flow works before the first bare `claude` run
+[ "$RC" -eq 0 ] && grep -q 'created ~/.claude.json' <<<"$OUT" \
+  && [ "$(jq -r '.oauthAccount.emailAddress' "$RUN/.claude.json" 2>/dev/null)" = "wk@example.com" ] \
+  && [ "$(stat -f %Lp "$RUN/.claude.json")" = "600" ] \
+  && ok "pointer-die → a missing ~/.claude.json is CREATED with the claim (fresh machine), mode 600" \
+  || bad "pointer-die → fresh-machine branch (got $RC: $OUT; file: $(cat "$RUN/.claude.json" 2>/dev/null || echo absent))"
 
 # ── 8g. keeper lock takeover needs a DEAD pid (finding 7) ────────────────────
 mk_pool lockalive

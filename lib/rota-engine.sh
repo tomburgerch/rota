@@ -1791,7 +1791,7 @@ cmd_pool_init() {
   else
     printf 'pool-init: %d dir(s) created, %d link(s) made for %d seat(s) in %s. No credentials were created or touched.\n' \
       "$made" "$linked" "$seats" "$(tilde "$ACCOUNTS_FILE")"
-    printf 'Next: `rota adopt-shared` moves this box'"'"'s shared login into its pool dir; every OTHER account needs one browser login: CLAUDE_CONFIG_DIR=<its dir> claude\n'
+    printf 'Next: `rota adopt-shared` moves this box'"'"'s shared login into its pool dir; every OTHER seat needs one browser login: rota login <seat>\n'
   fi
   return 0
 }
@@ -2994,10 +2994,16 @@ move_oauth_account() {  # move_oauth_account <target-config-dir> <target-label>
     die "cannot move the active-account pointer: jq is missing (brew install jq). Nothing was changed, the pointer IS the switch under pool v2, so there is no partial fallback."
   fi
   if [[ ! -f "$tgt_cfg" ]] || [[ -z "$(jq -r '.oauthAccount.emailAddress // empty' "$tgt_cfg" 2>/dev/null || true)" ]]; then
-    die "cannot switch to $tlabel: $(tilde "$tgt_cfg") has no oauthAccount to copy, that dir has never completed a login. Log it in once (CLAUDE_CONFIG_DIR=$(tilde "$tdir") claude → /login), then re-run. Nothing was changed."
+    die "cannot switch to $tlabel: $(tilde "$tgt_cfg") has no oauthAccount to copy, that dir has never completed a login. Log it in once (rota login $tlabel, then /login), then re-run. Nothing was changed."
   fi
   if [[ ! -f "$mine" ]]; then
-    die "cannot switch: ~/.claude.json does not exist, so there is no claim to rewrite, run a bare \`claude\` once (creates it), or adopt-shared on a fresh box. Nothing was changed."
+    # A fresh machine has no ~/.claude.json until the first bare `claude` run.
+    # The pointer IS the switch, so create the file with nothing but the claim;
+    # Claude Code fills in the rest on its next launch (mode 600 like its own).
+    if ! (umask 077 && printf '{}\n' > "$mine"); then
+      die "cannot switch: ~/.claude.json does not exist and could not be created. Nothing was changed."
+    fi
+    printf 'created ~/.claude.json (it did not exist yet: fresh machine) to hold the active-seat pointer\n' >&2
   fi
   # atomic: temp file in the SAME dir, then mv
   tmp="$mine.failover-tmp.$$"
