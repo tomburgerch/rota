@@ -295,6 +295,13 @@ unset TMUX_PANE
 # the surrounding shell would arm a peer in every scenario that never asked for
 # one. $CLAUDE_FAILOVER_HOME already points the peers FILE at the fake cfg dir.
 unset ROTA_PEERS
+# Nor the operator's own billing/hand-measurement files. `usage` reads both now
+# (seat status, end dates, dated `boosts`, recorded readings), and both default
+# inside $CFG_DIR, which every scenario throws away, so the only way a REAL file
+# could reach this suite is an inherited override. A run that read one would
+# assert against somebody's live seats and change its answer on the day a boost
+# expires.
+unset CLAUDE_BILLING_JSON CLAUDE_HUMAN_USAGE
 
 # --- per-run fixture ----------------------------------------------------------
 # A fresh $HOME each run so state never leaks into the next scenario. v2 shape
@@ -361,10 +368,14 @@ trap 'restore_home; cleanup' EXIT
 active_block()  { awk '/^▶ ACTIVE/{f=1} f&&/^$/{exit} f'; }
 alt_block()     { awk '/^  ALTERNATIVES/{f=1;next} f&&/^$/{exit} f'; }
 unavail_block() { awk '/^  UNAVAILABLE/{f=1;next} f&&/^$/{exit} f'; }
-# How many ACCOUNT rows a report rendered: the ACTIVE header plus one ✓/✗ line
+# The FOURTH bucket (2026-08-25). "I have not measured this" is a statement about
+# the TOOL, not a verdict on the account, and filing it under UNAVAILABLE told
+# every reader the opposite of the truth about two cancelled-but-live seats.
+unmeasured_block() { awk '/^  UNMEASURED/{f=1;next} f&&/^$/{exit} f'; }
+# How many ACCOUNT rows a report rendered: the ACTIVE header plus one ✓/✗/? line
 # per other account. Alternation rather than a [✓✗] bracket expression, those
 # are multi-byte and BSD grep collapses them byte-wise outside a UTF-8 locale.
-rendered_rows() { grep -cE '^(▶ ACTIVE|  ✓ |  ✗ )' || true; }
+rendered_rows() { grep -cE '^(▶ ACTIVE|  ✓ |  ✗ |  \? )' || true; }
 # Any line that leads with "N% left · M% used" while NOT being one of the two
 # metered ACTIVE window rows. The metered rows lead with left deliberately (they
 # sit next to a bar whose filled cells ARE the left figure); every SENTENCE must
@@ -717,12 +728,26 @@ JSON_OUT="$("$SCRIPT" usage --no-refresh --json 2>/dev/null)"
 RC=$?
 set -e
 [ "$RC" -eq 0 ] && ok "expired cache → usage --no-refresh exits 0" || bad "expired cache → usage --no-refresh exits 0 (got $RC)"
-# The row lands in UNAVAILABLE, and its short reason is the expiry itself, an
-# already-reset cached window is not "old data", it is data from a window that no
-# longer exists, so that is the whole answer for why the row cannot be used.
-grep -q "weekly window expired" <<<"$(unavail_block <<<"$OUT")" \
-  && ok "expired cache → the row is UNAVAILABLE, reason 'weekly window expired'" \
-  || bad "expired cache → UNAVAILABLE with an expiry reason (got: $OUT)"
+# ⚠️ THIS ASSERTION WAS INVERTED ON PURPOSE, 2026-08-25. It used to require the
+# row to land in UNAVAILABLE reading "weekly window expired", and that wording
+# was load-bearing in the worst way: the string means "the number I have is
+# stale, go and measure it" and it READS as "this account is finished". Every
+# session believed it. Measured 2026-08-21 08:30, both cancelled-but-live seats
+# rendered exactly that while each still had roughly two more full weekly
+# refreshes of already-paid-for quota.
+#
+# A cached window that has ROLLED is not bad news about the account, the quota
+# behind it is new and simply unmeasured. So the row must NOT be under
+# UNAVAILABLE, and must not use the word "expired" about the account.
+! grep -q "wk@example.com" <<<"$(unavail_block <<<"$OUT")" \
+  && ok "expired cache → the row is NOT filed under UNAVAILABLE" \
+  || bad "expired cache → must not be UNAVAILABLE, a rolled window is not a dead seat (got: $OUT)"
+grep -q "unmeasured, may be full" <<<"$(unmeasured_block <<<"$OUT")" \
+  && ok "expired cache → it is UNMEASURED, and says the quota may be full" \
+  || bad "expired cache → UNMEASURED with an invitation to measure (got: $OUT)"
+! grep -q "weekly window expired" <<<"$OUT" \
+  && ok "expired cache → the word 'expired' never describes the ACCOUNT again" \
+  || bad "expired cache → 'weekly window expired' is back (got: $OUT)"
 ! grep -q "55% left" <<<"$OUT" \
   && ok "expired cache → the stale 55% (100-45) never renders" \
   || bad "expired cache → the stale 55% never renders (got: $OUT)"
@@ -733,6 +758,205 @@ cs_row="$(jq -c '.accounts[] | select(.email=="wk@example.com")' <<<"$JSON_OUT" 
 [ "$(jq -r '.weekly.remaining_pct' <<<"$cs_row" 2>/dev/null)" = "null" ] \
   && ok "expired cache (json) → weekly.remaining_pct is null, never the stale number" \
   || bad "expired cache (json) → weekly.remaining_pct is null (got: $cs_row)"
+
+# --- 10b. THE SEAT'S LIFECYCLE IS NOT A QUOTA FACT (2026-08-25) --------------
+#
+# The operator, 2026-08-21: two seats had been cancelled and were still
+# perfectly usable, with two or three more weekly refreshes each still to come,
+# and every session was writing them off.
+#
+# The two cases the fix has to tell apart, and they differ ONLY by a date:
+#   a cancelled seat whose window ROLLED  -> still live, quota unknown and very
+#                                            possibly full
+#   a cancelled seat past its END date    -> genuinely finished
+# A tool that cannot separate these writes off a live seat carrying two more
+# full weekly refreshes of already-paid-for quota, which is what happened.
+seed_cancelled_seat() {  # seed_cancelled_seat <ends-date>
+  mkdir -p "$RUN/.claude-pool/spare"
+  printf '{"claudeAiOauth":{"accessToken":"TOK-SPARE-SEAT"}}' > "$RUN/.claude-pool/spare/.credentials.json"
+  cat > "$RUN/cfg/accounts" <<EOF
+spare@example.com|$RUN/.claude-pool/spare
+EOF
+  # a cached weekly window that has ALREADY ROLLED, the exact state that used
+  # to render as "weekly window expired"
+  jq -n --arg wr "$(iso_in -2d)" --arg sr "$(iso_in +2H)" \
+    '{"spare@example.com":{wk_u:"45",wk_r:$wr,se_u:"20",se_r:$sr,ts:"stale fixture",ts_epoch:"0"}}' \
+    > "$RUN/cfg/usage-cache.json"
+  jq -n --arg ends "$1" \
+    '{accounts:{"spare@example.com":{plan:"Max 20x",status:"cancelled",ends:$ends}}}' \
+    > "$RUN/billing.json"
+}
+
+new_run seatlive
+seed_cancelled_seat "$(date -u -v+14d '+%Y-%m-%d')"
+set +e
+OUT="$(CLAUDE_BILLING_JSON="$RUN/billing.json" "$SCRIPT" usage --no-refresh 2>/dev/null)"
+JSON_OUT="$(CLAUDE_BILLING_JSON="$RUN/billing.json" "$SCRIPT" usage --no-refresh --json 2>/dev/null)"
+set -e
+! grep -q "spare@example.com" <<<"$(unavail_block <<<"$OUT")" \
+  && ok "cancelled seat, window rolled → NOT unavailable: the seat has not ended" \
+  || bad "cancelled seat, window rolled → must not be UNAVAILABLE (got: $OUT)"
+grep -q "spare@example.com" <<<"$(unmeasured_block <<<"$OUT")" \
+  && ok "cancelled seat, window rolled → filed under UNMEASURED instead" \
+  || bad "cancelled seat, window rolled → belongs in UNMEASURED (got: $OUT)"
+# ⚠️ The END DATE is the column that changes behaviour: for a cancelled seat the
+# question is never "is this any good", it is "how many weekly windows are left".
+grep -q "cancelled, quota until" <<<"$(unmeasured_block <<<"$OUT")" \
+  && ok "cancelled seat, window rolled → names the deadline that actually matters" \
+  || bad "cancelled seat → must name its end date (got: $OUT)"
+grep -q "rota usage --record spare" <<<"$(unmeasured_block <<<"$OUT")" \
+  && ok "cancelled seat, window rolled → hands over the exact command that answers it" \
+  || bad "cancelled seat → must name the command (got: $OUT)"
+[ "$(jq -r '.accounts[0].seat.ended' <<<"$JSON_OUT" 2>/dev/null)" = "false" ] \
+  && ok "cancelled seat, window rolled (json) → seat.ended is false" \
+  || bad "cancelled seat (json) → seat.ended false (got: $JSON_OUT)"
+[ "$(jq -r '.accounts[0].seat.status' <<<"$JSON_OUT" 2>/dev/null)" = "cancelled" ] \
+  && ok "cancelled seat, window rolled (json) → seat.status is published verbatim" \
+  || bad "cancelled seat (json) → seat.status cancelled (got: $JSON_OUT)"
+[ "$(jq -r '.accounts[0].unmeasured' <<<"$JSON_OUT" 2>/dev/null)" = "true" ] \
+  && ok "cancelled seat, window rolled (json) → unmeasured is true" \
+  || bad "cancelled seat (json) → unmeasured true (got: $JSON_OUT)"
+
+# ⚠️ AND IT MUST BE ABLE TO FAIL. Same fixture, same rolled window, ONE field
+# different, the end date is in the past. If this did not flip, the check above
+# would be passing on "it never says unavailable", which is not the claim.
+new_run seatended
+seed_cancelled_seat "$(date -u -v-1d '+%Y-%m-%d')"
+set +e
+OUT="$(CLAUDE_BILLING_JSON="$RUN/billing.json" "$SCRIPT" usage --no-refresh 2>/dev/null)"
+JSON_OUT="$(CLAUDE_BILLING_JSON="$RUN/billing.json" "$SCRIPT" usage --no-refresh --json 2>/dev/null)"
+set -e
+grep -q "spare@example.com" <<<"$(unavail_block <<<"$OUT")" \
+  && ok "seat past its end date → IS unavailable" \
+  || bad "seat past its end date → must be UNAVAILABLE (got: $OUT)"
+grep -q "seat ended" <<<"$(unavail_block <<<"$OUT")" \
+  && ok "seat past its end date → the reason is the SEAT, not the window" \
+  || bad "seat past its end date → reason names the seat (got: $OUT)"
+[ "$(jq -r '.accounts[0].seat.ended' <<<"$JSON_OUT" 2>/dev/null)" = "true" ] \
+  && ok "seat past its end date (json) → seat.ended is true" \
+  || bad "seat past its end date (json) → seat.ended true (got: $JSON_OUT)"
+[ "$(jq -r '.accounts[0].unmeasured' <<<"$JSON_OUT" 2>/dev/null)" = "false" ] \
+  && ok "seat past its end date (json) → an ended seat is never merely unmeasured" \
+  || bad "seat past its end date (json) → unmeasured false (got: $JSON_OUT)"
+
+# --- 10b-ii. THE DEADLINE IS min(weekly reset, SEAT END) ---------------------
+#
+# ⚠️ WRITTEN BECAUSE A SABOTAGE PROVED THE RULE WAS UNTESTED. Removing the seat
+# end from the deadline entirely left the whole suite GREEN, so the ranking
+# change was riding on nothing, and a later "simplification" back to the weekly
+# reset alone would have passed review.
+#
+# The fixture separates the two rules by construction. Both candidates clear the
+# health floor; neither is active:
+#   alpha  ACTIVE seat,    weekly resets in 5 DAYS                  -> deadline +5d
+#   spare  CANCELLED, ends in 2 DAYS, weekly resets in 6 DAYS       -> deadline +2d
+# Ranking on the weekly reset alone picks alpha. Ranking on min(reset, end)
+# picks spare, correctly, because whatever is unspent on that seat in two days
+# is gone forever, while alpha's window merely rolls.
+new_run seatrank
+mkdir -p "$RUN/.claude-pool/primary" "$RUN/.claude-pool/alpha" "$RUN/.claude-pool/spare"
+sr_exp=$(( ($(date +%s) + 86400) * 1000 ))
+for a in primary alpha spare; do
+  printf '{"claudeAiOauth":{"accessToken":"TOK-SR-%s","refreshToken":"rt","expiresAt":%s,"refreshTokenExpiresAt":%s}}' \
+    "$a" "$sr_exp" "$sr_exp" > "$RUN/.claude-pool/$a/.credentials.json"
+  printf '{"oauthAccount":{"emailAddress":"%s@example.com"}}' "$a" > "$RUN/.claude-pool/$a/.claude.json"
+done
+cp "$RUN/.claude-pool/primary/.credentials.json" "$RUN/.claude/.credentials.json"
+printf '{"oauthAccount":{"emailAddress":"primary@example.com"}}' > "$RUN/.claude.json"
+cat > "$RUN/cfg/accounts" <<EOF
+primary@example.com|$RUN/.claude-pool/primary
+alpha@example.com|$RUN/.claude-pool/alpha
+spare@example.com|$RUN/.claude-pool/spare
+EOF
+# active, spent enough that the ordinary ranking decides
+printf '{"seven_day":{"utilization":98,"resets_at":"%s"},"five_hour":{"utilization":50,"resets_at":"%s"}}' \
+  "$(iso_in +10H)" "$(iso_in +4H)" > "$RUN/state/usage-TOK-SR-primary.json"
+printf '{"seven_day":{"utilization":20,"resets_at":"%s"},"five_hour":{"utilization":0,"resets_at":"%s"}}' \
+  "$(iso_in +5d)" "$(iso_in +4H)" > "$RUN/state/usage-TOK-SR-alpha.json"
+printf '{"seven_day":{"utilization":20,"resets_at":"%s"},"five_hour":{"utilization":0,"resets_at":"%s"}}' \
+  "$(iso_in +6d)" "$(iso_in +4H)" > "$RUN/state/usage-TOK-SR-spare.json"
+jq -n --arg ends "$(date -u -v+2d '+%Y-%m-%d')" \
+  '{accounts:{"spare@example.com":{plan:"Max 20x",status:"cancelled",ends:$ends},
+              "alpha@example.com":{plan:"Max 20x",status:"active"}}}' > "$RUN/billing.json"
+set +e
+SR_OUT="$(FAKE_NEW_EMAIL=primary@example.com CLAUDE_BILLING_JSON="$RUN/billing.json" \
+          "$SCRIPT" usage 2>/dev/null)"
+set -e
+grep -q "switch to spare@example.com" <<<"$SR_OUT" \
+  && ok "seat deadline → the CANCELLED seat is picked, though its weekly reset is LATER" \
+  || bad "seat deadline → must rank on min(weekly reset, seat end) (got: $SR_OUT)"
+! grep -q "switch to alpha@example.com" <<<"$SR_OUT" \
+  && ok "seat deadline → and the later-ending seat is not preferred just for resetting sooner" \
+  || bad "seat deadline → alpha must not win (got: $SR_OUT)"
+
+# --- 10c. a boost is dated data, and expires itself -------------------------
+# A percentage is only meaningful against a known baseline, and the baseline
+# moves: weekly Claude Code limits were 50% higher through 2026-08-31. A
+# hard-coded sentence would still be claiming that months later, so each entry
+# carries its own `through` date and simply stops printing.
+new_run boost
+mkdir -p "$RUN/.claude-pool/spare"
+printf '{"claudeAiOauth":{"accessToken":"TOK-B"}}' > "$RUN/.claude-pool/spare/.credentials.json"
+printf 'spare@example.com|%s\n' "$RUN/.claude-pool/spare" > "$RUN/cfg/accounts"
+jq -n --arg t "$(date -u -v+3d '+%Y-%m-%d')" \
+  '{boosts:[{through:$t,what:"Weekly limits are 50% higher"}],accounts:{}}' > "$RUN/live.json"
+jq -n --arg t "$(date -u -v-3d '+%Y-%m-%d')" \
+  '{boosts:[{through:$t,what:"Weekly limits are 50% higher"}],accounts:{}}' > "$RUN/past.json"
+set +e
+LIVE_OUT="$(CLAUDE_BILLING_JSON="$RUN/live.json" "$SCRIPT" usage --no-refresh 2>/dev/null)"
+PAST_OUT="$(CLAUDE_BILLING_JSON="$RUN/past.json" "$SCRIPT" usage --no-refresh 2>/dev/null)"
+set -e
+grep -q "boost until" <<<"$LIVE_OUT" \
+  && ok "boost → a live boost is stated, so a percentage is read against the right baseline" \
+  || bad "boost → a live boost must be shown (got: $LIVE_OUT)"
+! grep -q "boost until" <<<"$PAST_OUT" \
+  && ok "boost → one whose date has passed disappears on its own" \
+  || bad "boost → an expired boost must not print (got: $PAST_OUT)"
+
+# --- 10d. `usage --record`: the path that works when the API will not ---------
+# Measured 2026-08-21 09:35 on the pool host: GET /api/oauth/usage answered 429
+# for both cancelled seats across six attempts over two and a half minutes, with
+# no live session on either and a valid credential in every pool dir. The number
+# was two clicks away on the vendor's usage page the whole time.
+new_run record
+mkdir -p "$RUN/.claude-pool/spare"
+printf '{"claudeAiOauth":{"accessToken":"TOK-R"}}' > "$RUN/.claude-pool/spare/.credentials.json"
+printf '{"oauthAccount":{"emailAddress":"spare@example.com"}}' > "$RUN/.claude-pool/spare/.claude.json"
+printf 'spare@example.com|%s\n' "$RUN/.claude-pool/spare" > "$RUN/cfg/accounts"
+set +e
+REC_OUT="$(CLAUDE_POOL_DIR="$RUN/.claude-pool" "$SCRIPT" usage --record spare 12 2>&1)"; REC_RC=$?
+BAD_OUT="$(CLAUDE_POOL_DIR="$RUN/.claude-pool" "$SCRIPT" usage --record spare 150 2>&1)"; BAD_RC=$?
+NOALIAS="$(CLAUDE_POOL_DIR="$RUN/.claude-pool" "$SCRIPT" usage --record 2>&1)"; NOALIAS_RC=$?
+set -e
+[ "$REC_RC" -eq 0 ] && ok "--record → a real reading is accepted" || bad "--record rc=$REC_RC: $REC_OUT"
+[ "$BAD_RC" -ne 0 ] && ok "--record → refuses a percentage outside 0-100" || bad "--record accepted 150%: $BAD_OUT"
+[ "$NOALIAS_RC" -ne 0 ] && ok "--record → refuses without an alias and a number" || bad "--record accepted nothing: $NOALIAS"
+# ⚠️ IT MUST CARRY THE WINDOW IT BELONGS TO. A measurement with no window is
+# indistinguishable from a fresh one forever, which is the very defect this
+# whole change is about, a number outliving the window it described.
+[ -n "$(jq -r '.accounts["spare@example.com"].weekly_resets_at // empty' "$RUN/cfg/human-usage.json" 2>/dev/null)" ] \
+  && ok "--record → the reading is stamped with the window it belongs to" \
+  || bad "--record → stored without a window (got: $(cat "$RUN/cfg/human-usage.json" 2>/dev/null))"
+[ "$(jq -r '.accounts["spare@example.com"].weekly_used' "$RUN/cfg/human-usage.json" 2>/dev/null)" = "12" ] \
+  && ok "--record → stores the USED percentage, the polarity the vendor page prints" \
+  || bad "--record → weekly_used wrong (got: $(cat "$RUN/cfg/human-usage.json" 2>/dev/null))"
+# ⚠️ AND IT MUST SURVIVE THE READ WITH ITS TIMESTAMP INTACT. Tab is IFS
+# *whitespace*, so a tab-joined row collapses its two routinely-empty 5h fields
+# and shifts the stamp out of position: the recorded number then rendered with
+# NO age at all, a hand-typed figure looking freshly measured, which is exactly
+# the dishonesty this change exists to remove.
+set +e
+REC_TABLE="$(CLAUDE_POOL_DIR="$RUN/.claude-pool" CLAUDE_HUMAN_USAGE="$RUN/cfg/human-usage.json" \
+             "$SCRIPT" usage --no-refresh 2>/dev/null)"
+REC_JSON="$(CLAUDE_POOL_DIR="$RUN/.claude-pool" CLAUDE_HUMAN_USAGE="$RUN/cfg/human-usage.json" \
+            "$SCRIPT" usage --no-refresh --json 2>/dev/null)"
+set -e
+[ "$(jq -r '.accounts[0].weekly.used_pct' <<<"$REC_JSON" 2>/dev/null)" = "12" ] \
+  && ok "--record → the recorded reading is what the usage report then shows" \
+  || bad "--record → the reading never reached the report (got: $REC_JSON)"
+grep -qE 'cached [A-Z][a-z]{2} [0-9]' <<<"$REC_TABLE" \
+  && ok "--record → and it renders WITH its age, never as a stamp-less number" \
+  || bad "--record → the read-at stamp was lost on the way back (got: $REC_TABLE)"
 
 # --- 11. move_oauth_account copies the WHOLE object and leaves siblings alone -
 new_run oauthmove
@@ -2214,7 +2438,14 @@ EX_RC=$?
 EX_OUT_V="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" switch-auto --dry-run --verbose 2>&1)"
 EXQ_OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" switch-auto --dry-run --quiet 2>&1)"
 EXQ_RC=$?
-EX_USAGE="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage 2>/dev/null)"
+# ⚠️ AN EMPTY BILLING FILE, PINNED ON PURPOSE. `usage` reads billing.json now,
+# for seat status, end dates and dated `boosts`. Under this suite that path
+# resolves inside the throwaway $CFG_DIR and does not exist, but pinning it says
+# so out loud: a golden snapshot that ever read a REAL billing file would
+# inherit its dated boosts and then fail by itself on the day one expired, with
+# a diff pointing at a line nobody touched.
+printf '{"accounts":{}}\n' > "$RUN/no-billing.json"
+EX_USAGE="$(FAKE_NEW_EMAIL=primary@example.com CLAUDE_BILLING_JSON="$RUN/no-billing.json" "$SCRIPT" usage 2>/dev/null)"
 set -e
 
 [ "$EX_RC" -eq 0 ] && ok "self-explaining switch → still exits 0 and still switches" \
@@ -2420,12 +2651,25 @@ norm_json() {
          | .recommendation.reason |= (gsub("\\(in [^)]*\\)"; "(in <t>)")
                                       | gsub("[0-9]{2}:[0-9]{2} [A-Za-z0-9 ]+?(?=\\)|;|,)"; "<time>"))'
 }
-EX_JSON="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --json 2>/dev/null | norm_json)"
+# the same pinned-empty billing file as scenario 39, and for the same reason:
+# this fixture's run dir is a fresh one, so it needs its own copy
+printf '{"accounts":{}}\n' > "$RUN/no-billing.json"
+EX_JSON="$(FAKE_NEW_EMAIL=primary@example.com CLAUDE_BILLING_JSON="$RUN/no-billing.json" "$SCRIPT" usage --json 2>/dev/null | norm_json)"
 # every published key path, in sorted order, the shape contract itself
 # LC_ALL=C so the ordering is ASCII and identical on every box, a locale-sorted
 # expectation would pass here and fail on a runner with a different LC_COLLATE.
 EX_JSON_PATHS="$(jq -S -r 'paths | join(".")' <<<"$EX_JSON" | sed -E 's/\.[0-9]+/.N/g' | LC_ALL=C sort -u | tr '\n' ' ')"
-EX_JSON_PATHS_WANT="accounts accounts.N accounts.N.active accounts.N.alias accounts.N.cached_at accounts.N.config_dir accounts.N.current accounts.N.data accounts.N.email accounts.N.five_hour accounts.N.five_hour.expired accounts.N.five_hour.fresh accounts.N.five_hour.remaining_pct accounts.N.five_hour.resets_at accounts.N.five_hour.used_pct accounts.N.label accounts.N.live accounts.N.loggedIn accounts.N.note accounts.N.quota_data accounts.N.quota_measured_at accounts.N.quota_source accounts.N.reason accounts.N.recommendable accounts.N.session accounts.N.session.expired accounts.N.session.fresh accounts.N.session.leftPct accounts.N.session.resetsAt accounts.N.session.resetsInSeconds accounts.N.session.usedPct accounts.N.stale accounts.N.stale_reason accounts.N.weekly accounts.N.weekly.expired accounts.N.weekly.fresh accounts.N.weekly.kind accounts.N.weekly.leftPct accounts.N.weekly.remaining_pct accounts.N.weekly.resetsAt accounts.N.weekly.resetsInSeconds accounts.N.weekly.resets_at accounts.N.weekly.scope accounts.N.weekly.usedPct accounts.N.weekly.used_pct active active.auth_status active.auth_warning active.email active.fingerprint active.nested_config_warning active.source active.warning activeEmail floors floors.comfortable_pct floors.exhausted_pct floors.session_pct floors.weekly_pct peer recommendation recommendation.action recommendation.alias recommendation.best_alternative recommendation.best_alternative.email recommendation.best_alternative.weekly_left_pct recommendation.burn_down_hold recommendation.email recommendation.from_cached_numbers recommendation.label recommendation.mode recommendation.mode_forced recommendation.reason recommendation.weekly_fresh recommendation.weekly_resets_at "
+# ⚠️ GREW BY NINE PATHS ACROSS TWO CHANGES, and every one of them is ADDITIVE:
+# nothing was renamed or removed, which is the promise this assertion exists to
+# hold the dashboard to.
+#   2026-08-25  `seat.{status,ends,ended}` and `unmeasured`, because a consumer
+#               that only ever saw `weekly.expired` could not tell "this account
+#               is finished" from "I have not measured this", the same confusion
+#               the human table had and the reason two live seats were written off
+#   2026-08-27  `quota_data` / `quota_source` / `quota_measured_at` per row and the
+#               top-level `peer` object, so a consumer can see WHOSE measurement a
+#               number is and HOW OLD it is, not merely that one exists
+EX_JSON_PATHS_WANT="accounts accounts.N accounts.N.active accounts.N.alias accounts.N.cached_at accounts.N.config_dir accounts.N.current accounts.N.data accounts.N.email accounts.N.five_hour accounts.N.five_hour.expired accounts.N.five_hour.fresh accounts.N.five_hour.remaining_pct accounts.N.five_hour.resets_at accounts.N.five_hour.used_pct accounts.N.label accounts.N.live accounts.N.loggedIn accounts.N.note accounts.N.quota_data accounts.N.quota_measured_at accounts.N.quota_source accounts.N.reason accounts.N.recommendable accounts.N.seat accounts.N.seat.ended accounts.N.seat.ends accounts.N.seat.status accounts.N.session accounts.N.session.expired accounts.N.session.fresh accounts.N.session.leftPct accounts.N.session.resetsAt accounts.N.session.resetsInSeconds accounts.N.session.usedPct accounts.N.stale accounts.N.stale_reason accounts.N.unmeasured accounts.N.weekly accounts.N.weekly.expired accounts.N.weekly.fresh accounts.N.weekly.kind accounts.N.weekly.leftPct accounts.N.weekly.remaining_pct accounts.N.weekly.resetsAt accounts.N.weekly.resetsInSeconds accounts.N.weekly.resets_at accounts.N.weekly.scope accounts.N.weekly.usedPct accounts.N.weekly.used_pct active active.auth_status active.auth_warning active.email active.fingerprint active.nested_config_warning active.source active.warning activeEmail floors floors.comfortable_pct floors.exhausted_pct floors.session_pct floors.weekly_pct peer recommendation recommendation.action recommendation.alias recommendation.best_alternative recommendation.best_alternative.email recommendation.best_alternative.weekly_left_pct recommendation.burn_down_hold recommendation.email recommendation.from_cached_numbers recommendation.label recommendation.mode recommendation.mode_forced recommendation.reason recommendation.weekly_fresh recommendation.weekly_resets_at "
 [ "$EX_JSON_PATHS" = "$EX_JSON_PATHS_WANT" ] \
   && ok "json byte-identity → every published key path is exactly what the dashboard was promised" \
   || bad "json byte-identity → key paths drifted:

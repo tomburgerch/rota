@@ -25,6 +25,10 @@ credential that exists twice kills itself.
   about a real seat, measured somewhere else: treat it exactly as you treat
   `cached`, never as `live`. `live: false` / `stale: true` say the same thing in
   one field. The top-level `peer` object names the host when one was used.
+- Quota UNKNOWN is not quota SPENT, and a cancelled seat is not a dead seat. A
+  row with `unmeasured: true` has a number nobody has measured, very possibly a
+  full one; only `seat.ended: true` means the seat is finished. Read those two
+  fields before concluding anything about a seat from `weekly.expired`.
 - Which seat a live session bills to: `ps eww -p <pid> | grep -o 'CLAUDE_CONFIG_DIR=[^ ]*'`.
 - Identity of a directory: `jq -r .oauthAccount.emailAddress <dir>/.claude.json`.
   Never from the directory name, never from `claude auth status`.
@@ -65,5 +69,8 @@ credential that exists twice kills itself.
 | `rota usage` warns billing differs from claim | live sessions still on the previous seat | nothing; `rota switch <current>` converges idle panes now |
 | a seat shows `needs login` or `dead-refresh` | that chain is dead (revoked, password change) | `rota login <seat>` |
 | a seat shows `no active window yet` | it has not been used since its weekly reset; nothing to measure yet | one small request opens a window; the keeper does this at WARM_AT |
-| every row is `cached` | the usage API is rate-limiting (429) under many sessions | wait; do not switch on cached rows |
+| a seat is under `UNMEASURED`, reading `unmeasured, may be full` | the quota is UNKNOWN, not spent: either the cached window rolled or the usage API refused. The seat is fine, only the number is missing | never write the seat off; read the weekly USED % off the vendor's usage page and `rota usage --record <seat> <pct>` |
+| a seat reads `cancelled, quota until <date>` | it is cancelled but still live, and still refreshes weekly until that date | spend it FIRST: `min(weekly reset, seat end)` already ranks it, so `rota switch` will send you there |
+| a seat reads `seat ended <date>` under UNAVAILABLE | past its `ends` date in `billing.json`; this is the only state that really is finished | drop it from the accounts file and the pool |
+| every row is `cached` | the usage API is rate-limiting (429). Not only a many-sessions symptom: measured 2026-08-21 it refused six times over two and a half minutes with no live session at all | do not switch on cached rows; if waiting does not clear it, `rota usage --record` the seats you need |
 | cred-guard report | an unpinned session is writing the shared credential | read `~/.config/claude-failover/cred-guard-report.txt`; it names the one command |
