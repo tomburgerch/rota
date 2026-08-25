@@ -140,7 +140,14 @@ _env_AUTO_SWITCH_TARGET_MIN_LEFT_PCT="${AUTO_SWITCH_TARGET_MIN_LEFT_PCT:-}"
 _env_AUTO_SWITCH_BOUNCE_SECS="${AUTO_SWITCH_BOUNCE_SECS:-}"
 _env_KEEPER_LOCK_STALE_SECS="${KEEPER_LOCK_STALE_SECS:-}"
 _env_PANE_CONVERGE="${PANE_CONVERGE:-}"
+_env_RESERVED_FLOOR_PCT="${RESERVED_FLOOR_PCT:-}"
 AUTO_SWITCH_PCT=90
+# A RESERVED seat (one carrying a RESERVED marker, see `rota reserve`) that
+# drops below this much weekly headroom says so once, on state change.
+# 25 rather than something tighter because the point is to hear about it while
+# there is still a week's work left in the seat, not to confirm the funeral: on
+# 2026-08-21 a reserved seat went to 0% and was found days later.
+RESERVED_FLOOR_PCT=25
 AUTO_SWITCH_RESTART_IDLE=1
 KEEPALIVE_MIN=90
 # KEEPALIVE_ENABLED, OFF by default since 2026-08-16. The full evidence and
@@ -173,6 +180,7 @@ if [[ -f "$CFG_DIR/keeper.conf" ]]; then
   . "$CFG_DIR/keeper.conf"
 fi
 [[ -n "$_env_AUTO_SWITCH_PCT" ]] && AUTO_SWITCH_PCT="$_env_AUTO_SWITCH_PCT"
+[[ -n "$_env_RESERVED_FLOOR_PCT" ]] && RESERVED_FLOOR_PCT="$_env_RESERVED_FLOOR_PCT"
 [[ -n "$_env_AUTO_SWITCH_RESTART_IDLE" ]] && AUTO_SWITCH_RESTART_IDLE="$_env_AUTO_SWITCH_RESTART_IDLE"
 [[ -n "$_env_KEEPALIVE_MIN" ]] && KEEPALIVE_MIN="$_env_KEEPALIVE_MIN"
 [[ -n "$_env_KEEPALIVE_ENABLED" ]] && KEEPALIVE_ENABLED="$_env_KEEPALIVE_ENABLED"
@@ -1016,6 +1024,47 @@ iso_in_past_or_empty() {
 }
 
 # ── main ─────────────────────────────────────────────────────────────────────
+# ── reserved-seat floor alarm ───────────────────────────────────────────────
+check_reserved_seats() {
+  #
+  # A PANE BURNED A RESERVED SEAT TO 0% ON 2026-08-21 AND NOTHING ANNOUNCED IT.
+  # It was found days later, from a `rota billing` run for an unrelated reason.
+  # The shim now refuses interactive sessions on a reserved seat
+  # (lib/rota-shim.sh), but a guard only covers the ways it knows about, this is
+  # the backstop that notices the quota going regardless of HOW.
+  #
+  # State-change only, via notify_once/log_once: a reserved seat sitting under
+  # its floor for three days must not produce three days of notifications. The
+  # bucket keeps a seat drifting 24% -> 23% -> 22% from re-firing; crossing a
+  # 10-point band is a real change and says so again.
+  # `i` is local too: this runs from inside main(), whose own `i` indexes DIRS.
+  local rs rs_lbl rs_ui rs_used rs_left rs_owner rs_bucket i
+  for rs in "${DIRS[@]}"; do
+    [[ -f "$rs/${CLAUDE_RESERVED_MARKER:-RESERVED}" ]] || continue
+    rs_lbl=""
+    for i in "${!DIRS[@]}"; do [[ "${DIRS[$i]}" == "$rs" ]] && rs_lbl="${LABELS[$i]}"; done
+    [[ -n "$rs_lbl" ]] || continue
+    rs_ui="$(usage_for "$rs_lbl")"
+    [[ -n "$rs_ui" ]] || continue
+    rs_used="$(pct_int "${U_WK[$rs_ui]}")"
+    [[ -n "$rs_used" ]] || continue
+    rs_left=$(( 100 - rs_used ))
+    rs_owner="$(sed -n 's/^owner=//p' "$rs/${CLAUDE_RESERVED_MARKER:-RESERVED}" 2>/dev/null | head -1)"
+    if (( rs_left < RESERVED_FLOOR_PCT )); then
+      rs_bucket=$(( rs_left / 10 ))
+      log_once "reserved-$(basename "$rs")" "$rs_bucket" \
+        "RESERVED seat $(basename "$rs") (${rs_owner:-unknown}) is at ${rs_left}% weekly left, under the ${RESERVED_FLOOR_PCT}% floor"
+      notify_once "reserved-$(basename "$rs")" \
+        "$(basename "$rs"): ${rs_owner:-reserved} seat down to ${rs_left}% weekly"
+    else
+      # Recovered (the window reset, or nothing spent it): re-arm so the NEXT
+      # dip alarms again instead of being swallowed as "same state".
+      log_state_clear "reserved-$(basename "$rs")"
+      rm -f "$CFG_DIR/keeper-notified-reserved-$(basename "$rs")" 2>/dev/null || true
+    fi
+  done
+}
+
 main() {
   command -v jq >/dev/null 2>&1 || { printf 'rota-keeper: jq missing, cannot run\n' >&2; exit 1; }
   mkdir -p "$CFG_DIR"
@@ -1198,6 +1247,9 @@ main() {
   for i in "${!DIRS[@]}"; do
     fetch_usage "${LABELS[$i]}" "${DIRS[$i]}" || true
   done
+
+  # 3b. RESERVED SEATS, say so ONCE when one drops below its floor.
+  check_reserved_seats
 
   # 4. AUTO-SWITCH, the claim's binding weekly OR 5h utilization ≥ threshold
   local claim="" ui="" wk="" se=""
