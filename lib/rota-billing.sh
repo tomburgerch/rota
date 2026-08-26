@@ -388,7 +388,11 @@ if held:
         f"{r['alias'] or r['account']} ({r['weekly_left_pct']}% left → {r['reserved_owner'] or 'someone else'})"
         for r in held)
     print(f"\n  {c('NOT OFFERED', '1;35')}   {c(detail, '2')}")
-    print(f"     {c('reserved seats are excluded from the ranking; rota billing --include-reserved overrides', '2')}")
+    # ⚠️ Do NOT name a verb here. This renderer is reached as `rota accounts`
+    # AND as `rota billing` (and as `cdt accounts`), so any verb spelled out is
+    # wrong for most of the ways a reader got here - it would send them to a
+    # command they did not type.
+    print(f"     {c('reserved seats are excluded from the ranking; pass --include-reserved to rank them too', '2')}")
 
 missing = [r['account'] for r in rows if r['status'] == 'unknown']
 if missing:
