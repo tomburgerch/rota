@@ -14,6 +14,14 @@
 #   rota billing --json        machine-readable merge, for scripts
 #   rota billing --local       read THIS box's pool, whatever box it is
 #   rota billing --no-refresh  pass through to `rota usage` (use cached quota)
+#   rota billing --include-reserved  rank reserved seats too (see below)
+#
+# WHOSE SEAT IS IT. A pool can hold seats that are not yours to spend - one
+# pushed to a server that runs against it around the clock, one handed to a
+# colleague. Quota cannot tell you that, so those seats are marked RESERVED and
+# held out of the ranking. A seat is reserved if it carries a RESERVED file in
+# its own config dir (the same file the shim reads when it refuses to open a
+# session there) or is named in $CFG_DIR/reserved as `alias [owner] [why...]`.
 #
 # The quota columns are LIVE and re-measured on every run. The billing columns
 # are only as true as billing.json; config/billing.example.json documents the
@@ -35,11 +43,13 @@ POOL_HOST="${ROTA_POOL_HOST:-${CLAUDE_POOL_HOST:-}}"
 
 WANT_JSON=0
 FORCE_LOCAL=0
+INCLUDE_RESERVED=0
 PASSTHRU=()
 for a in "$@"; do
   case "$a" in
     --json)  WANT_JSON=1; PASSTHRU+=("$a") ;;
     --local) FORCE_LOCAL=1 ;;
+    --include-reserved) INCLUDE_RESERVED=1 ;;
     -h|--help) sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) PASSTHRU+=("$a") ;;
   esac
@@ -54,7 +64,10 @@ if [ "$FORCE_LOCAL" -eq 0 ] && [ -n "$POOL_HOST" ] && [ "$THIS_HOST" != "$POOL_H
     # Note goes to stderr so `--json | jq` stays clean.
     [ "$WANT_JSON" -eq 1 ] || printf '\n  \033[2mpool host: %s (read over ssh from %s)\033[0m\n' "$POOL_HOST" "$THIS_HOST" >&2
     # A non-interactive ssh shell rarely has ~/.local/bin on PATH, so put it there ourselves.
-    exec ssh -o ConnectTimeout=8 "$POOL_HOST" "PATH=\$HOME/.local/bin:\$PATH rota billing --local ${PASSTHRU[*]:-}"
+    # ⚠️ NOT ${INCLUDE_RESERVED:+...}: the variable holds 0 or 1 and "0" is
+    # non-empty, so :+ would forward the flag when it is switched OFF.
+    RES_FLAG=""; [ "$INCLUDE_RESERVED" -eq 1 ] && RES_FLAG=" --include-reserved"
+    exec ssh -o ConnectTimeout=8 "$POOL_HOST" "PATH=\$HOME/.local/bin:\$PATH rota billing --local$RES_FLAG ${PASSTHRU[*]:-}"
   fi
   # Fall through rather than fail: this box's table is still worth something, but
   # it must never be mistaken for the pool host's.
@@ -78,7 +91,8 @@ fi
 USAGE_RAW="$("$ROTA_LIB/rota-engine.sh" usage --json ${PASSTHRU+"${PASSTHRU[@]}"} 2>/dev/null || true)"
 [ -n "$USAGE_RAW" ] || { echo "rota billing: 'rota-engine.sh usage --json' returned nothing" >&2; exit 1; }
 
-BILLING_JSON="$BILLING_JSON" WANT_JSON="$WANT_JSON" THIS_HOST="$THIS_HOST" python3 - "$USAGE_RAW" <<'PY'
+BILLING_JSON="$BILLING_JSON" WANT_JSON="$WANT_JSON" THIS_HOST="$THIS_HOST" \
+CFG_DIR="$CFG_DIR" INCLUDE_RESERVED="$INCLUDE_RESERVED" python3 - "$USAGE_RAW" <<'PY'
 import json, os, sys
 from datetime import datetime, date
 
@@ -86,6 +100,51 @@ raw = sys.argv[1]
 usage = json.loads(raw[raw.index('{'):])
 billing = json.load(open(os.environ['BILLING_JSON']))
 bill = billing.get('accounts', {})
+
+# ── WHOSE SEAT IS IT ────────────────────────────────────────────────────────
+# A pool can hold seats that are NOT yours to spend: one pushed to a server that
+# runs against it around the clock, one handed to a colleague. Quota alone
+# cannot tell you that, so a table that ranks purely on quota will confidently
+# send you to somebody else's seat. It did: on 2026-08-25 this printed
+# `USE NEXT rota switch tommy` for a seat handed over the day before.
+#
+# Two sources, UNIONED - never "markers else config":
+#   1. a RESERVED file inside the seat's own config dir, which is also what the
+#      shim reads when it refuses to open a session there, so the table and the
+#      thing that actually refuses cannot drift apart
+#   2. $CFG_DIR/reserved, one `alias [owner] [why...]` per line
+# The union matters: the first box to grow a marker file would otherwise
+# silently un-reserve every seat named only in the config.
+def read_reservations(cfg_dir):
+    out = {}
+    path = os.path.join(cfg_dir, 'reserved')
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.split('#', 1)[0].strip()
+                if not line: continue
+                parts = line.split(None, 2)
+                out[parts[0]] = {'owner': parts[1] if len(parts) > 1 else '',
+                                 'why':   parts[2] if len(parts) > 2 else ''}
+    except OSError:
+        pass
+    return out
+
+def read_marker(config_dir):
+    if not config_dir: return None
+    try:
+        with open(os.path.join(os.path.expanduser(config_dir), 'RESERVED')) as fh:
+            kv = {}
+            for line in fh:
+                if '=' in line:
+                    k, v = line.split('=', 1)
+                    kv[k.strip()] = v.strip()
+            return {'owner': kv.get('owner', ''), 'why': kv.get('why', '')}
+    except OSError:
+        return None
+
+RESERVED_CFG = read_reservations(os.environ.get('CFG_DIR', ''))
+INCLUDE_RESERVED = os.environ.get('INCLUDE_RESERVED') == '1'
 
 def next_charge(day, ends):
     """Renewal is a day-of-month. Next charge is that day, in the next month it still bills."""
@@ -118,9 +177,16 @@ for a in usage.get('accounts', []):
     nxt = next_charge(b['renews_day'], ends) if b.get('renews_day') else None
     if nxt: total += float(b.get('usd_approx') or 0)
     status = b.get('status', 'unknown')
+    alias = a.get('alias')
+    # Marker first so a seat carrying one is reserved even with no config line;
+    # the config fills in seats that have no marker on this particular box.
+    res = read_marker(a.get('config_dir')) or RESERVED_CFG.get(alias)
     rows.append({
+        'reserved': bool(res),
+        'reserved_owner': (res or {}).get('owner', ''),
+        'reserved_why': (res or {}).get('why', ''),
         'account': email,
-        'alias': a.get('alias'),
+        'alias': alias,
         'active_now': bool(a.get('active')),
         'weekly_left_pct': w.get('remaining_pct'),
         'weekly_resets_at': w.get('resets_at'),
@@ -167,13 +233,48 @@ def pad(plain, width, code=None, right=False):
     return (fill + cell) if right else (cell + fill)
 
 host = os.environ.get('THIS_HOST') or '?'
-print(f"\nSeats on {c(host, '1')}, {fmt(usage.get('generated_at'))}   active: {usage.get('activeEmail')}\n")
-hdr = f"{'ACCOUNT':36} {'WEEKLY':>7}  {'QUOTA RESETS':17} {'5H':>5}   {'NEXT CHARGE':12} {'AMOUNT':>11}  STATUS"
+
+# ── HOW LONG UNTIL THIS QUOTA IS GONE ───────────────────────────────────────
+# An absolute reset time makes you do date arithmetic in your head to answer the
+# only question that matters ("can I still spend this before I leave?"). The
+# countdown answers it directly; the absolute time stays because a countdown
+# alone cannot be checked against a calendar.
+def countdown(ts):
+    if not ts: return '-'
+    delta = datetime.fromisoformat(ts.replace('Z', '+00:00')) - datetime.now().astimezone()
+    secs = int(delta.total_seconds())
+    if secs <= 0: return 'due'
+    d, rem = divmod(secs, 86400)
+    h, m = divmod(rem // 60, 60)
+    return f"{d}d {h:02d}h" if d else f"{h}h {m:02d}m"
+
+# A bar makes the column scannable: five seats sorted by charge date are five
+# numbers you have to read, but one glance at the bars finds the empty ones.
+def bar(pct, width=9):
+    if pct is None: return ' ' * width
+    filled = int(round(pct / 100 * width))
+    return '\u2588' * filled + '\u2591' * (width - filled)
+
+print(f"\nSeats on {c(host, '1')} \u00b7 {fmt(usage.get('generated_at'))} \u00b7 active: {c(usage.get('activeEmail') or '?', '36')}\n")
+hdr = (f"  {'SEAT':36} {'WEEKLY LEFT':>21}  {'5H':>4}  {'GONE IN':>8}  "
+       f"{'QUOTA RESETS':17} {'NEXT CHARGE':>12} {'AMOUNT':>11}  NOTES")
 print(c(hdr, '2;4'))
+
+# Reserved seats sink to the bottom: they are context, not options. Within each
+# group the original soonest-charge-first order is kept.
+#
+# ⚠️ The original position is captured BEFORE sorting, not looked up with
+# rows.index(r) inside the key. index() compares dicts by value and scans a list
+# that sort() is actively reordering, so it raises ValueError halfway down a
+# table that has already printed its header - a half-rendered table with a
+# traceback under it.
+for _i, _r in enumerate(rows):
+    _r['_ord'] = _i
+rows.sort(key=lambda r: (bool(r['reserved']), r['_ord']))
 
 for r in rows:
     wk = r['weekly_left_pct']
-    wk_plain = f"{wk}%" if wk is not None else '-'
+    wk_plain = f"{bar(wk)} {wk:>3}%" if wk is not None else f"{bar(None)}    -"
     if   wk is None: wk_code = '90'
     elif wk == 0:    wk_code = '31'    # spent
     elif wk < 20:    wk_code = '33'    # under the >=20%-left health floor
@@ -184,21 +285,28 @@ for r in rows:
     fh = r['five_hour_left_pct']
     fh_plain = '' if wk == 0 else (f"{fh}%" if fh is not None else '-')
 
+    notes = []
+    # ⚠️ THE RESERVATION LEADS. It is the one fact that changes whether a row is
+    # an option at all, so it must not sit behind the billing status where a
+    # reader scanning for green numbers will never reach it.
+    if r['reserved']:
+        who = r['reserved_owner'] or 'someone else'
+        notes.append(c(f"RESERVED \u2192 {who}", '1;35'))
     if r['status'] == 'cancelled':
-        st = c(f"CANCELLED, ends {datetime.fromisoformat(r['ends']).strftime('%-d %b')}", '31')
+        notes.append(c(f"CANCELLED, ends {datetime.fromisoformat(r['ends']).strftime('%-d %b')}", '31'))
     elif r['status'] == 'unknown':
-        st = c('billing unknown, add it to billing.json', '33')
-    else:
-        st = c('active', '90')
+        notes.append(c('billing unknown, add it to billing.json', '33'))
     if r['quota_data'] not in ('live', None):
-        st += c(f"  [quota {r['quota_data']}]", '33')
+        notes.append(c(f"[quota {r['quota_data']}]", '33'))
 
     nc_plain = datetime.fromisoformat(r['next_charge']).strftime('%-d %b %Y') if r['next_charge'] else 'none'
-    nc = pad(nc_plain, 12, None if r['next_charge'] else '90')
-    name = pad(r['account'] + (' <' if r['active_now'] else ''), 36, '36' if r['active_now'] else None)
+    nc = pad(nc_plain, 12, None if r['next_charge'] else '90', right=True)
+    name = pad(r['account'] + (' <' if r['active_now'] else ''), 36,
+               '36' if r['active_now'] else ('90' if r['reserved'] else None))
 
-    print(f"{name} {pad(wk_plain, 7, wk_code, right=True)}  "
-          f"{fmt(r['weekly_resets_at']):17} {fh_plain:>5}   {nc} {r['amount']:>11}  {st}")
+    print(f"  {name} {pad(wk_plain, 21, wk_code, right=True)}  {fh_plain:>4}  "
+          f"{countdown(r['weekly_resets_at']):>8}  "
+          f"{fmt(r['weekly_resets_at']):17} {nc} {r['amount']:>11}  {'  '.join(notes)}")
 
 # ── USE NEXT ────────────────────────────────────────────────────────────────
 # THE LIMIT IS WEEKLY AND USE-IT-OR-LOSE-IT, so rank by when THIS window is
@@ -227,8 +335,20 @@ def loses_at(r):
     # Compare as UTC-naive ISO; resets carry an offset, ends do not.
     return min(reset[:16], end[:16])
 
-usable = [r for r in rows if (r['weekly_left_pct'] or 0) >= floor]
+# ⚠️ A RESERVED SEAT IS NEVER A RECOMMENDATION. Quota is not the only fact that
+# decides whether a seat is available, and this ranking used to behave as if it
+# were: on 2026-08-25 it printed `rota switch tommy` for a seat handed to a
+# colleague the previous day, and `--json` consumers inherited the same mistake.
+# --include-reserved exists for the deliberate override, and says so out loud.
+usable = [r for r in rows if (r['weekly_left_pct'] or 0) >= floor
+          and (INCLUDE_RESERVED or not r['reserved'])]
 usable.sort(key=lambda r: (loses_at(r), -(r['weekly_left_pct'] or 0)))
+
+# Say what was withheld and why. A seat that silently vanishes from the ranking
+# is indistinguishable from one that is simply spent, which is how a reservation
+# gets quietly forgotten and then quietly violated.
+held = [r for r in rows if r['reserved'] and (r['weekly_left_pct'] or 0) >= floor
+        and not INCLUDE_RESERVED]
 
 print(f"\n  {c('monthly total (approx, seats that still charge):', '2')} ${total:,.2f}")
 
@@ -248,7 +368,7 @@ if usable:
     rest = usable[1:]
     if rest:
         tail = '  ·  '.join(
-            f"{r['account'].split('@')[0]} ({r['weekly_left_pct']}%, resets "
+            f"{r['alias'] or r['account']} ({r['weekly_left_pct']}%, resets "
             f"{datetime.fromisoformat(r['weekly_resets_at']).astimezone().strftime('%a %-d %b') if r['weekly_resets_at'] else '?'})"
             for r in rest)
         print(f"     {c('then', '2')} {c(tail, '2')}")
@@ -256,11 +376,22 @@ else:
     soonest = min((r for r in rows if r['weekly_resets_at']), key=lambda r: r['weekly_resets_at'], default=None)
     msg = f"nothing clears the {floor}%-weekly floor"
     if soonest:
-        msg += f"; earliest back is {soonest['account'].split('@')[0]} at {fmt(soonest['weekly_resets_at'])}"
+        msg += f"; earliest back is {soonest['alias'] or soonest['account']} at {fmt(soonest['weekly_resets_at'])}"
     print(f"\n  {c('USE NEXT', '1;31')}   {c(msg, '33')}")
+
+if held:
+    # ⚠️ NOT account.split('@')[0]. Two seats can share a local-part - a personal
+    # and a work address for the same person - and then the line names the wrong
+    # one, or names one seat twice. The alias is what `rota switch` takes and is
+    # unique by construction.
+    detail = '  ·  '.join(
+        f"{r['alias'] or r['account']} ({r['weekly_left_pct']}% left → {r['reserved_owner'] or 'someone else'})"
+        for r in held)
+    print(f"\n  {c('NOT OFFERED', '1;35')}   {c(detail, '2')}")
+    print(f"     {c('reserved seats are excluded from the ranking; rota billing --include-reserved overrides', '2')}")
 
 missing = [r['account'] for r in rows if r['status'] == 'unknown']
 if missing:
     print(c(f"  billing unknown for: {', '.join(missing)}; add to {os.environ['BILLING_JSON']}", '33'))
-print(f"\n  {c('quota is measured live; billing comes from billing.json (see config/billing.example.json to re-measure)', '2')}\n")
+print(f"\n  {c('quota is measured live; billing comes from billing.json; reservations from each seat'+chr(39)+'s RESERVED marker + $CFG_DIR/reserved', '2')}\n")
 PY

@@ -1,0 +1,29 @@
+# rota: seats in the pool that are NOT yours to spend.
+#
+# Copy to $CLAUDE_FAILOVER_HOME/reserved (default ~/.config/claude-failover/reserved).
+# Machine-local, like `accounts` - it names your people and your servers, so it
+# never belongs in the repo.
+#
+# WHY THIS EXISTS. A pool can hold seats that still show plenty of quota and are
+# still somebody else's: one pushed to a server that runs against it around the
+# clock, one handed to a colleague. `rota accounts` ranks on quota, so without
+# this it will confidently tell you to switch onto one of them. It did exactly
+# that on 2026-08-25, recommending a seat handed over the day before.
+#
+# FORMAT: one seat per line.
+#
+#   <alias>  [owner]  [why...]
+#
+# `alias` matches the seat's alias in the accounts file. `owner` is a short tag
+# shown in the table's NOTES column. Everything after it is free text for you.
+# Blank lines and anything after a # are ignored.
+#
+# A seat is ALSO reserved if it carries a RESERVED file in its own config dir
+# (see `rota reserve`, and the shim which reads the same file when it refuses to
+# open a session there). The two sources are UNIONED, never "markers else this
+# file" - otherwise the first box to grow a marker would silently un-reserve
+# every seat named only here.
+#
+# Examples:
+# runner-seat   ci-runner   pushed to the build host; a local pane starves it
+# team-seat     alex        handed over 2026-01-14
