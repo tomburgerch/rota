@@ -48,7 +48,12 @@ check "symlinked rota reaches lib (roster via symlink)" '[ "$(rota roster)" = "r
 # --- dispatch ------------------------------------------------------------------
 check "failover roster reaches engine"    '[ "$("$R" failover roster)" = "rota-engine.sh: roster" ]'
 check "usage reaches engine usage"        '[ "$("$R" usage --json)" = "rota-engine.sh: usage --json" ]'
-check "accounts aliases usage"            '[ "$("$R" accounts)" = "rota-engine.sh: usage" ]'
+# `accounts` is the HUMAN table, not an alias for the engine's measurement.
+# Cédric types `cdt accounts` to see quota, renewal, cost and whose seat it is
+# in one place; `usage` stays the raw engine view that other tools parse.
+check "accounts reaches the table"        '[ "$("$R" accounts)" = "rota-billing.sh: " ] || [ "$("$R" accounts)" = "rota-billing.sh:" ]'
+check "accounts forwards its flags"       '[ "$("$R" accounts --json)" = "rota-billing.sh: --json" ]'
+check "usage is still the engine view"    '[ "$("$R" usage)" = "rota-engine.sh: usage" ]'
 check "switch bare -> switch-auto"        '[ "$("$R" switch)" = "rota-engine.sh: switch-auto" ]'
 check "switch seat -> switch-all + flags" '[ "$("$R" switch work --force)" = "rota-engine.sh: switch-all work --force" ]'
 check "status reaches engine"             '[ "$("$R" status)" = "rota-engine.sh: status" ]'

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # rota: one command in front of a pool of Claude Code seats you own and pay for.
 #
-#   rota usage                measure every seat's quota live (alias: accounts)
+#   rota usage                measure every seat's quota live (engine view)
+#   rota accounts             the human table: quota + renewal + cost + whose seat
 #   rota switch [seat]        point new launches at the best seat, or at <seat>
 #   rota login <seat>         open a claude session pinned to <seat> so you can /login
 #   rota billing              quota + renewal + cost, one table (--json, --local)
@@ -42,7 +43,8 @@ usage_text() {
   cat <<'H'
 rota <verb> [args]
 
-  usage | accounts       measure every seat's quota live (--json, --no-refresh)
+  usage                  measure every seat's quota live (--json, --no-refresh)
+  accounts               the human table: quota, renewal, cost, and whose seat it is
   switch [seat]          bare: switch to the best seat; with a seat: switch-all <seat> [flags]
   login <seat>           open `claude` pinned to <seat>'s config dir so you can run /login
   billing [--json]       quota + renewal + cost in one table (--local reads this box)
@@ -111,7 +113,12 @@ verb="${1:-help}"; [ $# -gt 0 ] && shift
 case "$verb" in
   help|-h|--help)   usage_text ;;
   version|--version) cat "$ROTA_ROOT/VERSION" ;;
-  usage|accounts)   need "$ENGINE"; exec "$ENGINE" usage "$@" ;;
+  # ⚠️ `accounts` and `usage` are NOT the same view any more. `usage` is the
+  # engine's own measurement, which other things parse; `accounts` is the human
+  # table - quota, renewal, cost and WHOSE SEAT IT IS, in one place. Cédric asked
+  # for the comprehensive one under the name he actually types, 2026-08-26.
+  usage)            need "$ENGINE"; exec "$ENGINE" usage "$@" ;;
+  accounts)         need "$BILLING"; exec "$BILLING" "$@" ;;
   switch)
     need "$ENGINE"
     # bare, or flags only (e.g. --dry-run): let the picker choose; a seat name first: switch-all
