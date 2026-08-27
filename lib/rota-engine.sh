@@ -547,6 +547,35 @@ STATE_FILE="$CFG_DIR/current"
 USAGE_CACHE="$CFG_DIR/usage-cache.json"
 USAGE_API="https://api.anthropic.com/api/oauth/usage"
 
+# ── peers: boxes that hold a credential this one does not ────────────────────
+# One ssh destination per line, `#` comments and blanks ignored. Empty/absent by
+# default, which is exactly today's behaviour: no file, no peer, no ssh. See the
+# peer-usage block above collect_usage for what is read and why no credential
+# ever moves. ROTA_PEERS (space/comma separated) overrides the file, and being
+# SET-BUT-EMPTY is a real answer ("no peers"), which is how the remote leg of a
+# peer call switches the feature off on the box it lands on.
+PEERS_FILE="$CFG_DIR/peers"
+PEER_CACHE="$CFG_DIR/peer-usage-cache.json"
+PEER_TTL="${ROTA_PEER_TTL:-90}"            # seconds a peer payload stays reusable
+PEER_FAIL_TTL="${ROTA_PEER_FAIL_TTL:-300}" # …and how long a FAILED peer is left alone
+PEER_TIMEOUT="${ROTA_PEER_TIMEOUT:-10}"    # ceiling on the whole peer STEP, all peers
+# ⚠️ A KNOB IS SOMETHING A PERSON TYPED, so it is never trusted into arithmetic.
+# `ROTA_PEER_TIMEOUT=10s` is the obvious thing to write for a duration and used to
+# abort the whole command with `value too great for base`; `ROTA_PEER_TTL=abc`
+# printed `unbound variable` on stderr every single run. A bad knob now falls back
+# to its default SILENTLY, because a mistyped tuning value must never cost you the
+# table. 10# forces base ten, or a well-meant `090` would be read as octal.
+[[ "$PEER_TTL"      =~ ^[0-9]+$ ]] || PEER_TTL=90
+[[ "$PEER_FAIL_TTL" =~ ^[0-9]+$ ]] || PEER_FAIL_TTL=300
+[[ "$PEER_TIMEOUT"  =~ ^[0-9]+$ ]] || PEER_TIMEOUT=10
+PEER_TTL=$((10#$PEER_TTL)); PEER_FAIL_TTL=$((10#$PEER_FAIL_TTL)); PEER_TIMEOUT=$((10#$PEER_TIMEOUT))
+# ROTA_PEER_TIMEOUT=0 means the peer step is OFF, not "kill every dial the instant
+# it starts". "No time at all for peers" only sensibly reads as "do not", and it
+# gives a one-run kill switch (`ROTA_PEER_TIMEOUT=0 rota accounts`) that needs no
+# config edit. A 0 that silently meant 1s would be a lie about what you asked for.
+# 1 = this collection must not touch a peer; see resolve_shared_identity.
+PEER_SKIP=0
+
 # Health floor for the recommendation: an account needs real room left in BOTH
 # windows to be worth switching ONTO, or you switch and wall again within the hour.
 # It says nothing about the account you are already on, see EXHAUSTED_PCT.
@@ -2087,6 +2116,47 @@ iso_epoch() {
 
 epoch_fmt() { date -r "$1" "$2" 2>/dev/null || date -d "@$1" "$2" 2>/dev/null || printf '?'; }
 
+# epoch → the UTC ISO instant every machine surface in this tool speaks (the same
+# shape cache_flush's fetched_at and json_usage's generated_at already use). NOT
+# epoch_fmt, which renders in LOCAL time: a measurement stamp that silently
+# changes meaning with $TZ is the kind of number two boxes cannot compare.
+epoch_iso() {  # epoch_iso <epoch-seconds>
+  [[ "${1:-}" =~ ^[0-9]+$ ]] || return 0
+  date -u -r "$1" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+    || date -u -d "@$1" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true
+}
+
+# HOW OLD IS THIS NUMBER, in the one form you can read without stopping: a single
+# coarse unit, "4m" / "3h" / "2d". Deliberately not human_delta's two-unit "2d3h"
+# (that answers "how long have I got", a countdown, where the second unit earns
+# its place) and deliberately not a timestamp: the age rides in a NOTES cell next
+# to the number it qualifies, where anything longer stops being glanceable.
+#
+# 2026-08-27, the defect that made this necessary: a seat whose stored token has
+# been dead for days (nothing runs a session on it, so the keeper cannot rotate
+# it either) rendered a confident `27%` weekly behind a bare `[quota cached]`.
+# A 2.5-day-old number shown like a live one is worse than a blank, because a
+# blank sends you to look and a confident number does not.
+# Below this the source marker alone is enough: a number measured in the last two
+# minutes is, for every purpose this table serves, now. The threshold is applied
+# INSIDE age_short, not at each call site: a guard a caller has to remember is a
+# guard some caller will forget, and forgetting it here prints "0m old" next to a
+# number measured this second.
+# ⚠️ rota-billing.sh has the twin of this pair (its table is rendered in Python).
+# If this 120 moves, move that one: two surfaces disagreeing about when a number
+# stops being current is worse than either threshold on its own.
+AGE_VISIBLE_SECS=120
+age_short() {  # age_short <measured-at-epoch> → "" when it is young enough to be "now"
+  local te="${1:-}" now d
+  [[ "$te" =~ ^[0-9]+$ ]] || return 0
+  now="$(date '+%s')"
+  d=$((now - te)); (( d < 0 )) && d=0
+  (( d > AGE_VISIBLE_SECS )) || return 0
+  if   (( d >= 86400 )); then printf '%dd' $((d / 86400))
+  elif (( d >= 3600 ));  then printf '%dh' $((d / 3600))
+  else                        printf '%dm' $((d / 60)); fi
+}
+
 # Whole seconds from now until an ISO instant, the machine-readable twin of
 # human_delta(), so a --json consumer renders its own countdown instead of parsing
 # "in 4h31m" back into arithmetic. Prints NOTHING (→ null) when there is no instant
@@ -2244,10 +2314,437 @@ cache_age() {
   printf ' (%s old)' "${d#in }"
 }
 
+# ── peer usage: ask the box that legitimately holds the credential ───────────
+# THE PROBLEM, measured on the laptop 2026-08-27: four of five seats rendered `-`
+# in every quota column and `[quota none]` in NOTES, because this box holds one
+# credential. No stored credential → no token → no live fetch → no cache row →
+# nothing to print. The code was right about the input it had; the input was the
+# problem.
+#
+# THE OPTION THAT IS REJECTED, and must stay rejected: copying the credentials
+# here. An OAuth refresh token is SINGLE-USE, so two boxes holding one account's
+# credential means whichever rotates first invalidates the other, the loser 401s,
+# and the CLI hollows its file into a husk. That is the 2026-08-07 incident, and
+# cred-guard is still warning about it on this very box. A DISPLAY problem must
+# never be paid for with a second copy of a credential.
+#
+# SO: read the NUMBERS from the box that holds the credential. Nothing moves. The
+# call is read-only, the payload is percentages and reset instants (usage numbers
+# are not secret; tokens are, and none is ever transmitted), and every failure
+# mode degrades to exactly the table this box printed before.
+#
+# WHAT IS ASKED FOR, and why it is `--no-refresh`. Measured durban→ballito:
+# handshake alone 2.16s, `rota accounts --json` 4.12s, the same with
+# --no-refresh 2.46s. The peer runs the keeper on a 600s interval and its step 3
+# fetches usage per account per tick, so its cache IS the freshest thing
+# available: forcing a refresh buys ~0s of freshness for ~1.7s of latency. The
+# honesty that costs is bought back by quota_measured_at, which travels with
+# every row, so a peer number that is two days old SAYS it is two days old.
+#
+# `rota usage --json --no-refresh` is the fallback in the same ssh (one
+# handshake, not two): `rota accounts` needs a billing.json on the peer, and a
+# peer without one would otherwise silently contribute nothing.
+#
+# ROTA_PEERS= on the remote leg, and --local, are the loop guards: a peer that
+# has peers of its own must not go on to ssh a third box (or back here) inside
+# our timeout. --no-refresh alone already forces NET=0 there, which skips the
+# peer step anyway; the env var makes that structural rather than incidental.
+PEER_HOST=""            # the peer that answered, "" when none was consulted/usable
+PEER_GENERATED=""       # that payload's generated_at, for --json provenance
+peer_hosts() {
+  local raw="" line
+  if [[ -n "${ROTA_PEERS+set}" ]]; then
+    raw="$ROTA_PEERS"
+  elif [[ -f "$PEERS_FILE" ]]; then
+    raw="$(sed 's/#.*//' "$PEERS_FILE" 2>/dev/null || true)"
+  fi
+  raw="${raw//,/ }"
+  # NEVER ssh to ourselves: a peers file copied verbatim onto every box would
+  # otherwise make each one wait out a round trip to its own sshd for numbers it
+  # already has. FOUR spellings, because which one is right depends on the box:
+  # `hostname -s` is short, bare `hostname` and $HOSTNAME can carry the domain,
+  # and scutil is macOS-only (and is the name Cédric's fleet actually uses).
+  #
+  # ⚠️ Compared on the FIRST LABEL as well as verbatim. Truncating only the SELF
+  # side is what broke it: with HOSTNAME=durban.local and `durban.local` in the
+  # peers file, `durban` matched nothing and the box dialled its own sshd, which
+  # is precisely the case the $HOSTNAME spelling exists to catch. The cost of
+  # comparing first labels is that two genuinely different boxes sharing one
+  # (`mac.local` here, `mac.elsewhere.net` there) would be skipped; on a fleet
+  # whose names are `ballito` and `durban` that trade is free, and a wrongly
+  # skipped peer degrades to today's table rather than to a wrong one.
+  local self_names=() entries=() s short skip
+  self_names+=("$(hostname -s 2>/dev/null || true)")
+  self_names+=("$(hostname 2>/dev/null || true)")
+  self_names+=("$(scutil --get LocalHostName 2>/dev/null || true)")
+  self_names+=("${HOSTNAME:-}")
+  # WORD splitting is wanted here; GLOB expansion is not. Unquoted `for line in
+  # $raw` let a peers line containing `*` expand against the current directory,
+  # turning one hostname into a list of filenames. `set -f` for exactly the one
+  # expansion, then straight back off.
+  set -f
+  # shellcheck disable=SC2206  # the split is the point; `set -f` covers the rest
+  entries=( $raw )
+  set +f
+  for line in ${entries+"${entries[@]}"}; do
+    [[ -n "$line" ]] || continue
+    short="${line%%.*}"; skip=0
+    for s in "${self_names[@]}"; do
+      [[ -n "$s" ]] || continue
+      if [[ "$line" == "$s" || "$short" == "${s%%.*}" ]]; then skip=1; break; fi
+    done
+    (( skip )) && continue
+    printf '%s\n' "$line"
+  done
+}
+
+# One ssh, hard-bounded. There is no portable `timeout` on macOS, so the bound is
+# enforced here: background the call, watch it, and kill it at <budget> seconds.
+# ConnectTimeout only covers the connect, and the whole point of this bound is
+# that a peer which accepts the connection and then hangs must not hang US.
+#
+# The budget is passed IN rather than read from PEER_TIMEOUT, because the bound
+# the spec asks for is on the whole peer STEP, not on each dial: with three
+# hanging peers a per-dial bound spent 3 × PEER_TIMEOUT. peer_fill hands each
+# dial whatever is left of the step's deadline. With one peer the two are the
+# same number, so the single-peer path is byte-for-byte what it always was.
+peer_ssh() {  # peer_ssh <host> <out-file> <budget-secs>   → 0 when it produced something
+  local host="$1" out="$2" budget="${3:-$PEER_TIMEOUT}" pid ticks=0 max
+  (( budget > 0 )) || return 1
+  max=$(( budget * 5 ))          # the watch loop ticks every 0.2s
+  local remote='PATH="$HOME/.local/bin:$PATH"; export PATH; '
+  remote+='ROTA_PEERS= rota accounts --json --no-refresh --local 2>/dev/null '
+  remote+='|| ROTA_PEERS= rota usage --json --no-refresh 2>/dev/null'
+  : > "$out" 2>/dev/null || return 1
+  # `--` ends the options: a peers line starting with `-` is a hostname we cannot
+  # reach, never an ssh flag we did not mean to pass.
+  ssh -o BatchMode=yes -o ConnectTimeout=4 -o StrictHostKeyChecking=accept-new \
+      -o LogLevel=ERROR -- "$host" "$remote" > "$out" 2>/dev/null &
+  pid=$!
+  while (( ticks < max )); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.2
+    ticks=$((ticks + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    # No graceful path is implied here: TERM immediately followed by KILL IS a
+    # kill, and it kills the LOCAL ssh only. The `rota accounts` it started keeps
+    # running to completion on the peer, which is fine and worth stating plainly:
+    # that command is a read-only measurement, and its own --no-refresh means it
+    # does not even reach the network. What we are buying is our own deadline.
+    kill -TERM "$pid" 2>/dev/null || true
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    peer_note "$host: no answer within ${budget}s, ignoring it"
+    return 1
+  fi
+  wait "$pid" 2>/dev/null || true
+  [[ -s "$out" ]] || { peer_note "$host: answered with nothing, ignoring it"; return 1; }
+  return 0
+}
+
+# One explanatory line, --verbose only. A peer problem is never worth an error the
+# operator has to read: the whole feature is a bonus on top of a table that was
+# already correct without it.
+peer_note() { (( VERBOSE )) && printf '  peer %s\n' "$1" >&2; return 0; }
+
+# Ctrl-C between the ssh and the mv strands a `.peer.<pid>.json` or a
+# `peer-usage-cache.json.tmp.<pid>`. Both are tiny and bounded, but nothing else
+# sweeps them, so the step tidies anything an hour old on its way in. Deliberately
+# NOT an EXIT trap: this script installs none at all, and claiming the one global
+# trap for two stray temp files is a heavier commitment than the litter is worth.
+peer_tmp_sweep() {
+  find "$CFG_DIR" -maxdepth 1 \
+    \( -name '.peer.*.json' -o -name 'peer-usage-cache.json.tmp.*' \) \
+    -mmin +60 -delete 2>/dev/null || true
+  return 0
+}
+
+# ── the peer cache, in BOTH polarities ───────────────────────────────────────
+# SUCCESS, 90s (R3): running `rota accounts` twice in a row is what a human does,
+# and it must pay the round trip once.
+#
+# FAILURE, 300s, and this is the one that decides whether the feature is livable.
+# Caching only successes meant an unreachable peer was re-dialled on EVERY
+# invocation, so for as long as ballito was asleep, every `cdt accounts` on the
+# laptop stalled for the full 10s bound. That is a worse daily experience than
+# the blank table this feature exists to fix, and the kind of papercut that makes
+# a command stop being reached for.
+#
+# WHY 300s AND NOT 90s, AND NOT AN HOUR. The two costs pull opposite ways: too
+# short and a sleeping Mac (which stays asleep for hours) charges the stall over
+# and over; too long and a peer that has come BACK keeps being ignored while the
+# table it could fill sits there blank. 300s caps a dead peer at one 10s stall
+# per five minutes (~3% of the time, even running this constantly) while a woken
+# box is picked up within a coffee break. An hour would mean a laptop that woke
+# at 09:05 still showing blanks at 09:50, which is the same "this table is lying
+# about my seats" complaint we started from. `rm $CFG_DIR/peer-usage-cache.json`
+# forces an immediate retry for anyone who does not want to wait.
+#
+# Atomic write, same tmp.$$ + mv idiom as cache_put, for the same reason: a
+# half-written cache must never be readable.
+#
+# THREE ANSWERS, so the exit code carries what stdout cannot:
+#   0  a fresh payload, printed
+#   2  this peer failed recently, do NOT dial it again yet
+#   1  nothing known, go and dial
+peer_cache_get() {  # peer_cache_get <host> → payload on stdout; see the exit codes above
+  local host="$1" row age now failed
+  [[ -f "$PEER_CACHE" ]] || return 1
+  row="$(jq -c --arg h "$host" '.[$h] // empty' "$PEER_CACHE" 2>/dev/null || true)"
+  [[ -n "$row" ]] || return 1
+  age="$(jq -r '.at // empty' <<<"$row" 2>/dev/null || true)"
+  [[ "$age" =~ ^[0-9]+$ ]] || return 1
+  now="$(date '+%s')"
+  failed="$(jq -r 'if .failed then "1" else "" end' <<<"$row" 2>/dev/null || true)"
+  # STRICTLY less-than, on both, so that a TTL of 0 means what "0 seconds of
+  # reuse" plainly says: never reuse, always dial. With <= a same-second re-run
+  # still matched at age 0, so `ROTA_PEER_TTL=0` silently did nothing. The extra
+  # second it costs a real 90s/300s window is not worth a knob that lies.
+  if [[ "$failed" == "1" ]]; then
+    (( now - age < PEER_FAIL_TTL )) && return 2
+    return 1                       # the cooling-off window is over, try again
+  fi
+  (( now - age < PEER_TTL )) || return 1
+  jq -c '.payload // empty' <<<"$row" 2>/dev/null || true
+  return 0
+}
+
+# One writer for both polarities: a success record REPLACES a failure record and
+# vice versa, so a peer that comes back is never held down by its own history.
+peer_cache_write() {  # peer_cache_write <host> <payload-json|"">
+  local host="$1" payload="${2:-}" data entry
+  mkdir -p "$CFG_DIR" 2>/dev/null || return 0
+  data="$(cat "$PEER_CACHE" 2>/dev/null || echo '{}')"
+  jq -e . <<<"$data" >/dev/null 2>&1 || data='{}'
+  if [[ -n "$payload" ]]; then
+    entry="$(jq -cn --argjson p "$payload" --arg at "$(date '+%s')" \
+              '{at:($at|tonumber),payload:$p}' 2>/dev/null || true)"
+  else
+    entry="$(jq -cn --arg at "$(date '+%s')" '{at:($at|tonumber),failed:true}' 2>/dev/null || true)"
+  fi
+  [[ -n "$entry" ]] || return 0
+  data="$(jq -c --arg h "$host" --argjson e "$entry" '.[$h]=$e' <<<"$data" 2>/dev/null \
+          || printf '%s' "$data")"
+  printf '%s' "$data" > "$PEER_CACHE.tmp.$$" 2>/dev/null \
+    && mv "$PEER_CACHE.tmp.$$" "$PEER_CACHE" || true
+  return 0
+}
+
+# The payload for one host: cache first (either polarity), then ssh within the
+# budget the STEP has left. Returns nothing at all on any failure, which is the
+# whole contract.
+peer_payload() {  # peer_payload <host> <budget-secs>
+  local host="$1" budget="${2:-$PEER_TIMEOUT}" cached out payload rc=0
+  cached="$(peer_cache_get "$host")" || rc=$?
+  if (( rc == 0 )) && [[ -n "$cached" ]]; then
+    peer_note "$host: reusing the cached payload (<${PEER_TTL}s old)"
+    printf '%s' "$cached"; return 0
+  fi
+  if (( rc == 2 )); then
+    peer_note "$host: failed within the last ${PEER_FAIL_TTL}s, not dialling it again yet (rm $(tilde "$PEER_CACHE") to retry now)"
+    return 0
+  fi
+  # NOT a failure to record: we never dialled, so we learned nothing about this
+  # peer. Recording it would let one slow box blacklist every box behind it.
+  if (( budget <= 0 )); then
+    peer_note "$host: skipped, the ${PEER_TIMEOUT}s peer budget is already spent"
+    return 0
+  fi
+  out="$CFG_DIR/.peer.$$.json"
+  mkdir -p "$CFG_DIR" 2>/dev/null || return 0
+  if ! peer_ssh "$host" "$out" "$budget"; then
+    rm -f "$out"; peer_cache_write "$host" ""; return 0
+  fi
+  # The peer's stdout can carry a routing note or a warning ahead of the object
+  # (rota billing prints one when it reads another box), so take the JSON from the
+  # first `{`, exactly as rota-billing.sh does with the engine's own output.
+  payload="$(sed -n '/{/,$p' "$out" 2>/dev/null | jq -c 'select(type=="object")' 2>/dev/null | head -1 || true)"
+  rm -f "$out"
+  if [[ -z "$payload" ]]; then
+    peer_note "$host: answered with something that is not JSON, ignoring it"
+    peer_cache_write "$host" ""; return 0
+  fi
+  peer_cache_write "$host" "$payload"
+  printf '%s' "$payload"
+}
+
+# ⚠️ A PERCENTAGE OFF ANOTHER MACHINE IS UNTRUSTED INPUT, and this is the one
+# place peer data reaches bash ARITHMETIC. Unvalidated it was both a crash and a
+# code-execution hole, both reproduced 2026-08-27 against a hostile payload:
+#
+#   "weekly_left_pct":"n/a"                 → `n: unbound variable`, exit 1, no
+#                                             table and no JSON at all, breaking
+#                                             both the degrade-quietly promise
+#                                             above and `usage --json`'s "always
+#                                             one parseable object"
+#   "weekly_left_pct":"U_WKX[$(touch X)0]"  → exit 0, a normal-looking table, and
+#                                             the command RAN. Bash evaluates array
+#                                             subscripts inside $(( )), and `set -u`
+#                                             only blocks the undefined-array
+#                                             spelling, not a name that exists.
+#   "85%" / "1e3" / true                    → all three abort the command
+#
+# The peer is semi-trusted at best: StrictHostKeyChecking=accept-new means a
+# first-contact key (a re-imaged box, a LAN name takeover) is accepted silently,
+# so "numbers from a box I trust" is not a guarantee the bytes came from it. One
+# command as Cédric is a categorically different grant from reading percentages,
+# and this feature is sold as read-only with nothing moving.
+#
+# Same guard remaining() has used all along, eight lines up. A value that is not a
+# plain percentage is treated as THE PEER SUPPLIED NOTHING for that window, and the
+# row falls through silently (R3), rather than being reported or guessed at.
+peer_pct() {  # peer_pct <value> → the integer percentage it denotes, or nothing
+  local v="${1:-}"
+  [[ "$v" =~ ^[0-9]+(\.[0-9]+)?$ ]] || return 0
+  v="${v%.*}"
+  v=$((10#$v))                 # base ten, or a peer's "08" would be read as octal
+  (( v > 100 )) && v=100       # clamp: a nonsense 100000 must not become -99900
+  printf '%s' "$v"
+}
+
+# One peer row, \x1f-joined (never tab: see cache_get for why empty fields make
+# tab-splitting silently shift every field left).
+#
+# BOTH payload shapes are accepted. `rota accounts --json` names the fields
+# account / weekly_left_pct / weekly_resets_at, `rota usage --json` names them
+# email / weekly.remaining_pct / weekly.resets_at, and which one answered depends
+# on whether the peer had a billing.json. Neither shape is "the" shape, so the
+# reader takes either rather than making the caller care.
+#
+# MATCH ON EMAIL, NEVER ON ALIAS. An alias is a per-box directory name: `work` on
+# one box and `work` on another are not promised to be the same login, and a
+# cross-matched row would put one seat's numbers on another seat's line.
+peer_row() {  # peer_row <payload> <email>
+  jq -r --arg e "$2" '
+    ((.accounts // []) | map(select(((.account // .email) // "") == $e)))[0] // empty
+    | [ (.weekly_left_pct     // .weekly.remaining_pct    // ""),
+        (.weekly_resets_at    // .weekly.resets_at        // ""),
+        (.five_hour_left_pct  // .five_hour.remaining_pct // ""),
+        (.five_hour_resets_at // .five_hour.resets_at     // ""),
+        (.quota_data          // .data                    // ""),
+        (.quota_measured_at   // "") ]
+    | map(tostring) | join("\u001f")' <<<"$1" 2>/dev/null || true
+}
+
+# THE PRECEDENCE (R4), and it is short on purpose:
+#   1. a LIVE local fetch always wins, it is the freshest truth obtainable
+#   2. otherwise the NEWER MEASUREMENT wins, local cache or peer, whichever
+#      actually measured its number later
+#   3. nothing → the row stays exactly as it was, `-` and [quota none]
+#
+# Peer numbers are deliberately NOT written into this box's usage-cache.json.
+# That cache means "what THIS box measured"; seeding it from a peer would let a
+# borrowed number come back next run wearing local clothes, with the provenance
+# stripped off. The peer payload has its own cache with its own 90s TTL.
+peer_fill() {
+  local hosts host payload i email row deadline budget
+  local p_wkl p_wkr p_sel p_ser p_state p_meas p_epoch l_epoch gen_epoch
+  local p_pct p_uwk p_use
+  local wanted=0
+  (( NET )) || return 0            # --no-refresh means no network, and ssh is network
+  (( PEER_SKIP )) && return 0      # a caller with its own budget said no
+  (( PEER_TIMEOUT > 0 )) || return 0   # ROTA_PEER_TIMEOUT=0 = the step is off
+  command -v jq >/dev/null 2>&1 || return 0
+  command -v ssh >/dev/null 2>&1 || return 0
+  # A box where every row is live never pays the round trip.
+  for i in "${!DIRS[@]}"; do
+    case "${U_STATE[$i]}" in none|cached) wanted=1; break ;; esac
+  done
+  (( wanted )) || return 0
+  hosts="$(peer_hosts)"
+  [[ -n "$hosts" ]] || return 0
+  peer_tmp_sweep
+
+  # ── THE BOUND IS ON THE STEP, NOT ON THE DIAL ──────────────────────────────
+  # One deadline for the whole peer step, computed once. Each dial gets whatever
+  # is LEFT of it (never more than PEER_TIMEOUT), and a peer reached after the
+  # budget is spent is skipped rather than dialled. Before this the watchdog sat
+  # inside peer_ssh, which runs once per host, so three hanging peers cost
+  # 3 × PEER_TIMEOUT (~30s at the default) while the spec, and the operator
+  # waiting at a prompt, were promised ~10s for the lot. config/peers.example
+  # invites a list, so this was reachable as shipped, not theoretical.
+  #
+  # A CACHED payload still counts, budget or no budget: peer_payload only gates
+  # the dial, so a peer whose answer is already on disk keeps contributing after
+  # a slow box ahead of it has eaten the clock.
+  deadline=$(( $(date '+%s') + PEER_TIMEOUT ))
+
+  while read -r host; do
+    [[ -n "$host" ]] || continue
+    budget=$(( deadline - $(date '+%s') ))
+    (( budget > PEER_TIMEOUT )) && budget="$PEER_TIMEOUT"
+    payload="$(peer_payload "$host" "$budget")"
+    [[ -n "$payload" ]] || continue
+    gen_epoch="$(iso_epoch "$(jq -r '.generated_at // empty' <<<"$payload" 2>/dev/null || true)")"
+    local used_any=0
+    for i in "${!DIRS[@]}"; do
+      case "${U_STATE[$i]}" in none|cached) ;; *) continue ;; esac
+      email="${U_EMAIL[$i]}"
+      [[ -n "$email" ]] || continue
+      row="$(peer_row "$payload" "$email")"
+      [[ -n "$row" ]] || continue
+      IFS=$'\x1f' read -r p_wkl p_wkr p_sel p_ser p_state p_meas <<<"$row"
+      # VALIDATED here, before anything numeric happens to them, see peer_pct
+      p_uwk=""; p_use=""
+      p_pct="$(peer_pct "$p_wkl")"; [[ -n "$p_pct" ]] && p_uwk="$((100 - p_pct))"
+      p_pct="$(peer_pct "$p_sel")"; [[ -n "$p_pct" ]] && p_use="$((100 - p_pct))"
+      # a peer row with no usable numbers of its own (its own box could not measure
+      # that seat either, or it sent something that is not a percentage) is not an
+      # answer, it is the same blank in someone else's hand
+      [[ -n "$p_uwk$p_use" ]] || continue
+      [[ "$p_state" == "dup" ]] && continue
+      # R4: peer freshness is the row's own measurement instant when the peer
+      # publishes one, and the payload's generated_at when it does not (an older
+      # peer that predates quota_measured_at). generated_at is the optimistic
+      # reading of the two, so it is the fallback, never the preference.
+      p_epoch="$(iso_epoch "$p_meas")"
+      [[ "$p_epoch" =~ ^[0-9]+$ ]] || p_epoch="$gen_epoch"
+      if [[ "${U_STATE[$i]}" == "cached" ]]; then
+        l_epoch="${U_AGE[$i]:-}"
+        # a local cache row we cannot date loses to a peer row we can, and vice
+        # versa; two undatable rows leave the local one in place (do no harm)
+        if [[ "$l_epoch" =~ ^[0-9]+$ ]] && [[ "$p_epoch" =~ ^[0-9]+$ ]]; then
+          (( p_epoch > l_epoch )) || continue
+        elif [[ ! "$p_epoch" =~ ^[0-9]+$ ]]; then
+          continue
+        fi
+      fi
+      U_STATE[i]="peer"
+      U_SRC[i]="$host"
+      # the peer publishes % LEFT; this file stores % USED (the API's utilization),
+      # so it was inverted back on the way in (above, after validation) and
+      # remaining() returns the same integer the peer printed
+      U_WKU[i]="$p_uwk"; U_SEU[i]="$p_use"
+      U_WKR[i]="$p_wkr"; U_SER[i]="$p_ser"; U_SDR[i]="$p_wkr"
+      # the peer publishes the binding NUMBER but not which limit produced it, so
+      # the row carries no scope annotation rather than a borrowed or invented one
+      U_WKK[i]=""; U_WKS[i]=""
+      U_WKX[i]=0; U_SEX[i]=0
+      window_expired "$p_wkr" && U_WKX[i]=1
+      window_expired "$p_ser" && U_SEX[i]=1
+      U_TS[i]=""; U_AGE[i]=""; U_MEAS[i]=""
+      if [[ "$p_epoch" =~ ^[0-9]+$ ]]; then
+        U_AGE[i]="$p_epoch"; U_MEAS[i]="$(epoch_iso "$p_epoch")"
+      fi
+      U_VIA[i]="numbers read from $host over ssh; no credential moved, this box never held one for this seat"
+      used_any=1
+    done
+    if (( used_any )); then
+      PEER_HOST="$host"
+      PEER_GENERATED="$(jq -r '.generated_at // empty' <<<"$payload" 2>/dev/null || true)"
+      peer_note "$host: filled in the rows this box could not measure"
+      return 0            # first peer that answers usefully wins
+    fi
+    peer_note "$host: answered, but had nothing this box is missing"
+  done <<<"$hosts"
+  return 0
+}
+
 # ── collect usage for every slot, at most one fetch per token ────────────────
 # Fills, per slot index i:
 #   U_EMAIL[i]  the account that slot's own config JSON says it is
-#   U_STATE[i]  live | cached | none | dup
+#   U_STATE[i]  live | cached | peer | none | dup
 #   U_WKU/U_WKR/U_SEU/U_SER[i]   utilization + reset instant, per window. The weekly
 #               pair is the BINDING weekly limit (see weekly_binding), falling back to
 #               seven_day when the response carries no usable `limits` array.
@@ -2261,8 +2758,16 @@ cache_age() {
 #   U_TS[i]     cache stamp for a cached row
 #   U_VIA[i]    provenance note (e.g. numbers taken from the live shared credential)
 #   U_DUP[i]    index of the earlier slot holding the same account, or -1
+#   U_SRC[i]    the PEER these numbers were read from, "" when they are this box's own
+#   U_MEAS[i]   WHEN this row's numbers were actually measured (UTC ISO), which is
+#               not the same question as when the report was generated. A live row
+#               was measured this run; a cached row was measured whenever the cache
+#               says; a peer row was measured on the peer, possibly days ago. Every
+#               surface that prints an age reads this, so "how old is this number"
+#               has exactly one answer per row.
 # Plus the shared ~/.claude credential's own row in S_*.
 NET=1                      # 0 = --no-refresh: cache only, never touch the network
+RUN_MEASURED_AT=""         # UTC ISO instant this pass's LIVE numbers were measured
 COLLECTED=0
 COLLECTED_NET=0            # was the completed collection allowed to use the network?
 SHARED_TWIN_SLOT=-1        # slot whose credential bytes are identical to the shared one
@@ -2277,13 +2782,19 @@ collect_usage() {
                            # freeze cache-only rows in for the rest of the run
   command -v jq >/dev/null 2>&1 || die "usage needs jq"
   local i j
+  # ONE stamp for the whole pass, taken before the first fetch: every row that
+  # comes back live this run was measured at (near enough) this instant, and
+  # re-reading the clock per row would publish N slightly different answers to a
+  # question that has one.
+  RUN_MEASURED_AT="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  PEER_HOST=""; PEER_GENERATED=""
   U_EMAIL=(); U_STATE=(); U_WKU=(); U_WKR=(); U_SEU=(); U_SER=()
   U_WKX=(); U_SEX=(); U_WHY=(); U_TS=(); U_VIA=(); U_DUP=()
-  U_WKK=(); U_WKS=(); U_SDR=()
+  U_WKK=(); U_WKS=(); U_SDR=(); U_SRC=(); U_MEAS=()
   for i in "${!DIRS[@]}"; do
     U_EMAIL[i]=""; U_STATE[i]="none"; U_WKU[i]=""; U_WKR[i]=""; U_SEU[i]=""; U_SER[i]=""
     U_WKX[i]=0; U_SEX[i]=0; U_WHY[i]=""; U_TS[i]=""; U_VIA[i]=""; U_DUP[i]=-1
-    U_WKK[i]=""; U_WKS[i]=""; U_SDR[i]=""; U_AGE[i]=""
+    U_WKK[i]=""; U_WKS[i]=""; U_SDR[i]=""; U_AGE[i]=""; U_SRC[i]=""; U_MEAS[i]=""
   done
 
   # the shared credential FIRST: it is both the identity fingerprint and the row
@@ -2407,6 +2918,7 @@ collect_usage() {
         U_WHY[i]="unexpected usage schema"
       else
         U_STATE[i]="live"
+        U_MEAS[i]="$RUN_MEASURED_AT"
         cache_put "$email" "${U_WKU[$i]}" "${U_WKR[$i]}" "${U_SEU[$i]}" "${U_SER[$i]}"
         continue
       fi
@@ -2430,12 +2942,20 @@ collect_usage() {
       U_WKK[i]=""; U_WKS[i]=""; U_SDR[i]="$C_WKR"
       U_TS[i]="$C_TS$(cache_age "$C_TE")"
       U_AGE[i]="$C_TE"
+      # ts_epoch is when the number was MEASURED, which is the only honest answer
+      # to "how old is this". Older cache files carry only the human stamp; those
+      # rows publish no measured_at rather than a guessed one.
+      U_MEAS[i]="$(epoch_iso "$C_TE")"
       window_expired "$C_WKR" && U_WKX[i]=1
       window_expired "$C_SER" && U_SEX[i]=1
     else
       U_STATE[i]="none"
     fi
   done
+  # LAST, and only for the rows still blank or still cached: everything above is
+  # what this box can measure itself, and a local live fetch outranks any peer.
+  # Deliberately before cache_flush only in reading order, it queues nothing.
+  peer_fill
   cache_flush
   return 0   # the loop can end on a false window_expired test, never leak that as a failure
 }
@@ -2464,6 +2984,13 @@ collect_usage() {
 #                       is deliberately NOT done: the usage API rate-limits per
 #                       token at ~1/min, so a second sweep would 429 the rows that
 #                       had just succeeded.
+#
+# R6, peer rows: a `peer` row is STALE by this test, deliberately and identically
+# to a `cached` one. Both are real numbers about a real seat that this run did not
+# measure, so anything that demands a live row (the strict first pass of
+# switch-auto, `live:` in --json) must keep refusing both, and anything that
+# accepts a cached row (resolve_mode, the burn-down hold, switch-auto's second
+# pass) must accept both. Nothing gets a new exemption because it arrived by ssh.
 usage_row_stale() {  # usage_row_stale <slot-index>
   local i="${1:--1}"
   [[ "$i" =~ ^[0-9]+$ ]] || return 1
@@ -2584,8 +3111,22 @@ resolve_shared_identity() {
   fi
   # keep the degraded (no-oauthAccount) path inside callers' timeouts, the dashboard
   # allows this script 30s and there is one fetch per pool account
-  [[ "$mode" == "--verify" ]] || USAGE_CURL_TIMEOUT=5
+  #
+  # PEER_SKIP is the same rule extended to the peer step, and it needs its own
+  # switch because USAGE_CURL_TIMEOUT bounds curl and bounds nothing about ssh.
+  # peer_fill lives inside collect_usage, so every caller inherits it, and this
+  # branch runs with NET=1: measured 2026-08-27, `rota active` against three
+  # hanging peers took 32s and blew the 30s budget the line above exists to
+  # respect. It is skipped rather than squeezed because this path wants an
+  # IDENTITY, not quota: which credential sits in ~/.claude is a question about
+  # THIS box, and a peer's borrowed percentages cannot answer it. The dashboard
+  # path (--verify, and the oauthAccount fast path) is untouched and still peers.
+  if [[ "$mode" != "--verify" ]]; then
+    USAGE_CURL_TIMEOUT=5
+    PEER_SKIP=1
+  fi
   collect_usage
+  PEER_SKIP=0
 
   local fp="" fp_src="" ambiguous=0 i
   local n_match=0 first_match=-1 n_left=0 first_left=-1
@@ -2689,6 +3230,9 @@ adopt_shared_numbers() {
   U_WKK[SHARED_SLOT]="$S_WKK"; U_WKS[SHARED_SLOT]="$S_WKS"; U_SDR[SHARED_SLOT]="$S_SDR"
   U_WKX[SHARED_SLOT]=0; U_SEX[SHARED_SLOT]=0
   U_STATE[SHARED_SLOT]="live"
+  # a LIVE local fetch outranks anything borrowed, so a peer row for this slot is
+  # replaced outright, provenance and age included, not merely overwritten
+  U_SRC[SHARED_SLOT]=""; U_AGE[SHARED_SLOT]=""; U_MEAS[SHARED_SLOT]="$RUN_MEASURED_AT"
   if [[ -n "$SHARED_WARN" ]]; then
     U_VIA[SHARED_SLOT]="numbers from the LIVE shared ~/.claude credential, identity sources disagree (see the WARNING above); this row is what the shared credential itself reports, NOT ${U_EMAIL[$SHARED_SLOT]}'s own pool numbers"
   else
@@ -2792,7 +3336,11 @@ resolve_mode() {
   REC_MODE="floor"; REC_MODE_FORCED=0; BEST_ALT_EMAIL=""; BEST_ALT_PCT=""
   local i left
   for i in "${!DIRS[@]}"; do
-    [[ "${U_STATE[$i]}" == "live" || "${U_STATE[$i]}" == "cached" ]] || continue
+    # `peer` counts exactly as `cached` does here, and everywhere else a state is
+    # tested: it is real data about a real seat, measured somewhere else. Letting
+    # it in where cached is in (and, more importantly, keeping it out where cached
+    # is out) is the whole rule, see the R6 note above usage_row_stale.
+    [[ "${U_STATE[$i]}" == "live" || "${U_STATE[$i]}" == "cached" || "${U_STATE[$i]}" == "peer" ]] || continue
     (( SHARED_SLOT >= 0 )) && (( i == SHARED_SLOT )) && continue
     (( U_WKX[i] == 0 )) || continue
     left="$(remaining "${U_WKU[$i]}")"
@@ -2843,9 +3391,9 @@ active_burndown_hold() {   # 0 = hold the active account, 1 = let the ranking de
   BURN_WKL=""; BURN_SEL=""; BURN_CACHED=0; BURN_BLOCKED=0
   (( SHARED_SLOT >= 0 )) || return 1
   case "${U_STATE[$SHARED_SLOT]}" in
-    live)   ;;
-    cached) BURN_CACHED=1 ;;
-    *)      return 1 ;;   # dup / no data, nothing to hold on
+    live)        ;;
+    cached|peer) BURN_CACHED=1 ;;   # borrowed or remembered, either way not this run's
+    *)           return 1 ;;        # dup / no data, nothing to hold on
   esac
   (( U_WKX[SHARED_SLOT] == 0 )) || return 1
   BURN_WKL="$(remaining "${U_WKU[$SHARED_SLOT]}")"
@@ -2896,7 +3444,12 @@ compute_recommendation() {  # compute_recommendation <exclude_active 0|1> <requi
       U_REASON[i]="its home IS the shared ~/.claude, nothing to swap in"; continue
     fi
     if [[ "${U_STATE[$i]}" != "live" ]]; then
-      if (( allow_cached )) && [[ "${U_STATE[$i]}" == "cached" ]] \
+      # `peer` rides with `cached`, in BOTH directions: it is admitted only on the
+      # second (allow_cached) pass switch-auto makes, and the strict live-only
+      # first pass excludes it exactly as it excludes a cached row. A peer number
+      # is real, but it was not measured here this run, and that is the property
+      # the strict pass is testing.
+      if (( allow_cached )) && [[ "${U_STATE[$i]}" == "cached" || "${U_STATE[$i]}" == "peer" ]] \
          && (( U_WKX[i] == 0 )) && (( U_SEX[i] == 0 )); then
         cached_row=1
       else
@@ -3063,6 +3616,14 @@ state_tag() {  # state_tag <slot-index>
         fi
       fi
       printf 'cached %s' "${U_TS[$1]}" ;;
+    peer)
+      # WHOSE MEASUREMENT IS THIS. A number this box did not take must say so, and
+      # say how old it is once that stops being "just now": the peer answers from
+      # its own cache, which for a seat nothing runs sessions on can be days old.
+      # age_short answers "" for anything young enough to be current.
+      local pa; pa="$(age_short "${U_AGE[$1]:-}")"
+      if [[ -n "$pa" ]]; then printf 'via %s, %s old' "${U_SRC[$1]:-a peer}" "$pa"
+      else printf 'via %s' "${U_SRC[$1]:-a peer}"; fi ;;
     dup)    printf 'duplicate row' ;;
     *)      printf 'no data' ;;
   esac
@@ -3310,7 +3871,15 @@ recommendation_text() {
     # shellcheck disable=SC2016  # literal backticks around the command to run
     [[ -n "$REC_NEXT_EMAIL" ]] && next_note="$(printf ' Then `rota switch` moves to %s (`rota switch %s`).' \
       "$REC_NEXT_EMAIL" "$REC_NEXT_ALIAS")"
-    (( BURN_CACHED )) && cache_note=" [from CACHED numbers, ${U_TS[$SHARED_SLOT]:-age unknown}]"
+    if (( BURN_CACHED )); then
+      # same distinction as the optimizer-pick line: a borrowed number says whose
+      # it is, a remembered one says how old it is, and neither pretends to be live
+      if [[ "${U_STATE[$SHARED_SLOT]}" == "peer" ]]; then
+        cache_note=" [not a live measurement: $(state_tag "$SHARED_SLOT")]"
+      else
+        cache_note=" [from CACHED numbers, ${U_TS[$SHARED_SLOT]:-age unknown}]"
+      fi
+    fi
     printf '→ stay on %s: weekly %s%% used · %s%% left%s, %s; switch at ~%s%% left.%s%s%s\n' \
       "$REC_EMAIL" "$(used "${U_WKU[$SHARED_SLOT]}")" "$BURN_WKL" \
       "$(scope_note "${U_WKS[$SHARED_SLOT]}")" "$when_clause" "$EXHAUSTED_PCT" \
@@ -4166,6 +4735,18 @@ json_usage() {
     # is an alias of `five_hour` under the name the phone UI uses.
     wk_in="$(iso_in_seconds "${U_WKR[$i]}")"; [[ -n "$wk_in" ]] || wk_in="null"
     se_in="$(iso_in_seconds "${U_SER[$i]}")"; [[ -n "$se_in" ]] || se_in="null"
+    # ── provenance, ADDITIVE (2026-08-27) ────────────────────────────────────
+    # Three fields, one question: how much should a consumer trust this number?
+    #   quota_data         live | cached | peer | none | dup, the same word `data`
+    #                      has always carried, under the name rota-billing.sh
+    #                      publishes it as, so ONE vocabulary spans both surfaces
+    #                      and a peer parser does not have to care which answered
+    #   quota_source       the peer host these numbers were read from, null when
+    #                      this box measured them itself
+    #   quota_measured_at  when the numbers were MEASURED, not when the object was
+    #                      generated. The two differ by days on a seat nothing runs
+    #                      sessions on, and a machine consumer deserves the same
+    #                      honesty the table gets, see age_short.
     logged_in=false; slot_logged_in "$i" && logged_in=true
     is_live=false; [[ "${U_STATE[$i]}" == "live" ]] && is_live=true
     is_stale=false; usage_row_stale "$i" && is_stale=true
@@ -4183,6 +4764,8 @@ json_usage() {
       --arg wk_kind "${U_WKK[$i]}" \
       --arg wk_scope "${U_WKS[$i]}" \
       --arg cached_at "${U_TS[$i]}" \
+      --arg src "${U_SRC[$i]:-}" \
+      --arg meas "${U_MEAS[$i]:-}" \
       --arg why "${U_WHY[$i]}" \
       --arg via "${U_VIA[$i]}" \
       --arg reason "${U_REASON[$i]}" \
@@ -4195,6 +4778,9 @@ json_usage() {
       '{label:$label, email:$email, config_dir:$dir, alias:$alias, active:$active,
         current:$active, loggedIn:$logged_in, live:$is_live, stale:$is_stale,
         data:$state, cached_at:(if $cached_at=="" then null else $cached_at end),
+        quota_data:$state,
+        quota_source:(if $src=="" then null else $src end),
+        quota_measured_at:(if $meas=="" then null else $meas end),
         weekly:{remaining_pct:$wk, used_pct:$wk_used, resets_at:(if $wk_reset=="" then null else $wk_reset end), expired:($wk_exp==1), fresh:$wk_fresh,
                 kind:(if $wk_kind=="" then null else $wk_kind end),
                 scope:(if $wk_scope=="" then null else $wk_scope end),
@@ -4239,6 +4825,8 @@ json_usage() {
     --arg auth "$SHARED_AUTH" \
     --arg auth_warn "$AUTH_WARN" \
     --arg nested_warn "$NESTED_WARN" \
+    --arg peer_host "$PEER_HOST" \
+    --arg peer_gen "$PEER_GENERATED" \
     --arg action "$action" \
     --arg rec_reason "$rec_reason" \
     --argjson rec_email "$rec_email" --argjson rec_alias "$rec_alias" \
@@ -4264,6 +4852,9 @@ json_usage() {
       activeEmail:(if $active=="" then null else $active end),
       floors:{weekly_pct:$min_weekly, session_pct:$min_session,
               exhausted_pct:$exhausted, comfortable_pct:$comfortable},
+      peer:(if $peer_host=="" then null
+            else {host:$peer_host,
+                  generated_at:(if $peer_gen=="" then null else $peer_gen end)} end),
       accounts:.,
       recommendation:{action:$action, email:$rec_email, label:$rec_label,
                       alias:$rec_alias, weekly_resets_at:$rec_reset,
@@ -4529,7 +5120,16 @@ main() {
       # the cached-fallback marker is a SUFFIX, so the live-numbers line, the one
       # the operator sees every day, is byte-for-byte what it has always been
       local pick_src=""
-      (( REC_CACHED )) && pick_src=" [from CACHED numbers, ${U_TS[$REC_SLOT]:-age unknown}]"
+      # A peer-sourced pick is not "cached" in the sense this line has always
+      # meant (this box's own last-good numbers), so it names the box that
+      # measured it instead of claiming an age from an empty local cache stamp.
+      if (( REC_CACHED )); then
+        if [[ "${U_STATE[$REC_SLOT]}" == "peer" ]]; then
+          pick_src=" [not a live measurement: $(state_tag "$REC_SLOT")]"
+        else
+          pick_src=" [from CACHED numbers, ${U_TS[$REC_SLOT]:-age unknown}]"
+        fi
+      fi
       printf 'optimizer pick: %s (slot %s, %s; current: %s)%s\n' \
         "$REC_EMAIL" "${LABELS[$REC_SLOT]}" "$pick_when" "${SHARED_EMAIL:-unknown}" "$pick_src"
       if (( dry )); then

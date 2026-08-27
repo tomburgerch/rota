@@ -23,9 +23,9 @@
 # its own config dir (the same file the shim reads when it refuses to open a
 # session there) or is named in $CFG_DIR/reserved as `alias [owner] [why...]`.
 #
-# The quota columns are LIVE and re-measured on every run. The billing columns
-# are only as true as billing.json; config/billing.example.json documents the
-# schema and how to re-measure each field.
+# The quota columns are re-measured every run; any number that is NOT a live
+# local measurement says so in NOTES ([cached, 2d old], [via ballito]). Billing
+# is only as true as billing.json; config/billing.example.json documents it.
 #
 # WHY IT ROUTES. If you run more than one machine, the pool that matters usually
 # lives on the always-on box; a laptop's ~/.claude-pool is often a near-empty
@@ -191,7 +191,22 @@ for a in usage.get('accounts', []):
         'weekly_left_pct': w.get('remaining_pct'),
         'weekly_resets_at': w.get('resets_at'),
         'five_hour_left_pct': f.get('remaining_pct'),
+        'five_hour_resets_at': f.get('resets_at'),
+        # ── WHERE DID THIS NUMBER COME FROM, AND WHEN ────────────────────────
+        # quota_data is live | cached | peer | none. quota_source names the peer
+        # box when the engine had to read the seat's numbers over ssh (this box
+        # holds no credential for it, and copying one here is the option that is
+        # permanently rejected: an OAuth refresh token is single-use). Passed
+        # through under the SAME names the engine publishes, because this JSON is
+        # itself what a peer reads: an asymmetric vocabulary would mean the peer
+        # parser had to know which of two shapes answered it.
         'quota_data': a.get('data'),
+        'quota_source': a.get('quota_source'),
+        # 2026-08-27: the table used to render a 2.5-day-old cached number behind
+        # a bare `[quota cached]`, which reads exactly like a current one. This is
+        # the field that stops that, and it is the MEASUREMENT instant, never the
+        # generated_at of the report carrying it.
+        'quota_measured_at': a.get('quota_measured_at'),
         'plan': b.get('plan', '?'),
         'renews_day': b.get('renews_day'),
         'next_charge': nxt.isoformat() if nxt else None,
@@ -218,6 +233,10 @@ rows.sort(key=lambda r: (r['next_charge'] is None, r['next_charge'] or '', r['ac
 if os.environ.get('WANT_JSON') == '1':
     print(json.dumps({'generated_at': usage.get('generated_at'),
                       'active': usage.get('activeEmail'),
+                      # null unless a peer actually contributed a row, so a
+                      # consumer can tell "no peer configured" from "peer used"
+                      # without scanning every account for a quota_source.
+                      'peer': usage.get('peer'),
                       'monthly_total_usd_approx': round(total, 2),
                       'accounts': rows}, indent=2))
     sys.exit(0)
@@ -247,6 +266,39 @@ def countdown(ts):
     d, rem = divmod(secs, 86400)
     h, m = divmod(rem // 60, 60)
     return f"{d}d {h:02d}h" if d else f"{h}h {m:02d}m"
+
+# ── HOW OLD IS THIS NUMBER ──────────────────────────────────────────────────
+# countdown()'s twin, pointing backwards, and deliberately COARSER: one unit,
+# "4m" / "3h" / "2d". It rides inside a NOTES cell next to the number it
+# qualifies, where anything longer stops being glanceable.
+#
+# Measured on the pool 2026-08-27: two seats' access tokens have been dead for
+# ~17h and ~59h, and the keeper cannot rotate them because nothing runs a session
+# on those seats, so the staleness is STRUCTURAL and will persist. Their rows
+# still printed a confident weekly percentage behind a bare `[quota cached]`. A
+# 2.5-day-old number shown like a live one is worse than a blank, because a blank
+# sends Cédric to look and a confident number does not. Below AGE_VISIBLE_SECS
+# the source marker alone is enough: that number is, for every purpose this table
+# serves, now.
+# ⚠️ rota-engine.sh has the twin of this pair (its own dashboard is bash). If this
+# 120 moves, move that one: two surfaces disagreeing about when a number stops
+# being current is worse than either threshold on its own.
+AGE_VISIBLE_SECS = 120
+def age_short(ts):
+    if not ts: return ''
+    # except Exception, not except ValueError. A stamp that is None-ish, naive, or
+    # simply not a string raises TypeError/AttributeError instead, and a traceback
+    # under a half-drawn table is the one failure mode this whole file is written
+    # to avoid. An age we cannot compute is an age we do not print.
+    try:
+        secs = int((datetime.now().astimezone()
+                    - datetime.fromisoformat(ts.replace('Z', '+00:00'))).total_seconds())
+    except Exception:
+        return ''
+    if secs <= AGE_VISIBLE_SECS: return ''
+    if secs >= 86400: return f"{secs // 86400}d"
+    if secs >= 3600:  return f"{secs // 3600}h"
+    return f"{secs // 60}m"
 
 # A bar makes the column scannable: five seats sorted by charge date are five
 # numbers you have to read, but one glance at the bars finds the empty ones.
@@ -296,8 +348,22 @@ for r in rows:
         notes.append(c(f"CANCELLED, ends {datetime.fromisoformat(r['ends']).strftime('%-d %b')}", '31'))
     elif r['status'] == 'unknown':
         notes.append(c('billing unknown, add it to billing.json', '33'))
+    # ⚠️ PROVENANCE AND AGE ON EVERY NUMBER THIS BOX DID NOT MEASURE LIVE. The
+    # marker answers "whose measurement is this", the age answers "from when",
+    # and a row missing either one reads as current when it may be days old.
+    # It COMPOSES with RESERVED / CANCELLED above rather than replacing them:
+    # whose seat it is and how fresh the number is are different questions.
     if r['quota_data'] not in ('live', None):
-        notes.append(c(f"[quota {r['quota_data']}]", '33'))
+        age = age_short(r.get('quota_measured_at'))
+        if r['quota_data'] == 'peer':
+            # the peer's own name, not "a peer": which box answered is the whole
+            # point of the marker, and it is what you would ssh to to check
+            where = r.get('quota_source') or 'a peer'
+            notes.append(c(f"[via {where}, {age} old]" if age else f"[via {where}]", '33'))
+        elif r['quota_data'] == 'cached':
+            notes.append(c(f"[cached, {age} old]" if age else "[cached]", '33'))
+        else:
+            notes.append(c(f"[quota {r['quota_data']}]", '33'))
 
     nc_plain = datetime.fromisoformat(r['next_charge']).strftime('%-d %b %Y') if r['next_charge'] else 'none'
     nc = pad(nc_plain, 12, None if r['next_charge'] else '90', right=True)
@@ -397,5 +463,16 @@ if held:
 missing = [r['account'] for r in rows if r['status'] == 'unknown']
 if missing:
     print(c(f"  billing unknown for: {', '.join(missing)}; add to {os.environ['BILLING_JSON']}", '33'))
-print(f"\n  {c('quota is measured live; billing comes from billing.json; reservations from each seat'+chr(39)+'s RESERVED marker + $CFG_DIR/reserved', '2')}\n")
+# The peer clause appears only when a row actually used a peer, so a box with no
+# peers configured never sees it. (The LEAD-IN did change unconditionally, see
+# below: it used to promise LIVE for the whole table, which is the over-claim the
+# per-row markers exist to retire, and that is true peer or no peer.)
+peer_hosts = sorted({r.get('quota_source') for r in rows
+                     if r.get('quota_data') == 'peer' and r.get('quota_source')})
+peer_clause = (f"; rows marked [via {' / '.join(peer_hosts)}] were read over ssh from "
+               f"{'that box, which holds' if len(peer_hosts) == 1 else 'those boxes, which hold'} "
+               f"the credential this one does not (no credential is ever copied)") if peer_hosts else ''
+# "unless a row says otherwise": the lead-in used to promise LIVE for the whole
+# table, which was the same over-claim the per-row markers exist to retire.
+print(f"\n  {c('quota is measured live unless the row says otherwise; billing comes from billing.json; reservations from each seat'+chr(39)+'s RESERVED marker + $CFG_DIR/reserved'+peer_clause, '2')}\n")
 PY
