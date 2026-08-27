@@ -155,5 +155,103 @@ OUT="$("$LIB/rota-billing.sh" 2>/dev/null)"
 check "table: countdown column is rendered"      'grep -qE "[0-9]+d [0-9]{2}h|[0-9]+h [0-9]{2}m|due" <<<"$OUT"'
 check "table: weekly bar is drawn"               'grep -q "\u2588" <<<"$OUT" || grep -q "░" <<<"$OUT"'
 
+# --- provenance and age in NOTES --------------------------------------------
+# ⚠️ THE FAILURE THIS PREVENTS, measured 2026-08-27: a seat whose access token had
+# been dead for ~59h (nothing runs a session on it, so the keeper cannot rotate it
+# either, and the staleness is structural) rendered a confident `27%` weekly with a
+# bare `[quota cached]` behind it. Cédric reads this table to decide where to send
+# work; a 2.5-day-old number shown like a live one is worse than a blank, because a
+# blank sends him to look and a confident number does not.
+#
+# So every number that is NOT a live local measurement carries WHOSE it is and,
+# past two minutes, HOW OLD. A fresh engine stub is written here rather than
+# amending the one above: the cases only make sense against rows that are
+# deliberately not live.
+cat > "$LIB/rota-engine.sh" <<STUB
+#!/usr/bin/env bash
+[ "\${1:-}" = "usage" ] && [ "\${2:-}" = "--json" ] || { echo "stub: unexpected args: \$*" >&2; exit 9; }
+cat <<J
+{"generated_at":"$(date -u '+%Y-%m-%dT%H:%M:%SZ')","activeEmail":"work@example.com",
+ "floors":{"weekly_pct":20},
+ "peer":{"host":"peerbox","generated_at":"$(date -u '+%Y-%m-%dT%H:%M:%SZ')"},
+ "accounts":[
+  {"label":"work@example.com","email":"work@example.com","alias":"work","active":true,
+   "data":"live","quota_data":"live","quota_source":null,
+   "quota_measured_at":"$(date -u '+%Y-%m-%dT%H:%M:%SZ')",
+   "weekly":{"remaining_pct":55,"resets_at":"$(date -u -v+3d '+%Y-%m-%dT%H:%M:%S+00:00')"},"five_hour":{"remaining_pct":80}},
+  {"label":"personal@example.com","email":"personal@example.com","alias":"personal","active":false,
+   "data":"peer","quota_data":"peer","quota_source":"peerbox",
+   "quota_measured_at":"$(date -u -v-30S '+%Y-%m-%dT%H:%M:%SZ')",
+   "weekly":{"remaining_pct":90,"resets_at":"$(date -u -v+1d '+%Y-%m-%dT%H:%M:%S+00:00')"},"five_hour":{"remaining_pct":100}},
+  {"label":"team@example.com","email":"team@example.com","alias":"team","active":false,
+   "data":"peer","quota_data":"peer","quota_source":"peerbox",
+   "quota_measured_at":"$(date -u -v-2d '+%Y-%m-%dT%H:%M:%SZ')",
+   "weekly":{"remaining_pct":40,"resets_at":"$(date -u -v+5d '+%Y-%m-%dT%H:%M:%S+00:00')"},"five_hour":{"remaining_pct":70}}
+ ]}
+J
+STUB
+chmod +x "$LIB/rota-engine.sh"
+
+OUT="$("$LIB/rota-billing.sh" 2>/dev/null)"
+check "notes: a peer-sourced row says which box measured it" \
+  'grep "personal@example.com" <<<"$OUT" | grep -q "\[via peerbox\]"'
+check "notes: a peer row measured 30s ago carries no age (below 120s it IS now)" \
+  '! grep "personal@example.com" <<<"$OUT" | grep -qE "\[via peerbox, [0-9]+[mhd] old\]"'
+check "notes: a two-day-old peer row shows its age, in one coarse unit" \
+  'grep "team@example.com" <<<"$OUT" | grep -q "\[via peerbox, 2d old\]"'
+check "notes: a live local row carries NO provenance marker (unmarked means measured here, now)" \
+  '! grep "work@example.com" <<<"$OUT" | grep -qE "\[(via|cached|quota) "'
+check "legend: names the peer, and says no credential is copied" \
+  'grep -q "were read over ssh from that box" <<<"$OUT" && grep -q "no credential is ever copied" <<<"$OUT"'
+check "notes: CANCELLED still renders alongside the provenance marker" \
+  'grep "team@example.com" <<<"$OUT" | grep -q "CANCELLED"'
+
+JOUT="$("$LIB/rota-billing.sh" --json 2>/dev/null)"
+check "json: quota_source is passed through per row" \
+  '[ "$(python3 -c "import json,sys;d=json.loads(sys.argv[1]);print([a[\"quota_source\"] for a in d[\"accounts\"] if a[\"account\"]==\"team@example.com\"][0])" "$JOUT")" = peerbox ]'
+check "json: quota_data reads peer for a borrowed row" \
+  '[ "$(python3 -c "import json,sys;d=json.loads(sys.argv[1]);print([a[\"quota_data\"] for a in d[\"accounts\"] if a[\"account\"]==\"team@example.com\"][0])" "$JOUT")" = peer ]'
+check "json: quota_measured_at is present, so a machine gets the same honesty" \
+  '[ "$(python3 -c "import json,sys;d=json.loads(sys.argv[1]);print(bool([a[\"quota_measured_at\"] for a in d[\"accounts\"] if a[\"account\"]==\"team@example.com\"][0]))" "$JOUT")" = True ]'
+check "json: the top-level peer object is carried through" \
+  '[ "$(python3 -c "import json,sys;print(json.loads(sys.argv[1])[\"peer\"][\"host\"])" "$JOUT")" = peerbox ]'
+
+# --- a STALE LOCAL cached row, with no peer anywhere in the picture -----------
+# The same defect, the half that has nothing to do with ssh: this is the shape
+# that actually shipped, and fixing only the peer half would have left the two
+# seats most worth distrusting looking the most trustworthy.
+cat > "$LIB/rota-engine.sh" <<STUB
+#!/usr/bin/env bash
+[ "\${1:-}" = "usage" ] && [ "\${2:-}" = "--json" ] || { echo "stub: unexpected args: \$*" >&2; exit 9; }
+cat <<J
+{"generated_at":"$(date -u '+%Y-%m-%dT%H:%M:%SZ')","activeEmail":"work@example.com",
+ "floors":{"weekly_pct":20},"peer":null,
+ "accounts":[
+  {"label":"work@example.com","email":"work@example.com","alias":"work","active":true,
+   "data":"live","quota_data":"live","quota_source":null,
+   "quota_measured_at":"$(date -u '+%Y-%m-%dT%H:%M:%SZ')",
+   "weekly":{"remaining_pct":55,"resets_at":"$(date -u -v+3d '+%Y-%m-%dT%H:%M:%S+00:00')"},"five_hour":{"remaining_pct":80}},
+  {"label":"team@example.com","email":"team@example.com","alias":"team","active":false,
+   "data":"cached","quota_data":"cached","quota_source":null,
+   "quota_measured_at":"$(date -u -v-2d '+%Y-%m-%dT%H:%M:%SZ')",
+   "weekly":{"remaining_pct":27,"resets_at":"$(date -u -v+5d '+%Y-%m-%dT%H:%M:%S+00:00')"},"five_hour":{"remaining_pct":70}}
+ ]}
+J
+STUB
+chmod +x "$LIB/rota-engine.sh"
+OUT="$("$LIB/rota-billing.sh" 2>/dev/null)"
+check "notes: a two-day-old LOCAL cache says [cached, 2d old], not a bare [quota cached]" \
+  'grep "team@example.com" <<<"$OUT" | grep -q "\[cached, 2d old\]"'
+check "notes: and the old unqualified marker is gone for good" \
+  '! grep -q "\[quota cached\]" <<<"$OUT"'
+# ⚠️ NOT "the legend is unchanged": the LEAD-IN changed on purpose and in every
+# case ("quota is measured live" over-claimed for the whole table, which is the
+# same defect the per-row markers retire). What is conditional is the PEER CLAUSE,
+# and that is what this pins, on both the new lead-in and the absent clause.
+check "legend: the lead-in no longer promises LIVE for the whole table" \
+  'grep -q "quota is measured live unless the row says otherwise" <<<"$OUT"'
+check "legend: with no peer used, no peer clause is appended" \
+  '! grep -q "read over ssh" <<<"$OUT"'
+
 printf 'billing.test.sh: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

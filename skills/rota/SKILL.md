@@ -17,6 +17,14 @@ credential that exists twice kills itself.
 - Quota: `rota usage --json` (or `rota usage` for the table). Rows carry
   `fetched_at`; older than 60 minutes is stale, and a stale row is not evidence.
   Do not hand-roll a call to the usage API.
+- **Check the provenance before you trust a number.** Each row publishes
+  `quota_data` (`live` | `cached` | `peer` | `none` | `dup`), `quota_source` (the
+  peer host the numbers were read from over ssh, `null` when this box measured
+  them itself) and `quota_measured_at` (when they were MEASURED, which is not the
+  object's `generated_at` and can be days earlier). A `peer` row is real data
+  about a real seat, measured somewhere else: treat it exactly as you treat
+  `cached`, never as `live`. `live: false` / `stale: true` say the same thing in
+  one field. The top-level `peer` object names the host when one was used.
 - Which seat a live session bills to: `ps eww -p <pid> | grep -o 'CLAUDE_CONFIG_DIR=[^ ]*'`.
 - Identity of a directory: `jq -r .oauthAccount.emailAddress <dir>/.claude.json`.
   Never from the directory name, never from `claude auth status`.

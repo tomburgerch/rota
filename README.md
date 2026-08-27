@@ -94,6 +94,10 @@ tests/run.sh            hermetic test suites (fake HOME, stubbed claude)
 
 State lives in `~/.config/claude-failover/` (the accounts map, `usage-cache.json`, `keeper.log`, `keeper-status`) and the seats in `~/.claude-pool/`. Knobs are in `~/.config/claude-failover/keeper.conf`; every one is listed with its default in `config/keeper.conf.example`.
 
+A box that holds only some of the pool's credentials shows blank quota columns for the rest, because there is no token to measure them with. Copying the credentials over is the wrong fix: an OAuth refresh token is single-use, so the second copy husks the first. Instead list the box that does hold them in `~/.config/claude-failover/peers`, one ssh destination per line. `rota accounts` then reads those numbers over ssh, read-only, and marks the rows `[via <host>]` (with their age when the peer's own number is not fresh). See `config/peers.example`.
+
+Upgrade the peer to the same rota, or newer, in the same pass. Against an older peer it still works, but a borrowed row loses its age (freshness falls back to when the peer built its report, not when it measured the seat, so a days-old number can render as a bare `[via <host>]`) and loses its 5h reset instant. Both fields are new here.
+
 ## For Claude Code agents
 
 If you run Claude Code sessions that themselves run `claude` (subagents, automation, tmux fleets), point them at `skills/rota/SKILL.md`. The short form: identity comes from the directory, never from a name; never set `CLAUDE_CONFIG_DIR=$HOME/.claude`; never move a credential; read quota through `rota usage --json`, not your own probe.

@@ -1,0 +1,56 @@
+# rota: other boxes that hold a credential this one does not.
+#
+# Copy to $CLAUDE_FAILOVER_HOME/peers (default ~/.config/claude-failover/peers).
+# Machine-local, like `accounts` - it names your machines, so it never belongs
+# in the repo. Absent (the default) means: no peers, no ssh, exactly today's
+# behaviour.
+#
+# WHY THIS EXISTS. A laptop typically holds ONE of the pool's credentials, so
+# `rota accounts` there prints `-` in every quota column for the other seats and
+# annotates them `[quota none]`. The code is right about the input it has: no
+# stored credential, no token, no fetch, nothing to show.
+#
+# The tempting fix is to copy the credentials here. DO NOT. An OAuth refresh
+# token is SINGLE-USE: two boxes holding one account's credential means whichever
+# rotates first invalidates the other, the loser 401s, and the CLI hollows its
+# file into a husk. That is the 2026-08-07 incident. A DISPLAY problem must never
+# be paid for with a second copy of a credential.
+#
+# So instead this reads the NUMBERS from the box that legitimately holds the
+# credential: one ssh, read-only, `rota accounts --json --no-refresh`, nothing
+# moves. Rows filled in this way are marked `[via <host>]` in NOTES, with their
+# age when the peer's own number is not fresh, and `--json` carries
+# quota_source + quota_measured_at so no borrowed number can pass for a local one.
+#
+# FORMAT: one ssh destination per line. Blank lines and anything after a # are
+# ignored. Use the name you would type after `ssh`, so any Host block, jump host
+# or LAN/VPN/tunnel fallback you already have for that name is inherited for
+# free. A line naming THIS box is skipped rather than dialled.
+#
+# WHEN A PEER IS CONSULTED: only when at least one row is missing or cached,
+# only with the network on (`--no-refresh` still does zero network), and at most
+# one round trip per 90s (ROTA_PEER_TTL). The 10s bound (ROTA_PEER_TIMEOUT) is on
+# the WHOLE step, however many hosts are listed, not per host. A peer that fails
+# is left alone for 300s (ROTA_PEER_FAIL_TTL) so a sleeping box costs one stall
+# per five minutes rather than one per command; `rm` the cache file named below
+# to retry immediately. ROTA_PEER_TIMEOUT=0 turns the peer step OFF for one run,
+# and a knob that is not a plain number of seconds (`10s`) falls back to its
+# default rather than costing you the table. The first peer that answers usefully wins; any failure at
+# all is silent, and the table degrades to exactly what it printed before.
+# `--verbose` explains. State lives in $CLAUDE_FAILOVER_HOME/peer-usage-cache.json.
+#
+# ⚠️ UPGRADE THE PEER TOO. The peer should run the same rota as this box, or
+# newer. Against an older one everything still works, but two things silently
+# degrade, and both make a number look better than it is:
+#   * NO PER-ROW AGE. Freshness falls back to the payload's generated_at, which
+#     is when the peer BUILT the report, not when it measured the seat. A
+#     genuinely days-old peer number then outranks a one-hour-old local cache and
+#     renders as a bare `[via <host>]` with no age at all.
+#   * NO 5H RESET. `five_hour_resets_at` is new, so a borrowed row carries the 5h
+#     percentage without the instant it resets.
+# Both fields (quota_measured_at, five_hour_resets_at) arrived together; a peer
+# that publishes them is a peer that can be trusted to date its own numbers.
+#
+# Examples:
+# always-on-box
+# home-server

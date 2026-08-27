@@ -170,6 +170,34 @@ fi
 STUB
 chmod +x "$STUB_DIR/curl"
 
+# --- fake `ssh` ----------------------------------------------------------------
+# Stands in for the ONE peer call (peer_ssh): `rota accounts --json --no-refresh`
+# on a box that holds a credential this one does not. Stubbed for the WHOLE suite
+# and, by default, REFUSING: unstubbed, a scenario that configured a peer would
+# dial the real network and every assertion would depend on whose laptop the
+# suite happens to run on. Refusing by default is also the exact host-is-down
+# behaviour the feature promises to degrade through.
+#
+# $FAKE_STATE/peer-<host>.json arms it: that file becomes the peer's stdout.
+# $FAKE_STATE/peer-slow-<host> makes it hang (the timeout bound), and
+# $FAKE_STATE/peer-junk-<host> makes it answer with something that is not JSON.
+# Every call APPENDS its host to $FAKE_STATE/ssh-calls, which is what lets a
+# scenario prove a round trip did NOT happen (--no-refresh, the 90s TTL and the
+# never-ssh-to-yourself rule are all assertions about a call that must be absent).
+# No key, no known_hosts, no socket: nothing here can reach a real machine.
+cat > "$STUB_DIR/ssh" <<'STUB'
+#!/usr/bin/env bash
+# rota calls this as: ssh -o … -o … <host> <remote-command>
+host="${@: -2:1}"
+printf '%s\n' "$host" >> "${FAKE_STATE:-/tmp}/ssh-calls"
+[ -f "${FAKE_STATE:-/nonexistent}/peer-slow-$host" ] && { sleep 30; exit 0; }
+[ -f "${FAKE_STATE:-/nonexistent}/peer-junk-$host" ] && { printf 'ssh: this is not JSON\n'; exit 0; }
+f="${FAKE_STATE:-/nonexistent}/peer-$host.json"
+[ -f "$f" ] || exit 255            # ssh's own "could not connect" exit code
+cat "$f"
+STUB
+chmod +x "$STUB_DIR/ssh"
+
 # --- fake `tmux` ---------------------------------------------------------------
 # The PANES block (render_panes_summary / restart_idle_panes) asks tmux what is
 # open in the configured session. Unstubbed, this suite would read the REAL local
@@ -262,6 +290,11 @@ export ROTA_TMUX_SESSION="rota-test-panes"
 # Never inherit the real session's pane id: restart_idle_panes skips $TMUX_PANE,
 # and a leaked value could silently skip a pane a scenario is asserting on.
 unset TMUX_PANE
+# Same for the peer list. ROTA_PEERS is SET-BUT-EMPTY-aware by design (that is how
+# the remote leg of a peer call switches the feature off), so inheriting one from
+# the surrounding shell would arm a peer in every scenario that never asked for
+# one. $CLAUDE_FAILOVER_HOME already points the peers FILE at the fake cfg dir.
+unset ROTA_PEERS
 
 # --- per-run fixture ----------------------------------------------------------
 # A fresh $HOME each run so state never leaks into the next scenario. v2 shape
@@ -2371,6 +2404,11 @@ done < <(grep -E '^(▶ ACTIVE|  ✓ |  ✗ |    (weekly|5h) )' <<<"$EX_USAGE_NO
 # Scenarios 38 and 37 left DIFFERENT fixtures behind, and 39b/40/41 all run the
 # script live, so the explains fixture, the same three accounts scenario 39
 # snapshots, is re-established here rather than inherited from whatever ran last.
+#
+# 2026-08-27 GREW the pinned set by four paths (accounts.N.quota_data,
+# accounts.N.quota_source, accounts.N.quota_measured_at and the top-level `peer`),
+# which is the point: provenance is part of the published contract now, so it is
+# pinned like everything else rather than the guard being loosened to let it in.
 explains_fixture explainsjson
 norm_json() {
   jq -S 'del(.generated_at, .generatedAt)
@@ -2387,7 +2425,7 @@ EX_JSON="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --json 2>/dev/null
 # LC_ALL=C so the ordering is ASCII and identical on every box, a locale-sorted
 # expectation would pass here and fail on a runner with a different LC_COLLATE.
 EX_JSON_PATHS="$(jq -S -r 'paths | join(".")' <<<"$EX_JSON" | sed -E 's/\.[0-9]+/.N/g' | LC_ALL=C sort -u | tr '\n' ' ')"
-EX_JSON_PATHS_WANT="accounts accounts.N accounts.N.active accounts.N.alias accounts.N.cached_at accounts.N.config_dir accounts.N.current accounts.N.data accounts.N.email accounts.N.five_hour accounts.N.five_hour.expired accounts.N.five_hour.fresh accounts.N.five_hour.remaining_pct accounts.N.five_hour.resets_at accounts.N.five_hour.used_pct accounts.N.label accounts.N.live accounts.N.loggedIn accounts.N.note accounts.N.reason accounts.N.recommendable accounts.N.session accounts.N.session.expired accounts.N.session.fresh accounts.N.session.leftPct accounts.N.session.resetsAt accounts.N.session.resetsInSeconds accounts.N.session.usedPct accounts.N.stale accounts.N.stale_reason accounts.N.weekly accounts.N.weekly.expired accounts.N.weekly.fresh accounts.N.weekly.kind accounts.N.weekly.leftPct accounts.N.weekly.remaining_pct accounts.N.weekly.resetsAt accounts.N.weekly.resetsInSeconds accounts.N.weekly.resets_at accounts.N.weekly.scope accounts.N.weekly.usedPct accounts.N.weekly.used_pct active active.auth_status active.auth_warning active.email active.fingerprint active.nested_config_warning active.source active.warning activeEmail floors floors.comfortable_pct floors.exhausted_pct floors.session_pct floors.weekly_pct recommendation recommendation.action recommendation.alias recommendation.best_alternative recommendation.best_alternative.email recommendation.best_alternative.weekly_left_pct recommendation.burn_down_hold recommendation.email recommendation.from_cached_numbers recommendation.label recommendation.mode recommendation.mode_forced recommendation.reason recommendation.weekly_fresh recommendation.weekly_resets_at "
+EX_JSON_PATHS_WANT="accounts accounts.N accounts.N.active accounts.N.alias accounts.N.cached_at accounts.N.config_dir accounts.N.current accounts.N.data accounts.N.email accounts.N.five_hour accounts.N.five_hour.expired accounts.N.five_hour.fresh accounts.N.five_hour.remaining_pct accounts.N.five_hour.resets_at accounts.N.five_hour.used_pct accounts.N.label accounts.N.live accounts.N.loggedIn accounts.N.note accounts.N.quota_data accounts.N.quota_measured_at accounts.N.quota_source accounts.N.reason accounts.N.recommendable accounts.N.session accounts.N.session.expired accounts.N.session.fresh accounts.N.session.leftPct accounts.N.session.resetsAt accounts.N.session.resetsInSeconds accounts.N.session.usedPct accounts.N.stale accounts.N.stale_reason accounts.N.weekly accounts.N.weekly.expired accounts.N.weekly.fresh accounts.N.weekly.kind accounts.N.weekly.leftPct accounts.N.weekly.remaining_pct accounts.N.weekly.resetsAt accounts.N.weekly.resetsInSeconds accounts.N.weekly.resets_at accounts.N.weekly.scope accounts.N.weekly.usedPct accounts.N.weekly.used_pct active active.auth_status active.auth_warning active.email active.fingerprint active.nested_config_warning active.source active.warning activeEmail floors floors.comfortable_pct floors.exhausted_pct floors.session_pct floors.weekly_pct peer recommendation recommendation.action recommendation.alias recommendation.best_alternative recommendation.best_alternative.email recommendation.best_alternative.weekly_left_pct recommendation.burn_down_hold recommendation.email recommendation.from_cached_numbers recommendation.label recommendation.mode recommendation.mode_forced recommendation.reason recommendation.weekly_fresh recommendation.weekly_resets_at "
 [ "$EX_JSON_PATHS" = "$EX_JSON_PATHS_WANT" ] \
   && ok "json byte-identity → every published key path is exactly what the dashboard was promised" \
   || bad "json byte-identity → key paths drifted:
@@ -3511,6 +3549,494 @@ set -e
 grep -q 'needs one browser login' <<<"$SW_OUT" \
   && ok "switch-all → the refusal names the login that fixes it, not just the failure" \
   || bad "switch-all → refusal names the next step (got: $SW_OUT)"
+
+# --- 53. PEER USAGE: read the numbers from the box that holds the credential ----
+# THE DEFECT, measured on the laptop 2026-08-27: four of five seats printed `-` in
+# every quota column and `[quota none]` in NOTES, because that box holds exactly
+# one credential. The rejected fix is copying the other four over: an OAuth
+# refresh token is SINGLE-USE, so the second copy husks the first (the 2026-08-07
+# incident). The accepted fix is to read the NUMBERS from the box that
+# legitimately holds them, over ssh, read-only, with nothing moving.
+#
+# Everything below runs against the fake `ssh` stubbed at the top of this file, so
+# no scenario here can reach a real machine, and the DEFAULT behaviour of that
+# stub (refuse) is itself one of the cases under test.
+
+# UTC ISO at a `date -v` offset, e.g. `iso_at -30S` (30 seconds ago), `iso_at -2d`.
+# ⚠️ BSD date: uppercase M is MINUTES, lowercase m is MONTHS. The offsets here stay
+# in S/H/d for exactly that reason.
+iso_at() { date -u -v"$1" '+%Y-%m-%dT%H:%M:%SZ'; }
+
+# A peer payload in the shape `rota accounts --json` publishes (the command the
+# peer is actually asked to run). Any number of seats, `<email>:<weekly-left>:<5h-left>`.
+peer_json() {  # peer_json <measured-at-iso> <alias> <email:wk:se>...
+  local meas="$1" alias="$2"; shift 2
+  local rows="[]" spec e wk se
+  for spec in "$@"; do
+    IFS=: read -r e wk se <<<"$spec"
+    rows="$(jq -c --argjson r "$rows" --arg e "$e" --argjson wk "$wk" --argjson se "$se" \
+      --arg a "$alias" --arg m "$meas" --arg wr "$(iso_in +3d)" --arg sr "$(iso_in +2H)" \
+      -n '$r + [{account:$e, alias:$a, active_now:false,
+                 weekly_left_pct:$wk, weekly_resets_at:$wr,
+                 five_hour_left_pct:$se, five_hour_resets_at:$sr,
+                 quota_data:"cached", quota_source:null, quota_measured_at:$m}]')"
+  done
+  jq -cn --argjson rows "$rows" --arg g "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    '{generated_at:$g, active:"whoever@example.com", peer:null,
+      monthly_total_usd_approx:0, accounts:$rows}'
+}
+
+# Two seats: one this box CAN measure (credential + a curl fixture) and one it
+# cannot (no credential at all), which is the laptop's real shape in miniature.
+peer_fixture() {  # peer_fixture <name> [weekly-utilization for the local seat]
+  new_run "$1"
+  local lu="${2:-10}"
+  mkdir -p "$RUN/.claude-pool/localseat" "$RUN/.claude-pool/remoteseat"
+  cred_json TOK-LOCAL > "$RUN/.claude-pool/localseat/.credentials.json"
+  printf '{"oauthAccount":{"emailAddress":"local@example.com"}}' > "$RUN/.claude-pool/localseat/.claude.json"
+  printf '{"oauthAccount":{"emailAddress":"remote@example.com"}}' > "$RUN/.claude-pool/remoteseat/.claude.json"
+  printf '{"oauthAccount":{"emailAddress":"local@example.com"}}' > "$RUN/.claude.json"
+  cat > "$RUN/cfg/accounts" <<EOF
+local@example.com|$RUN/.claude-pool/localseat
+remote@example.com|$RUN/.claude-pool/remoteseat
+EOF
+  printf '{"seven_day":{"utilization":%s,"resets_at":"%s"},"five_hour":{"utilization":5,"resets_at":"%s"}}' \
+    "$lu" "$(iso_in +5d)" "$(iso_in +3H)" > "$RUN/state/usage-TOK-LOCAL.json"
+}
+prow() { jq -c --arg e "$1" '.accounts[] | select(.email==$e)' <<<"$2" 2>/dev/null; }
+ssh_count() { grep -c . "$FAKE_STATE/ssh-calls" 2>/dev/null || echo 0; }
+# norm_clock on BOTH sides, plus the day-form countdown it does not collapse
+# ("4d23h"): the byte-identity cases below compare two separate runs seconds
+# apart, and a reset countdown that legitimately ticks over between them would
+# fail the compare once an hour for a reason that has nothing to do with peers.
+norm_peer() { sed -E 's/resets in [0-9][0-9dhm]*/resets in <t>/g' | norm_clock; }
+
+# --- 53a. a peer fills the slots this box cannot measure ------------------------
+peer_fixture peerfill
+peer_json "$(iso_at -30S)" remotealias remote@example.com:73:88 > "$RUN/state/peer-peerbox.json"
+# ⚠️ ONE $? PER RUN. Capturing it after the second assignment silently tested the
+# --json run twice and never checked the table run's exit code at all.
+set +e
+P_OUT="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage 2>/dev/null)"
+RC=$?
+P_JSON="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>/dev/null)"
+RC_JSON=$?
+set -e
+P_REMOTE="$(prow remote@example.com "$P_JSON")"
+P_LOCAL="$(prow local@example.com "$P_JSON")"
+[ "$RC" -eq 0 ] && ok "peer → the TABLE run exits 0 with a peer configured" || bad "peer → table exits 0 (got $RC: $P_OUT)"
+[ "$RC_JSON" -eq 0 ] && ok "peer → and so does the --json run" || bad "peer → --json exits 0 (got $RC_JSON: $P_JSON)"
+[ "$(jq -r '.quota_data' <<<"$P_REMOTE")" = peer ] \
+  && ok "peer → the slot this box cannot measure comes back as quota_data=peer" \
+  || bad "peer → remote slot is quota_data=peer (got: $P_REMOTE)"
+[ "$(jq -r '.quota_source' <<<"$P_REMOTE")" = peerbox ] \
+  && ok "peer → quota_source names the box the numbers were read from" \
+  || bad "peer → quota_source is the host (got: $(jq -r '.quota_source' <<<"$P_REMOTE"))"
+[ "$(jq -r '.weekly.remaining_pct' <<<"$P_REMOTE")" = 73 ] \
+  && [ "$(jq -r '.five_hour.remaining_pct' <<<"$P_REMOTE")" = 88 ] \
+  && ok "peer → both windows carry the peer's numbers (% LEFT round-trips through % USED)" \
+  || bad "peer → windows carry the peer's numbers (got: $(jq -c '.weekly,.five_hour' <<<"$P_REMOTE"))"
+[ "$(jq -r '.quota_measured_at' <<<"$P_REMOTE")" != null ] \
+  && ok "peer → the row publishes WHEN it was measured, not just that it is borrowed" \
+  || bad "peer → quota_measured_at present (got: $P_REMOTE)"
+[ "$(jq -r '.peer.host' <<<"$P_JSON")" = peerbox ] \
+  && ok "peer (json) → the top-level peer object names the host that answered" \
+  || bad "peer (json) → top-level peer object (got: $(jq -c '.peer' <<<"$P_JSON"))"
+grep -q 'via peerbox' <<<"$P_OUT" \
+  && ok "peer → the rendered row says [via peerbox], a borrowed number never passes as local" \
+  || bad "peer → the row is marked [via peerbox] (got: $P_OUT)"
+[ "$(jq -r '.quota_data' <<<"$P_LOCAL")" = live ] \
+  && [ "$(jq -r '.quota_source' <<<"$P_LOCAL")" = null ] \
+  && ok "peer → a locally measured row keeps quota_data=live and a null quota_source" \
+  || bad "peer → local row unchanged (got: $P_LOCAL)"
+# THE INVARIANT: a peer's numbers are never seeded into THIS box's usage cache.
+# That cache means "what this box measured"; a borrowed row written into it would
+# come back next run wearing local clothes with the provenance stripped off.
+[ "$(jq -r 'has("remote@example.com")' "$RUN/cfg/usage-cache.json" 2>/dev/null)" = false ] \
+  && ok "peer → peer numbers are NEVER written into this box's usage-cache.json" \
+  || bad "peer → the local cache was polluted with a peer's numbers: $(cat "$RUN/cfg/usage-cache.json" 2>/dev/null)"
+# two runs, one round trip: the 90s TTL is what makes `rota accounts` twice in a
+# row cost what it costs once, which is exactly how a human uses it
+[ "$(ssh_count)" -eq 1 ] \
+  && ok "peer → the 90s TTL cache means two consecutive runs pay ONE ssh round trip" \
+  || bad "peer → expected 1 ssh call across two runs, got $(ssh_count)"
+
+# --- 53b. R6: a peer row is exactly as (in)eligible as a cached one -------------
+# Real data about a real seat, measured somewhere else. It must not become
+# eligible for anything a cached row is excluded from, and 73%/88% would clear
+# both floors comfortably if it were live, so an accidental promotion shows here.
+[ "$(jq -r '.live' <<<"$P_REMOTE")" = false ] \
+  && [ "$(jq -r '.stale' <<<"$P_REMOTE")" = true ] \
+  && ok "peer (R6) → a peer row is live=false / stale=true, same as a cached row" \
+  || bad "peer (R6) → peer row must read as stale, not live (got: $P_REMOTE)"
+[ "$(jq -r '.recommendable' <<<"$P_REMOTE")" = false ] \
+  && ok "peer (R6) → and it is NOT recommendable on the strict live-only pass" \
+  || bad "peer (R6) → a peer row must not be recommendable where a cached row is not"
+
+# --- 53c. a LIVE local fetch always beats a peer row for the same slot ----------
+peer_fixture peerlocalwins
+peer_json "$(iso_at -30S)" remotealias local@example.com:1:1 remote@example.com:73:88 \
+  > "$RUN/state/peer-peerbox.json"
+P_JSON="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>/dev/null)"
+P_LOCAL="$(prow local@example.com "$P_JSON")"
+[ "$(jq -r '.quota_data' <<<"$P_LOCAL")" = live ] \
+  && [ "$(jq -r '.weekly.remaining_pct' <<<"$P_LOCAL")" = 90 ] \
+  && ok "precedence → local LIVE wins outright, the peer's 1% never displaces it" \
+  || bad "precedence → local live must win (got: $P_LOCAL)"
+
+# --- 53d. between local cache and peer, the NEWER MEASUREMENT wins --------------
+# Both directions, because a rule that only ever prefers one side is not a
+# comparison. The remote seat has no credential either way, so the only question
+# is which remembered number is younger.
+peer_fixture peerfresherlocal
+jq -n --arg wr "$(iso_in +3d)" --arg sr "$(iso_in +2H)" --arg te "$(( $(date +%s) - 60 ))" \
+  '{"remote@example.com":{wk_u:"40",wk_r:$wr,se_u:"30",se_r:$sr,ts:"a minute ago",ts_epoch:$te}}' \
+  > "$RUN/cfg/usage-cache.json"
+peer_json "$(iso_at -2d)" remotealias remote@example.com:73:88 > "$RUN/state/peer-peerbox.json"
+P_JSON="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>/dev/null)"
+P_REMOTE="$(prow remote@example.com "$P_JSON")"
+[ "$(jq -r '.quota_data' <<<"$P_REMOTE")" = cached ] \
+  && [ "$(jq -r '.weekly.remaining_pct' <<<"$P_REMOTE")" = 60 ] \
+  && ok "precedence → a MINUTE-old local cache beats a two-day-old peer row" \
+  || bad "precedence → fresher local cache must win (got: $P_REMOTE)"
+
+peer_fixture peerfresherpeer
+jq -n --arg wr "$(iso_in +3d)" --arg sr "$(iso_in +2H)" --arg te "$(( $(date +%s) - 259200 ))" \
+  '{"remote@example.com":{wk_u:"40",wk_r:$wr,se_u:"30",se_r:$sr,ts:"three days ago",ts_epoch:$te}}' \
+  > "$RUN/cfg/usage-cache.json"
+peer_json "$(iso_at -30S)" remotealias remote@example.com:73:88 > "$RUN/state/peer-peerbox.json"
+P_JSON="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>/dev/null)"
+P_REMOTE="$(prow remote@example.com "$P_JSON")"
+[ "$(jq -r '.quota_data' <<<"$P_REMOTE")" = peer ] \
+  && [ "$(jq -r '.weekly.remaining_pct' <<<"$P_REMOTE")" = 73 ] \
+  && ok "precedence → a fresh peer row beats a three-day-old local cache" \
+  || bad "precedence → fresher peer must win (got: $P_REMOTE)"
+
+# --- 53e. AGE IS VISIBLE on anything that is not a live local measurement -------
+# 2026-08-27: two seats on the pool host have had dead access tokens for ~17h and
+# ~59h, and the keeper cannot rotate them (nothing runs a session on those seats),
+# so the staleness is STRUCTURAL. Their rows printed a confident percentage behind
+# a bare marker. A 2.5-day-old number shown like a live one is worse than a blank.
+peer_fixture peerage
+peer_json "$(iso_at -2d)" remotealias remote@example.com:73:88 > "$RUN/state/peer-peerbox.json"
+P_OUT="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage 2>/dev/null)"
+grep -q 'via peerbox, 2d old' <<<"$P_OUT" \
+  && ok "age → a two-day-old peer number says so, in one coarse glanceable unit" \
+  || bad "age → a stale peer row shows its age (got: $P_OUT)"
+peer_fixture peerageminor
+peer_json "$(iso_at -30S)" remotealias remote@example.com:73:88 > "$RUN/state/peer-peerbox.json"
+P_OUT="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage 2>/dev/null)"
+grep -q 'via peerbox' <<<"$P_OUT" && ! grep -qE 'via peerbox, [0-9]+[mhd] old' <<<"$P_OUT" \
+  && ok "age → a number measured 30s ago carries no age: below 120s it IS now" \
+  || bad "age → a fresh peer row shows no age (got: $P_OUT)"
+
+# --- 53f. an unreachable peer degrades to BYTE-IDENTICAL output -----------------
+# The whole feature is a bonus on top of a table that was already correct. A peer
+# problem must never cost the operator a line to read, a stack trace, or a hang.
+peer_fixture peerdown
+P_NOPEER="$("$SCRIPT" usage 2>/dev/null | norm_peer)"
+P_DEAD="$(ROTA_PEERS=deadbox "$SCRIPT" usage 2>"$RUN/peer.err" | norm_peer)"
+[ "$P_NOPEER" = "$P_DEAD" ] \
+  && ok "unreachable peer → output is byte-identical to having no peer at all" \
+  || bad "unreachable peer → output drifted: $(diff <(printf '%s\n' "$P_NOPEER") <(printf '%s\n' "$P_DEAD") || true)"
+[ ! -s "$RUN/peer.err" ] \
+  && ok "unreachable peer → not one byte on stderr, it is not the operator's problem" \
+  || bad "unreachable peer → stderr must stay empty (got: $(cat "$RUN/peer.err"))"
+grep -q 'peer deadbox' <<<"$(ROTA_PEERS=deadbox "$SCRIPT" usage --verbose 2>&1 >/dev/null)" \
+  && ok "unreachable peer → --verbose, and only --verbose, explains what happened" \
+  || bad "unreachable peer → --verbose explains it"
+# the same for a peer that answers with something that is not JSON
+peer_fixture peerjunk
+: > "$RUN/state/peer-junk-peerbox"
+P_JUNK="$(ROTA_PEERS=peerbox "$SCRIPT" usage --json 2>/dev/null)"
+[ "$(jq -r '.accounts[] | select(.email=="remote@example.com") | .quota_data' <<<"$P_JUNK")" = none ] \
+  && ok "junk from a peer → ignored, the row stays honestly empty" \
+  || bad "junk from a peer → must be ignored (got: $P_JUNK)"
+
+# a peer that ACCEPTS the connection and then hangs is the case ConnectTimeout
+# cannot cover, and the one that would turn `cdt accounts` into a wait. The bound
+# is enforced by peer_ssh itself, so the run must come back on its own.
+peer_fixture peerhang
+: > "$RUN/state/peer-slow-peerbox"
+HANG_START="$(date +%s)"
+set +e
+P_HANG="$(ROTA_PEER_TIMEOUT=1 ROTA_PEERS=peerbox "$SCRIPT" usage --json 2>/dev/null)"
+HANG_RC=$?
+set -e
+HANG_SECS=$(( $(date +%s) - HANG_START ))
+[ "$HANG_RC" -eq 0 ] && [ "$HANG_SECS" -lt 15 ] \
+  && ok "hanging peer → killed at the bound and the run finishes on its own (${HANG_SECS}s)" \
+  || bad "hanging peer → must be bounded (rc=$HANG_RC, took ${HANG_SECS}s)"
+[ "$(jq -r '.accounts[] | select(.email=="remote@example.com") | .quota_data' <<<"$P_HANG")" = none ] \
+  && ok "hanging peer → and the row falls back to the honest blank, not a half-read payload" \
+  || bad "hanging peer → row must stay empty (got: $P_HANG)"
+
+# THE BOUND IS ON THE STEP, NOT ON THE DIAL. With the watchdog inside peer_ssh
+# (one call per host) three hanging peers cost 3 × PEER_TIMEOUT: measured at 7s
+# with ROTA_PEER_TIMEOUT=2, which is ~30s at the default while the operator sits
+# at a prompt. config/peers.example invites a list, so this is reachable as
+# shipped. The assertion is on TOTAL WALL TIME, because a per-dial assertion is
+# exactly what passed while the step was unbounded.
+peer_fixture peerhang3
+: > "$RUN/state/peer-slow-hangA"; : > "$RUN/state/peer-slow-hangB"; : > "$RUN/state/peer-slow-hangC"
+H3_START="$(date +%s)"
+set +e
+ROTA_PEER_TIMEOUT=2 ROTA_PEERS="hangA hangB hangC" "$SCRIPT" usage --json >/dev/null 2>&1
+H3_RC=$?
+set -e
+H3_SECS=$(( $(date +%s) - H3_START ))
+[ "$H3_RC" -eq 0 ] && [ "$H3_SECS" -le 4 ] \
+  && ok "step deadline → THREE hanging peers cost one 2s budget between them, not 2s each (${H3_SECS}s)" \
+  || bad "step deadline → the whole step must be bounded (rc=$H3_RC, took ${H3_SECS}s for 3 peers at 2s)"
+[ "$(ssh_count)" -eq 1 ] \
+  && ok "step deadline → and the peers behind the spent budget are skipped, not dialled" \
+  || bad "step deadline → expected 1 dial once the budget was gone, got $(ssh_count)"
+
+# NEGATIVE CACHING. Caching only successes meant an unreachable peer was
+# re-dialled on every single invocation, so for as long as ballito was asleep
+# every `cdt accounts` on the laptop stalled for the full bound. That is a worse
+# daily experience than the blank table this feature exists to fix.
+peer_fixture peerfailcache
+: > "$RUN/state/peer-slow-peerbox"
+NC_START="$(date +%s)"
+for _ in 1 2 3; do
+  ROTA_PEER_TIMEOUT=2 ROTA_PEERS=peerbox "$SCRIPT" usage --json >/dev/null 2>&1 || true
+done
+NC_SECS=$(( $(date +%s) - NC_START ))
+[ "$(ssh_count)" -eq 1 ] \
+  && ok "failure cache → a dead peer is dialled ONCE across three runs, not three times" \
+  || bad "failure cache → expected 1 dial across three runs, got $(ssh_count)"
+[ "$NC_SECS" -le 4 ] \
+  && ok "failure cache → so runs 2 and 3 cost nothing at all (${NC_SECS}s for all three)" \
+  || bad "failure cache → runs after the first must not stall (took ${NC_SECS}s)"
+[ "$(jq -r '.peerbox.failed' "$RUN/cfg/peer-usage-cache.json" 2>/dev/null)" = true ] \
+  && ok "failure cache → the failure is recorded with its own stamp, next to the payload entries" \
+  || bad "failure cache → nothing written to peer-usage-cache.json: $(cat "$RUN/cfg/peer-usage-cache.json" 2>/dev/null)"
+# ...and it is a COOLING-OFF WINDOW, never a blacklist: with the window at zero
+# every run tries again, which is what lets a woken box come back on its own.
+peer_fixture peerfailttl
+: > "$RUN/state/peer-slow-peerbox"
+for _ in 1 2; do
+  ROTA_PEER_FAIL_TTL=0 ROTA_PEER_TIMEOUT=1 ROTA_PEERS=peerbox "$SCRIPT" usage --json >/dev/null 2>&1 || true
+done
+[ "$(ssh_count)" -eq 2 ] \
+  && ok "failure cache → it is a cooling-off window, not a blacklist: TTL=0 retries every run" \
+  || bad "failure cache → TTL=0 must re-dial each run, got $(ssh_count) dial(s)"
+# a suppressed failure must still render exactly the no-peer table
+peer_fixture peerfailquiet
+: > "$RUN/state/peer-slow-peerbox"
+ROTA_PEER_TIMEOUT=1 ROTA_PEERS=peerbox "$SCRIPT" usage >/dev/null 2>&1 || true
+FQ_NOPEER="$("$SCRIPT" usage 2>/dev/null | norm_peer)"
+FQ_CACHED="$(ROTA_PEERS=peerbox "$SCRIPT" usage 2>"$RUN/fq.err" | norm_peer)"
+[ "$FQ_NOPEER" = "$FQ_CACHED" ] && [ ! -s "$RUN/fq.err" ] \
+  && ok "failure cache → a suppressed peer still renders byte-identical no-peer output, silently" \
+  || bad "failure cache → suppressed peer output drifted: $(diff <(printf '%s\n' "$FQ_NOPEER") <(printf '%s\n' "$FQ_CACHED") || true)"
+
+# --- 53f2. A HOSTILE PAYLOAD: peer percentages are untrusted input --------------
+# Reproduced 2026-08-27 against the unvalidated arithmetic that shipped in the
+# first draft of this feature:
+#   "n/a"                      → `n: unbound variable`, exit 1, no table AND no
+#                                JSON, breaking both the degrade-quietly contract
+#                                and `usage --json`'s always-one-object promise
+#   "U_WKX[$(touch FILE)0]"    → exit 0, a normal-looking table, and the command
+#                                RAN: bash evaluates array subscripts inside
+#                                $(( )), and `set -u` only blocks the undefined
+#                                -array spelling, not a name that exists
+#   "85%" / "1e3" / true       → each one aborted the whole command
+# The peer is semi-trusted at best (accept-new means a re-imaged box's key is
+# taken silently), and one command as Cédric is a categorically different grant
+# from reading percentages off a machine.
+peer_fixture peerhostile
+PWN="$RUN/state/PWNED"     # ⚠️ no dot in the path: ${v%.*} would truncate the probe
+for VAL in '"n/a"' 'true' '"85%"' '"1e3"' "\"U_WKX[\$(touch $PWN)0]\""; do
+  rm -f "$RUN/cfg/peer-usage-cache.json" "$PWN"
+  jq -n --argjson wk "$(jq -n --arg v "$VAL" '$v' >/dev/null 2>&1 && printf '%s' "$VAL" || printf 'null')" \
+     --arg g "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" --arg m "$(iso_at -30S)" \
+     --arg wr "$(iso_in +3d)" --arg sr "$(iso_in +2H)" \
+     '{generated_at:$g, peer:null, accounts:[{account:"remote@example.com",alias:"remotealias",
+        weekly_left_pct:$wk, weekly_resets_at:$wr, five_hour_left_pct:88,
+        five_hour_resets_at:$sr, quota_data:"cached", quota_source:null,
+        quota_measured_at:$m}]}' > "$RUN/state/peer-peerbox.json"
+  # FAKE_NEW_EMAIL pins the auth-status stub to the account ~/.claude.json claims;
+  # without it the run prints the (correct, unrelated) identity WARNING to stderr
+  # and the capture stops being the one parseable object under test.
+  set +e
+  HOSTILE_OUT="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>/dev/null)"
+  HOSTILE_RC=$?
+  set -e
+  [ "$HOSTILE_RC" -eq 0 ] && jq -e 'type=="object"' <<<"$HOSTILE_OUT" >/dev/null 2>&1 \
+    && ok "hostile payload → weekly_left_pct=$VAL still answers one parseable object, exit 0" \
+    || bad "hostile payload → $VAL broke the command (rc=$HOSTILE_RC): $(head -1 <<<"$HOSTILE_OUT")"
+  [ "$(jq -r '.accounts[] | select(.email=="remote@example.com") | .weekly.remaining_pct' <<<"$HOSTILE_OUT" 2>/dev/null)" = null ] \
+    && ok "hostile payload → $VAL is treated as 'the peer supplied nothing', never guessed at" \
+    || bad "hostile payload → $VAL produced a weekly number: $(jq -c '.accounts[]|select(.email=="remote@example.com")|.weekly' <<<"$HOSTILE_OUT" 2>/dev/null)"
+done
+[ ! -e "$PWN" ] \
+  && ok "hostile payload → NO command ran: a peer cannot execute anything on this box" \
+  || bad "hostile payload → the peer executed a command (created $PWN)"
+# both windows hostile → the row falls through entirely, as if the peer had no row
+rm -f "$RUN/cfg/peer-usage-cache.json"
+jq -n --arg g "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" --arg m "$(iso_at -30S)" \
+  '{generated_at:$g, peer:null, accounts:[{account:"remote@example.com",
+     weekly_left_pct:"n/a", five_hour_left_pct:"n/a", quota_data:"cached",
+     quota_measured_at:$m}]}' > "$RUN/state/peer-peerbox.json"
+HOSTILE_BOTH="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>/dev/null)"
+[ "$(jq -r '.accounts[] | select(.email=="remote@example.com") | .quota_data' <<<"$HOSTILE_BOTH")" = none ] \
+  && ok "hostile payload → a row with NO usable number at all is not claimed as a peer row" \
+  || bad "hostile payload → both-windows-garbage must fall through (got: $HOSTILE_BOTH)"
+
+# --- 53f3. the `rota usage --json` fallback shape --------------------------------
+# The peer is asked for `rota accounts --json` first, but that needs a billing.json
+# on the peer; without one the same ssh falls back to `rota usage --json`, whose
+# field names are entirely different (email / weekly.remaining_pct rather than
+# account / weekly_left_pct). Both shapes are accepted precisely so a peer without
+# a billing file still contributes, and until now only one of them was exercised.
+peer_fixture peerenginshape
+jq -n --arg g "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" --arg m "$(iso_at -30S)" \
+   --arg wr "$(iso_in +3d)" --arg sr "$(iso_in +2H)" \
+  '{generated_at:$g, peer:null, accounts:[{label:"remote@example.com",
+     email:"remote@example.com", alias:"remotealias", data:"cached",
+     quota_data:"cached", quota_source:null, quota_measured_at:$m,
+     weekly:{remaining_pct:64, resets_at:$wr},
+     five_hour:{remaining_pct:91, resets_at:$sr}}]}' > "$RUN/state/peer-peerbox.json"
+P_ENG="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>/dev/null)"
+P_ENG_ROW="$(prow remote@example.com "$P_ENG")"
+[ "$(jq -r '.quota_data' <<<"$P_ENG_ROW")" = peer ] \
+  && [ "$(jq -r '.weekly.remaining_pct' <<<"$P_ENG_ROW")" = 64 ] \
+  && [ "$(jq -r '.five_hour.remaining_pct' <<<"$P_ENG_ROW")" = 91 ] \
+  && ok "engine-shaped payload → a peer with no billing.json still fills the row" \
+  || bad "engine-shaped payload → both windows must parse (got: $P_ENG_ROW)"
+[ "$(jq -r '.five_hour.resets_at' <<<"$P_ENG_ROW")" != null ] \
+  && ok "engine-shaped payload → and it carries the 5h reset the billing shape used to drop" \
+  || bad "engine-shaped payload → 5h resets_at parsed (got: $P_ENG_ROW)"
+
+# --- 53f4. MULTIPLE PEERS: first useful answer wins, and only then stop ----------
+# R2 is "one ssh per peer, in configured order, stopping at the FIRST that answers
+# usefully". Usefully is the load-bearing word: a peer that answers with nothing
+# this box is missing must NOT end the search, or one healthy-but-irrelevant box
+# in front of the right one silently disables the feature.
+peer_fixture peerfirstwins
+peer_json "$(iso_at -30S)" remotealias remote@example.com:73:88 > "$RUN/state/peer-boxA.json"
+peer_json "$(iso_at -30S)" remotealias remote@example.com:11:11 > "$RUN/state/peer-boxB.json"
+P_MULTI="$(ROTA_PEERS="boxA boxB" FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>/dev/null)"
+[ "$(jq -r '.peer.host' <<<"$P_MULTI")" = boxA ] \
+  && [ "$(jq -r '.accounts[]|select(.email=="remote@example.com")|.weekly.remaining_pct' <<<"$P_MULTI")" = 73 ] \
+  && ok "multi-peer → the FIRST peer that answers usefully wins, in configured order" \
+  || bad "multi-peer → boxA must win (got: $(jq -c '.peer' <<<"$P_MULTI"))"
+[ "$(ssh_count)" -eq 1 ] \
+  && ok "multi-peer → and boxB is never dialled at all once boxA has answered" \
+  || bad "multi-peer → expected 1 dial, got $(ssh_count)"
+
+peer_fixture peeruseless
+# boxA is up and healthy but knows nothing about the seat this box is missing
+peer_json "$(iso_at -30S)" other other@example.com:99:99 > "$RUN/state/peer-boxA.json"
+peer_json "$(iso_at -30S)" remotealias remote@example.com:41:55 > "$RUN/state/peer-boxB.json"
+P_USELESS="$(ROTA_PEERS="boxA boxB" FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>/dev/null)"
+[ "$(jq -r '.peer.host' <<<"$P_USELESS")" = boxB ] \
+  && [ "$(jq -r '.accounts[]|select(.email=="remote@example.com")|.weekly.remaining_pct' <<<"$P_USELESS")" = 41 ] \
+  && ok "multi-peer → a peer that answers UNUSEFULLY does not end the search" \
+  || bad "multi-peer → boxB must be consulted after a useless boxA (got: $(jq -c '.peer' <<<"$P_USELESS"))"
+[ "$(ssh_count)" -eq 2 ] \
+  && ok "multi-peer → both were dialled, once each, in order" \
+  || bad "multi-peer → expected 2 dials, got $(ssh_count)"
+
+# --- 53f5. a corrupt peer cache SELF-HEALS -------------------------------------
+# Same rule cache_flush already lives by: a truncated write must never poison
+# every later run. Half a JSON object on disk has to cost one re-dial, not the
+# feature.
+peer_fixture peercorrupt
+peer_json "$(iso_at -30S)" remotealias remote@example.com:73:88 > "$RUN/state/peer-peerbox.json"
+printf '{"peerbox": {"at": 17562900' > "$RUN/cfg/peer-usage-cache.json"   # truncated mid-write
+set +e
+P_CORRUPT="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>"$RUN/corrupt.err")"
+CORRUPT_RC=$?
+set -e
+[ "$CORRUPT_RC" -eq 0 ] && [ ! -s "$RUN/corrupt.err" ] \
+  && ok "corrupt peer cache → exit 0 and silent, exactly as a corrupt usage cache is" \
+  || bad "corrupt peer cache → must degrade quietly (rc=$CORRUPT_RC: $(cat "$RUN/corrupt.err"))"
+[ "$(jq -r '.accounts[]|select(.email=="remote@example.com")|.quota_data' <<<"$P_CORRUPT")" = peer ] \
+  && ok "corrupt peer cache → the run re-dials and the row still fills" \
+  || bad "corrupt peer cache → the row must still fill (got: $P_CORRUPT)"
+jq -e . "$RUN/cfg/peer-usage-cache.json" >/dev/null 2>&1 \
+  && ok "corrupt peer cache → and the junk is replaced with a valid file, not appended to" \
+  || bad "corrupt peer cache → the file is still corrupt: $(cat "$RUN/cfg/peer-usage-cache.json")"
+
+# --- 53g. --no-refresh performs NO peer call ------------------------------------
+# "no network" is the whole promise of the flag, and ssh is network.
+peer_fixture peernorefresh
+peer_json "$(iso_at -30S)" remotealias remote@example.com:73:88 > "$RUN/state/peer-peerbox.json"
+ROTA_PEERS=peerbox "$SCRIPT" usage --no-refresh --json >/dev/null 2>&1 || true
+[ "$(ssh_count)" -eq 0 ] \
+  && ok "--no-refresh → not one ssh call: an explicit 'no network' outranks a peer" \
+  || bad "--no-refresh → made $(ssh_count) ssh call(s)"
+
+# --- 53h. matching is on EMAIL, never on alias ----------------------------------
+# An alias is a per-box DIRECTORY NAME. Two boxes can both call a seat `remote`
+# and mean two different logins; cross-matching would print one seat's numbers on
+# another seat's line, which is the one failure worse than a blank row.
+peer_fixture peeralias
+peer_json "$(iso_at -30S)" remoteseat someone-else@example.com:73:88 > "$RUN/state/peer-peerbox.json"
+P_JSON="$(ROTA_PEERS=peerbox "$SCRIPT" usage --json 2>/dev/null)"
+[ "$(jq -r '.accounts[] | select(.email=="remote@example.com") | .quota_data' <<<"$P_JSON")" = none ] \
+  && ok "alias collision → a peer row whose ALIAS matches but whose email does not is ignored" \
+  || bad "alias collision → must not cross-match (got: $P_JSON)"
+[ "$(jq -r '.peer' <<<"$P_JSON")" = null ] \
+  && ok "alias collision → and no peer is claimed, because none was usable" \
+  || bad "alias collision → peer must stay null (got: $(jq -c '.peer' <<<"$P_JSON"))"
+
+# --- 53i. the peers FILE, and never dialling yourself ---------------------------
+peer_fixture peerfile
+peer_json "$(iso_at -30S)" remotealias remote@example.com:73:88 > "$RUN/state/peer-peerbox.json"
+printf '# boxes that hold what this one does not\n\n  peerbox  \n' > "$RUN/cfg/peers"
+P_JSON="$("$SCRIPT" usage --json 2>/dev/null)"
+[ "$(jq -r '.accounts[] | select(.email=="remote@example.com") | .quota_data' <<<"$P_JSON")" = peer ] \
+  && ok "peers file → read from \$CFG_DIR/peers, with comments and blank lines ignored" \
+  || bad "peers file → the file is read (got: $P_JSON)"
+
+peer_fixture peerself
+SELF_HOST="$(hostname -s 2>/dev/null || echo unknown)"
+peer_json "$(iso_at -30S)" remotealias remote@example.com:73:88 > "$RUN/state/peer-$SELF_HOST.json"
+ROTA_PEERS="$SELF_HOST" "$SCRIPT" usage --json >/dev/null 2>&1 || true
+[ "$(ssh_count)" -eq 0 ] \
+  && ok "self as peer → skipped, never a round trip to our own sshd for numbers we have" \
+  || bad "self as peer → dialled itself $(ssh_count) time(s)"
+
+# ...INCLUDING the fully-qualified spelling, which is the case the $HOSTNAME
+# comparison was added for and the one it was getting wrong: only the SELF side
+# was truncated at the first dot, so HOSTNAME=peerbox.local plus `peerbox.local`
+# in the peers file matched nothing and the box dialled its own sshd. The fixture
+# is armed, so a failure to skip fills the row and is visible twice over.
+peer_fixture peerselffqdn
+peer_json "$(iso_at -30S)" remotealias remote@example.com:73:88 > "$RUN/state/peer-peerbox.local.json"
+P_FQDN="$(HOSTNAME=peerbox.local ROTA_PEERS=peerbox.local "$SCRIPT" usage --json 2>/dev/null)"
+[ "$(ssh_count)" -eq 0 ] \
+  && ok "self as peer → the FQDN spelling is skipped too (HOSTNAME=peerbox.local vs peerbox.local)" \
+  || bad "self as peer → dialled its own FQDN $(ssh_count) time(s)"
+[ "$(jq -r '.peer' <<<"$P_FQDN")" = null ] \
+  && ok "self as peer → and no peer is claimed, so the row stays this box's own answer" \
+  || bad "self as peer → peer must stay null (got: $(jq -c '.peer' <<<"$P_FQDN"))"
+
+# --- 53j. R6 in the switch path: peer rides with cached, in both directions -----
+# switch-auto's STRICT first pass demands live rows and must refuse a peer row
+# exactly as it refuses a cached one; its SECOND pass (the cached fallback that
+# exists so a bare `rota switch` never dead-ends) must then accept it, and say
+# out loud that the pick was not measured here.
+peer_fixture peerswitch 98      # the active seat is down to 2% weekly left
+peer_json "$(iso_at -30S)" remotealias remote@example.com:73:88 > "$RUN/state/peer-peerbox.json"
+set +e
+SW_OUT="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" switch-auto --dry-run 2>&1)"
+SW_RC=$?
+set -e
+[ "$SW_RC" -eq 0 ] && ok "peer (R6) → switch-auto --dry-run exits 0" || bad "peer (R6) → switch-auto exits 0 (got $SW_RC: $SW_OUT)"
+grep -q 'optimizer pick: remote@example.com' <<<"$SW_OUT" \
+  && ok "peer (R6) → the cached-fallback pass picks the peer row, exactly as it would a cached one" \
+  || bad "peer (R6) → the fallback pass picks the peer seat (got: $SW_OUT)"
+grep -q 'no account returned LIVE numbers this run' <<<"$SW_OUT" \
+  && ok "peer (R6) → and it says the strict live-only pass found nothing first" \
+  || bad "peer (R6) → the fallback says why it fell back (got: $SW_OUT)"
+grep -q 'not a live measurement: via peerbox' <<<"$SW_OUT" \
+  && ok "peer (R6) → the pick line names the box that measured it, not a borrowed 'cached' age" \
+  || bad "peer (R6) → the pick names its source (got: $SW_OUT)"
 
 restore_home
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
