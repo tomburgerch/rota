@@ -34,6 +34,7 @@ ENGINE="$ROTA_LIB/rota-engine.sh"
 KEEPER="$ROTA_LIB/rota-keeper.sh"
 GUARD="$ROTA_LIB/rota-cred-guard.sh"
 BILLING="$ROTA_LIB/rota-billing.sh"
+RESERVE="$ROTA_LIB/rota-reserve.sh"
 
 die() { printf 'rota: %s\n' "$*" >&2; exit "${2:-1}"; }
 
@@ -53,6 +54,7 @@ rota <verb> [args]
   keeper                 run one keeper tick now
   cred-guard             run the credential guard once
   cred-restore <seat>    restore <seat>'s credential from its backup
+  reserve [args]         bare: list reserved seats; <seat> <owner> [why] to reserve; --release <seat>
   reconcile              rewrite the accounts file from the dirs' real identities
   normalize              untangle two pool dirs holding each other's seats
   pool-init              create ~/.claude-pool dirs + the accounts file from $CFG_DIR/accounts
@@ -131,6 +133,7 @@ case "$verb" in
   keeper)           need "$KEEPER"; exec "$KEEPER" "$@" ;;
   cred-guard)       need "$GUARD"; exec "$GUARD" run "$@" ;;
   cred-restore)     need "$GUARD"; [ $# -ge 1 ] || die "usage: rota cred-restore <seat>" 2; exec "$GUARD" restore "$@" ;;
+  reserve)          need "$RESERVE"; exec "$RESERVE" "$@" ;;
   reconcile|normalize|pool-init|adopt-shared|pane-converge|repair-nested|roster|active|next)
                     need "$ENGINE"; exec "$ENGINE" "$verb" "$@" ;;
   failover)         need "$ENGINE"; exec "$ENGINE" "$@" ;;

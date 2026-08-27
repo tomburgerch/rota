@@ -24,7 +24,9 @@
 # ── WHAT IT DOES ─────────────────────────────────────────────────────────────
 #   1. CLAUDE_CONFIG_DIR already in the environment  -> change NOTHING, exec.
 #      (The runners, the test suites, and any deliberately pinned tmux pane all
-#      depend on this. An explicit pin always outranks the shim.)
+#      depend on this. An explicit pin always outranks the shim.) The ONE
+#      exception is a RESERVED seat, see "reserved seats" further down: the
+#      reservation outranks the pin, because the pin is how the seat was lost.
 #   2. Otherwise resolve the ACTIVE account's email and map it to its pool dir
 #      via ~/.config/claude-failover/accounts (`<email>|<dir>` per line), then
 #      export CLAUDE_CONFIG_DIR=<that dir> and exec.
@@ -445,12 +447,102 @@ resolve_pool_dir() {
 # Escape hatch, then the recursion guard, then "an explicit pin always wins".
 # `+set` not `:-`: respecting the variable's PRESENCE (even empty) is the
 # literal reading of "already set in the environment -> change nothing".
+# --- reserved seats --------------------------------------------------------
+#
+# A SEAT WAS BURNED TO 0% AND NOTHING SAID ANYTHING. On 2026-08-21 an
+# interactive pane ran under an explicit CLAUDE_CONFIG_DIR pin and spent a
+# reserved seat's whole weekly quota. That seat is the one pushed to the
+# always-on runners, so it is the one seat that must never be spent by hand.
+# The rule already existed and was written down, in prose and as one script's
+# hardcoded list of aliases, and nothing enforced it. It was found days later,
+# by accident, from a `rota billing` run for an unrelated reason.
+#
+# WHY THE GUARD IS HERE AND NOT IN THE CLI. Panes are launched several ways:
+# `rota switch`, `rota login`, and a plain hand-typed
+# `CLAUDE_CONFIG_DIR=~/.claude-pool/runner claude`. A guard covering only the
+# rota verbs is walked around by the shortest of those, which is exactly how
+# the breach happened. This shim sits on PATH ahead of the real binary and
+# every one of those paths runs through it, including the explicit-pin branch
+# below.
+#
+# The reservation is a marker file in the seat itself, so it is data rather
+# than a constant in one script's head:
+#
+#     ~/.claude-pool/runner/RESERVED
+#         owner=always-on-runner
+#         why=this credential is pushed to the always-on runners
+RESERVED_MARKER_NAME="${CLAUDE_RESERVED_MARKER:-RESERVED}"
+
+# ONLY AN INTERACTIVE SESSION IS REFUSED. The seat has legitimate users on this
+# box and breaking them would be far worse than the bug: the pool keeper probes
+# with `claude -p`, and the login check and the failover run
+# `claude auth status`. Every one of those is a short read that spends nothing,
+# and a seat whose health can no longer be probed is a worse outage than the
+# one this prevents. What burned the quota was a long interactive session, and
+# that is the only shape this stops.
+seat_invocation_is_a_session() {
+  local a
+  for a in "$@"; do
+    case "$a" in
+      -p|--print) return 1 ;;
+    esac
+  done
+  case "${1:-}" in
+    # Not a session at all. Anything UNRECOGNISED falls through to "session", so
+    # a new interactive mode is guarded by default rather than silently exempt.
+    auth|mcp|config|doctor|update|install|migrate-installer|setup-token) return 1 ;;
+    --version|-v|--help|-h) return 1 ;;
+  esac
+  # No TTY means nothing is going to sit here spending quota for an hour.
+  [ -t 0 ] || return 1
+  return 0
+}
+
+refuse_reserved_seat() {
+  local dir="$1" marker="$2" owner why
+  owner="$(sed -n 's/^owner=//p' "$marker" 2>/dev/null | head -1)"
+  why="$(sed -n 's/^why=//p' "$marker" 2>/dev/null | head -1)"
+  {
+    printf '\n  REFUSED: %s is a RESERVED seat.\n\n' "$(basename "$dir")"
+    printf '    owner: %s\n' "${owner:-unknown}"
+    [ -n "$why" ] && printf '    why:   %s\n' "$why"
+    printf '\n  An interactive session here spends quota that seat needs. On 2026-08-21\n'
+    printf '  a pane burned a reserved seat to 0%% for a week and nothing said so.\n\n'
+    printf '  See what has room:   rota usage\n'
+    printf '  Or say you meant it: CLAUDE_SEAT_OVERRIDE=1 claude ...\n\n'
+  } >&2
+  exit 9
+}
+
+# Checked for BOTH the explicit-pin and the shim-resolved path, because the
+# breach came in through the explicit pin.
+check_reserved_seat() {
+  local dir="${1:-}"
+  shift || true
+  [ -n "$dir" ] || return 0
+  [ -n "${CLAUDE_SEAT_OVERRIDE:-}" ] && return 0
+  local marker="$dir/$RESERVED_MARKER_NAME"
+  [ -f "$marker" ] || return 0
+  seat_invocation_is_a_session "$@" || return 0
+  refuse_reserved_seat "$dir" "$marker"
+}
+
 [ -n "${CLAUDE_SHIM_DISABLE:-}" ]   && exec_real "$@"
 [ -n "${CLAUDE_SHIM_RESOLVING:-}" ] && exec_real "$@"
-[ -n "${CLAUDE_CONFIG_DIR+set}" ]   && exec_real "$@"
+# The reserved check goes BEFORE the explicit-pin passthrough. A hand-typed
+# `CLAUDE_CONFIG_DIR=~/.claude-pool/runner claude` is precisely how the seat was
+# taken, so "an explicit pin always wins" must not mean it wins against the
+# reservation too.
+if [ -n "${CLAUDE_CONFIG_DIR+set}" ]; then
+  check_reserved_seat "$CLAUDE_CONFIG_DIR" "$@"
+  exec_real "$@"
+fi
 
 _pool_dir="$(resolve_pool_dir)"
 if [ -n "$_pool_dir" ]; then
+  # The resolved path too: `rota switch runner` then a bare `claude` reaches the
+  # same seat without anybody typing the variable.
+  check_reserved_seat "$_pool_dir" "$@"
   export CLAUDE_CONFIG_DIR="$_pool_dir"
 fi
 
