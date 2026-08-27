@@ -29,6 +29,11 @@ credential that exists twice kills itself.
   row with `unmeasured: true` has a number nobody has measured, very possibly a
   full one; only `seat.ended: true` means the seat is finished. Read those two
   fields before concluding anything about a seat from `weekly.expired`.
+  `unmeasured` is a statement about the REPORT, not about this box's probe: it
+  means there is no number for the window you would spend right now, whoever
+  would have measured it. So a `peer` row whose window has rolled is `unmeasured`
+  exactly as a `cached` one is, and a `peer` row with a current window is
+  measured even when this box's own fetch came back 429.
 - Which seat a live session bills to: `ps eww -p <pid> | grep -o 'CLAUDE_CONFIG_DIR=[^ ]*'`.
 - Identity of a directory: `jq -r .oauthAccount.emailAddress <dir>/.claude.json`.
   Never from the directory name, never from `claude auth status`.
@@ -69,7 +74,9 @@ credential that exists twice kills itself.
 | `rota usage` warns billing differs from claim | live sessions still on the previous seat | nothing; `rota switch <current>` converges idle panes now |
 | a seat shows `needs login` or `dead-refresh` | that chain is dead (revoked, password change) | `rota login <seat>` |
 | a seat shows `no active window yet` | it has not been used since its weekly reset; nothing to measure yet | one small request opens a window; the keeper does this at WARM_AT |
-| a seat is under `UNMEASURED`, reading `unmeasured, may be full` | the quota is UNKNOWN, not spent: either the cached window rolled or the usage API refused. The seat is fine, only the number is missing | never write the seat off; read the weekly USED % off the vendor's usage page and `rota usage --record <seat> <pct>` |
+| a seat is under `UNMEASURED`, reading `unmeasured, may be full` | the quota is UNKNOWN, not spent: the window behind the number rolled, or nothing (local fetch, cache, peer, hand reading) produced one. The seat is fine, only the number is missing | never write the seat off; read the weekly USED % off the vendor's usage page and `rota usage --record <seat> <pct>` |
+| an `UNMEASURED` row also says `[via <host>, <age>]` | a peer measured it, but before its weekly window rolled, so the figure is about a window that no longer exists | same answer: `rota usage --record`, or wait for the peer to re-measure after the roll |
+| you recorded a number by hand and the row shows a different one | the NEWER measurement wins, always. A peer (or a live fetch) that measured that seat more recently outranks the typed number, and a typed number outranks anything older | nothing; `rota usage --record` again if the newer number is the wrong one |
 | a seat reads `cancelled, quota until <date>` | it is cancelled but still live, and still refreshes weekly until that date | spend it FIRST: `min(weekly reset, seat end)` already ranks it, so `rota switch` will send you there |
 | a seat reads `seat ended <date>` under UNAVAILABLE | past its `ends` date in `billing.json`; this is the only state that really is finished | drop it from the accounts file and the pool |
 | every row is `cached` | the usage API is rate-limiting (429). Not only a many-sessions symptom: measured 2026-08-21 it refused six times over two and a half minutes with no live session at all | do not switch on cached rows; if waiting does not clear it, `rota usage --record` the seats you need |

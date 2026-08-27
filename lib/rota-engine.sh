@@ -227,12 +227,15 @@
 #                                                       table can never advertise a switch
 #                                                       the optimizer refuses, each with
 #                                                       the exact `rota switch <alias>`
-#                                       UNMEASURED      quota UNKNOWN, not spent: the
-#                                                       cached window has rolled or the
-#                                                       usage API answered 429, so the
-#                                                       SEAT is fine and only the number
-#                                                       is missing. Names each cancelled
-#                                                       seat's end date and the
+#                                       UNMEASURED      quota UNKNOWN, not spent: no source
+#                                                       (live fetch, cache, peer, hand
+#                                                       reading) produced a number for the
+#                                                       window you would spend right now,
+#                                                       because the window behind it has
+#                                                       rolled or the usage API answered
+#                                                       429. The SEAT is fine and only the
+#                                                       number is missing. Names each
+#                                                       cancelled seat's end date and the
 #                                                       `rota usage --record` that
 #                                                       answers it
 #                                       UNAVAILABLE     everything else, with a SHORT
@@ -2675,6 +2678,13 @@ peer_row() {  # peer_row <payload> <email>
 #      actually measured its number later
 #   3. nothing → the row stays exactly as it was, `-` and [quota none]
 #
+# A number recorded by hand (`rota usage --record`, for the seats whose token the
+# usage API answers 429 for) is a MEASUREMENT under rule 2 like any other: it
+# reaches this function already adopted into the `cached` slot, carrying its
+# read_at_epoch in U_AGE, so the same newer-wins test below arbitrates it with no
+# special case. It is not privileged for having been typed and not demoted for it
+# either; see the block above the human_get call in collect_usage.
+#
 # Peer numbers are deliberately NOT written into this box's usage-cache.json.
 # That cache means "what THIS box measured"; seeding it from a peer would let a
 # borrowed number come back next run wearing local clothes, with the provenance
@@ -2975,6 +2985,8 @@ record_human_usage() {  # record_human_usage <alias> <weekly-used> [<5h-used>] [
      "$HUMAN_USAGE" > "$tmp" && mv "$tmp" "$HUMAN_USAGE"
   printf 'recorded for %s: weekly %s%% used, window until %s\n' "$email" "$wk" "$wkr"
   printf '  it feeds `rota usage` only while that window lasts, and only when the API will not answer.\n'
+  # shellcheck disable=SC2016  # literal backticks, nothing to expand
+  printf '  a peer that measured this seat MORE RECENTLY still wins; the newer measurement always does.\n'
 }
 
 # Is this row's WEEKLY quota simply UNKNOWN? Either the cached window has since
@@ -3000,8 +3012,29 @@ record_human_usage() {  # record_human_usage <alias> <weekly-used> [<5h-used>] [
 # cached window that has ROLLED (the number describes a window that no longer
 # exists) and a usage API that answered 429. In both, the seat is fine and only
 # the NUMBER is missing.
+#
+# ⚠️ "MISSING" MEANS MISSING FROM THE REPORT, NOT MISSING FROM THIS BOX'S OWN
+# PROBE, and that distinction only started to matter when peer rows arrived
+# (2026-08-27). U_WHY answers "why did THIS box fail to fetch", and after
+# peer_fill a row can carry a 429 in U_WHY and, at the same time, a real
+# current-window number that a peer measured over ssh. Asking U_WHY alone then
+# filed a perfectly good borrowed number under UNMEASURED, which prints no
+# number at all and tells the operator to go and read one off the vendor's page:
+# the exact inversion this bucket exists to prevent, pointing the other way.
+#
+# So the question is asked about the ROW, not about the probe. In order:
+#   1. the window this row's number describes has ROLLED  -> unknown, whoever
+#      measured it (local cache, a peer, or a hand reading): the number is about
+#      a window that no longer exists
+#   2. there IS a number for the CURRENT window           -> measured. Where it
+#      came from is a freshness question the state tag already answers
+#      (`cached Mon 14:02`, `via ballito, 2d old`), never a bucket question
+#   3. no number, and the probe was REFUSED (429)         -> unknown
+#   4. no number, and the CREDENTIAL is the problem       -> not unknown, see the
+#      "narrow on purpose" note above: that seat needs a login, not a measurement
 weekly_unknown() {  # weekly_unknown <slot-index>
   (( U_WKX[$1] == 1 )) && return 0
+  [[ -n "${U_WKU[$1]:-}" ]] && return 1
   case "${U_WHY[$1]:-}" in
     *429*) return 0 ;;
   esac
@@ -3188,6 +3221,20 @@ collect_usage() {
     # It never displaces a LIVE fetch and never displaces a cache that is still
     # describing its own window: a typed number is the answer of last resort,
     # not a preference.
+    #
+    # ⚠️ AND AGAINST A PEER ROW (2026-08-27, the question `--record` predates):
+    # THE NEWER MEASUREMENT WINS, which is R4, unchanged, applied to one more
+    # kind of measurement. A hand reading lands in the `cached` slot below with
+    # its read_at_epoch in U_AGE, so peer_fill's own newer-wins comparison
+    # arbitrates it exactly as it arbitrates this box's cache. Deliberately no
+    # privilege in either direction:
+    #   - typed a minute ago, peer's payload is a day old -> the typed number
+    #     wins, which is the whole reason it was typed
+    #   - peer measured this seat live 30s ago, the typed number is yesterday's
+    #     -> the peer wins, and should: it is an API reading of the same seat
+    # The one asymmetry is already handled above by window, not by source: a
+    # hand reading whose window has rolled is dropped here before it is ever
+    # adopted, because `--record` stamps a window precisely so it can expire.
     if [[ -z "$json" ]] && { [[ -z "$C_WKU$C_SEU" ]] || window_expired "$C_WKR"; }; then
       human_get "$email"
       if [[ -n "$H_WKU" ]] && ! window_expired "$H_WKR"; then

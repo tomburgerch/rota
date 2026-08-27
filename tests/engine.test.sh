@@ -4282,6 +4282,184 @@ grep -q 'not a live measurement: via peerbox' <<<"$SW_OUT" \
   && ok "peer (R6) → the pick line names the box that measured it, not a borrowed 'cached' age" \
   || bad "peer (R6) → the pick names its source (got: $SW_OUT)"
 
+# --- 54. UNMEASURED × peer: the two changes composed ---------------------------
+#
+# These two landed independently and answer the same operator question from
+# opposite ends, so the interesting cases are the ones NEITHER suite had:
+#   the SEAT's lifecycle  (2026-08-25) - unknown quota is not spent quota, and a
+#                                        cancelled seat is not a dead seat
+#   the PEER fallback     (2026-08-27) - a box with no credential for a seat
+#                                        borrows that seat's numbers over ssh
+# The bucket rule they have to agree on is one sentence: a row is UNMEASURED when
+# THIS REPORT has no number for the window you would spend right now. Not "this
+# box failed to fetch" - after a peer fill those are different facts.
+
+# --- 54a. a peer row whose window has ROLLED is UNMEASURED, not spent -----------
+# The whole 2026-08-21 harm, arriving by ssh instead of out of the local cache:
+# the number describes a window that no longer exists, so it must not render as a
+# figure, must not read as an obituary, and must still say WHOSE measurement it
+# was and how old.
+peer_fixture peerrolled
+peer_json "$(iso_at -2d)" remotealias remote@example.com:73:88 \
+  | jq -c --arg wr "$(iso_in -2d)" '.accounts[0].weekly_resets_at=$wr' \
+  > "$RUN/state/peer-peerbox.json"
+jq -n --arg ends "$(date -u -v+5d '+%Y-%m-%d')" \
+  '{accounts:{"remote@example.com":{plan:"Max 20x",status:"cancelled",ends:$ends}}}' \
+  > "$RUN/billing.json"
+set +e
+PU_OUT="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com \
+          CLAUDE_BILLING_JSON="$RUN/billing.json" "$SCRIPT" usage 2>/dev/null)"
+PU_JSON="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com \
+           CLAUDE_BILLING_JSON="$RUN/billing.json" "$SCRIPT" usage --json 2>/dev/null)"
+set -e
+PU_REMOTE="$(prow remote@example.com "$PU_JSON")"
+grep -q 'remote@example.com' <<<"$(unmeasured_block <<<"$PU_OUT")" \
+  && ok "peer × unmeasured → a peer row whose window rolled lands in UNMEASURED" \
+  || bad "peer × unmeasured → belongs in UNMEASURED (got: $PU_OUT)"
+! grep -q 'remote@example.com' <<<"$(unavail_block <<<"$PU_OUT")" \
+  && ok "peer × unmeasured → and NOT in UNAVAILABLE: a rolled window is not a dead seat" \
+  || bad "peer × unmeasured → must not be UNAVAILABLE (got: $PU_OUT)"
+grep -q 'via peerbox' <<<"$(unmeasured_block <<<"$PU_OUT")" \
+  && ok "peer × unmeasured → the UNMEASURED row still names the box that measured it" \
+  || bad "peer × unmeasured → the row keeps its provenance (got: $PU_OUT)"
+grep -q 'cancelled, quota until' <<<"$(unmeasured_block <<<"$PU_OUT")" \
+  && ok "peer × unmeasured → and still names the seat-end deadline that ranks it" \
+  || bad "peer × unmeasured → names its end date (got: $PU_OUT)"
+[ "$(jq -r '.unmeasured' <<<"$PU_REMOTE")" = true ] \
+  && [ "$(jq -r '.quota_data' <<<"$PU_REMOTE")" = peer ] \
+  && [ "$(jq -r '.weekly.remaining_pct' <<<"$PU_REMOTE")" = null ] \
+  && ok "peer × unmeasured (json) → unmeasured:true, quota_data:peer, and no stale figure" \
+  || bad "peer × unmeasured (json) → wrong shape (got: $PU_REMOTE)"
+
+# --- 54b. a peer row with a CURRENT window is MEASURED, whatever this box's own
+#          probe did -----------------------------------------------------------
+# ⚠️ THE REGRESSION THIS FILE EXISTS FOR. weekly_unknown was written before peer
+# rows existed and asked U_WHY, which answers "why did THIS box fail to fetch".
+# After a peer fill a row can carry a 429 in U_WHY *and* a real current-window
+# number measured over ssh: asking U_WHY alone filed that number under
+# UNMEASURED, a bucket that prints no number at all and tells the operator to go
+# and read one off the vendor's page. That is the exact inversion the UNMEASURED
+# bucket exists to prevent, pointing the other way.
+#
+# It is also R6: a `peer` row must answer this question exactly as a `cached` one
+# would, so the fix is to ask the ROW ("is there a number for the current
+# window") rather than the probe.
+peer_fixture peer429
+cred_json TOK-REMOTE > "$RUN/.claude-pool/remoteseat/.credentials.json"
+printf '429' > "$RUN/state/usage-TOK-REMOTE.code"
+peer_json "$(iso_at -30S)" remotealias remote@example.com:73:88 > "$RUN/state/peer-peerbox.json"
+set +e
+P4_OUT="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage 2>/dev/null)"
+P4_JSON="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>/dev/null)"
+set -e
+P4_REMOTE="$(prow remote@example.com "$P4_JSON")"
+[ "$(jq -r '.quota_data' <<<"$P4_REMOTE")" = peer ] \
+  && [ "$(jq -r '.weekly.remaining_pct' <<<"$P4_REMOTE")" = 73 ] \
+  && ok "peer × 429 → the local 429 is rescued by the peer, the row carries 73% left" \
+  || bad "peer × 429 → the peer must fill the 429'd row (got: $P4_REMOTE)"
+[ "$(jq -r '.unmeasured' <<<"$P4_REMOTE")" = false ] \
+  && ok "peer × 429 → and it is NOT unmeasured: a number exists for the current window" \
+  || bad "peer × 429 → a filled row is measured, whatever the local probe did (got: $P4_REMOTE)"
+! grep -q 'remote@example.com' <<<"$(unmeasured_block <<<"$P4_OUT")" \
+  && ok "peer × 429 → the table does not park a borrowed number under UNMEASURED" \
+  || bad "peer × 429 → must not be UNMEASURED (got: $P4_OUT)"
+
+# --- 54c. R6 on the bucket rule: cached answers it identically to peer ----------
+# The same fixture with the number in the LOCAL cache instead of on the peer. If
+# these two ever disagree, `peer` has grown an exemption `cached` does not have,
+# which is precisely what R6 forbids.
+peer_fixture cached429
+cred_json TOK-REMOTE > "$RUN/.claude-pool/remoteseat/.credentials.json"
+printf '429' > "$RUN/state/usage-TOK-REMOTE.code"
+jq -n --arg wr "$(iso_in +3d)" --arg sr "$(iso_in +2H)" --arg te "$(( $(date +%s) - 600 ))" \
+  '{"remote@example.com":{wk_u:"27",wk_r:$wr,se_u:"12",se_r:$sr,ts:"ten minutes ago",ts_epoch:$te}}' \
+  > "$RUN/cfg/usage-cache.json"
+set +e
+C4_OUT="$(FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage 2>/dev/null)"
+C4_JSON="$(FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>/dev/null)"
+set -e
+C4_REMOTE="$(prow remote@example.com "$C4_JSON")"
+[ "$(jq -r '.quota_data' <<<"$C4_REMOTE")" = cached ] \
+  && [ "$(jq -r '.unmeasured' <<<"$C4_REMOTE")" = false ] \
+  && ok "cached × 429 (R6) → a ten-minute-old cached number is measured too, not UNMEASURED" \
+  || bad "cached × 429 (R6) → cached must answer as peer does (got: $C4_REMOTE)"
+! grep -q 'remote@example.com' <<<"$(unmeasured_block <<<"$C4_OUT")" \
+  && ok "cached × 429 (R6) → and the table agrees, byte for byte with the peer case" \
+  || bad "cached × 429 (R6) → must not be UNMEASURED (got: $C4_OUT)"
+
+# ⚠️ AND IT MUST BE ABLE TO FAIL. Same 429, same fixture, NO number from anywhere:
+# that row IS unmeasured, and this is the case the 429 arm was written for.
+peer_fixture nonum429
+cred_json TOK-REMOTE > "$RUN/.claude-pool/remoteseat/.credentials.json"
+printf '429' > "$RUN/state/usage-TOK-REMOTE.code"
+set +e
+N4_OUT="$(FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage 2>/dev/null)"
+N4_JSON="$(FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>/dev/null)"
+set -e
+[ "$(jq -r '.unmeasured' <<<"$(prow remote@example.com "$N4_JSON")")" = true ] \
+  && ok "429 with no number at all → still UNMEASURED, the case that arm was written for" \
+  || bad "429 with nothing → must stay unmeasured (got: $(prow remote@example.com "$N4_JSON"))"
+grep -q 'remote@example.com' <<<"$(unmeasured_block <<<"$N4_OUT")" \
+  && ok "429 with no number at all → and the table files it under UNMEASURED" \
+  || bad "429 with nothing → belongs in UNMEASURED (got: $N4_OUT)"
+
+# --- 54d. `--record` versus a peer: the NEWER MEASUREMENT wins ------------------
+# `--record` predates peers, so this is the precedence the merge had to decide. A
+# hand reading is a measurement like any other: no privilege for having been
+# typed, and no demotion for it either. It reaches peer_fill already adopted into
+# the `cached` slot with its read_at_epoch, so R4 arbitrates it with no special
+# case. Both directions, because a rule that only ever prefers one side is not a
+# comparison.
+peer_fixture recordbeatspeer
+printf '%s' '{"accounts":{}}' > "$RUN/cfg/human-usage.json"
+jq --arg wr "$(iso_in +3d)" --argjson te "$(date +%s)" \
+   '.accounts["remote@example.com"]={weekly_used:8,weekly_resets_at:$wr,five_hour_used:null,
+                                     five_hour_resets_at:null,read_at:"just now",read_at_epoch:$te,
+                                     source:"vendor usage page, read by hand"}' \
+   "$RUN/cfg/human-usage.json" > "$RUN/cfg/hu.json" && mv "$RUN/cfg/hu.json" "$RUN/cfg/human-usage.json"
+peer_json "$(iso_at -2d)" remotealias remote@example.com:73:88 > "$RUN/state/peer-peerbox.json"
+R1_JSON="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com \
+           CLAUDE_HUMAN_USAGE="$RUN/cfg/human-usage.json" "$SCRIPT" usage --json 2>/dev/null)"
+R1_REMOTE="$(prow remote@example.com "$R1_JSON")"
+[ "$(jq -r '.weekly.remaining_pct' <<<"$R1_REMOTE")" = 92 ] \
+  && [ "$(jq -r '.quota_data' <<<"$R1_REMOTE")" = cached ] \
+  && ok "--record × peer → a reading typed just now beats a two-day-old peer row" \
+  || bad "--record × peer → the fresh hand reading must win (got: $R1_REMOTE)"
+
+peer_fixture peerbeatsrecord
+printf '%s' '{"accounts":{}}' > "$RUN/cfg/human-usage.json"
+jq --arg wr "$(iso_in +3d)" --argjson te "$(( $(date +%s) - 259200 ))" \
+   '.accounts["remote@example.com"]={weekly_used:8,weekly_resets_at:$wr,five_hour_used:null,
+                                     five_hour_resets_at:null,read_at:"three days ago",read_at_epoch:$te,
+                                     source:"vendor usage page, read by hand"}' \
+   "$RUN/cfg/human-usage.json" > "$RUN/cfg/hu.json" && mv "$RUN/cfg/hu.json" "$RUN/cfg/human-usage.json"
+peer_json "$(iso_at -30S)" remotealias remote@example.com:73:88 > "$RUN/state/peer-peerbox.json"
+R2_JSON="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com \
+           CLAUDE_HUMAN_USAGE="$RUN/cfg/human-usage.json" "$SCRIPT" usage --json 2>/dev/null)"
+R2_REMOTE="$(prow remote@example.com "$R2_JSON")"
+[ "$(jq -r '.weekly.remaining_pct' <<<"$R2_REMOTE")" = 73 ] \
+  && [ "$(jq -r '.quota_data' <<<"$R2_REMOTE")" = peer ] \
+  && ok "--record × peer → a peer that measured 30s ago beats a three-day-old reading" \
+  || bad "--record × peer → the fresher peer must win (got: $R2_REMOTE)"
+
+# ⚠️ AND A LIVE LOCAL FETCH STILL BEATS BOTH. The one rule `--record` shipped
+# with ("it never displaces a live fetch") must survive the peer precedence being
+# layered under it.
+peer_fixture recordneverbeatslive
+printf '%s' '{"accounts":{}}' > "$RUN/cfg/human-usage.json"
+jq --arg wr "$(iso_in +3d)" --argjson te "$(date +%s)" \
+   '.accounts["local@example.com"]={weekly_used:99,weekly_resets_at:$wr,five_hour_used:null,
+                                    five_hour_resets_at:null,read_at:"just now",read_at_epoch:$te,
+                                    source:"vendor usage page, read by hand"}' \
+   "$RUN/cfg/human-usage.json" > "$RUN/cfg/hu.json" && mv "$RUN/cfg/hu.json" "$RUN/cfg/human-usage.json"
+R3_JSON="$(FAKE_NEW_EMAIL=local@example.com CLAUDE_HUMAN_USAGE="$RUN/cfg/human-usage.json" \
+           "$SCRIPT" usage --json 2>/dev/null)"
+R3_LOCAL="$(prow local@example.com "$R3_JSON")"
+[ "$(jq -r '.quota_data' <<<"$R3_LOCAL")" = live ] \
+  && [ "$(jq -r '.weekly.remaining_pct' <<<"$R3_LOCAL")" = 90 ] \
+  && ok "--record × live → a typed 99% used never displaces this run's own measurement" \
+  || bad "--record × live → the live fetch must win (got: $R3_LOCAL)"
+
 restore_home
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
