@@ -253,5 +253,229 @@ check "legend: the lead-in no longer promises LIVE for the whole table" \
 check "legend: with no peer used, no peer clause is appended" \
   '! grep -q "read over ssh" <<<"$OUT"'
 
+# --- UNMEASURED: quota UNKNOWN is not quota SPENT -----------------------------
+# ⚠️ THE FAILURE THIS PREVENTS, measured 2026-08-21 and again 2026-08-27. A seat
+# whose cached weekly number describes a window that has SINCE ROLLED has no
+# usable number at all, and `cdt accounts` rendered that as a bare `-` in the
+# same visually-empty column that a genuinely spent seat fills with `0%`. On the
+# 21st two cancelled-but-live seats were written off that way while each still
+# carried roughly two more full weekly refreshes of already-paid-for quota. On
+# the 27th tartare's row read `- · due · Thu 27 Aug 19:00` two hours AFTER that
+# window refilled, on a seat whose usage API answers 429 every time, so nothing
+# was ever going to correct it on its own.
+#
+# Fixtures here are RELATIVE to today (`date -v`) and carry their own
+# billing.json via CLAUDE_BILLING_JSON: the dates in the shared fixture at the
+# top of this file are absolute, and a seat-end date that quietly slides into
+# the past would turn these into passes that stop testing anything.
+UN_BILL="$TMP/billing-unmeasured.json"
+UN_ENDS="$(date -v+4d '+%Y-%m-%d')"          # after today, BEFORE the rolled-forward reset (+7d)
+cat > "$UN_BILL" <<J
+{"accounts":{
+  "work@example.com":{"plan":"Max 20x","renews_day":7,"amount_display":"\$200.00","usd_approx":200,"status":"active"},
+  "spent@example.com":{"plan":"Max 5x","renews_day":15,"amount_display":"\$100.00","usd_approx":100,"status":"active"},
+  "team@example.com":{"plan":"Max 20x","renews_day":1,"amount_display":"\$200.00","usd_approx":200,"status":"cancelled","ends":"$UN_ENDS"}
+}}
+J
+
+# tartare's real shape: a peer-sourced number measured a day ago, for a weekly
+# window that rolled two hours ago, on a cancelled seat. Plus the two rows it
+# has to stay visually distinct from: a live one and a genuinely SPENT one.
+write_unmeasured_stub() {  # write_unmeasured_stub <unmeasured-flag> <weekly-pct-or-null> <floor>
+  cat > "$LIB/rota-engine.sh" <<STUB
+#!/usr/bin/env bash
+[ "\${1:-}" = "usage" ] && [ "\${2:-}" = "--json" ] || { echo "stub: unexpected args: \$*" >&2; exit 9; }
+cat <<J
+{"generated_at":"$(date -u '+%Y-%m-%dT%H:%M:%SZ')","activeEmail":"work@example.com",
+ "floors":{"weekly_pct":$3},
+ "peer":{"host":"ballito","generated_at":"$(date -u '+%Y-%m-%dT%H:%M:%SZ')"},
+ "accounts":[
+  {"label":"work@example.com","email":"work@example.com","alias":"work","active":true,
+   "data":"live","quota_data":"live","quota_source":null,
+   "quota_measured_at":"$(date -u '+%Y-%m-%dT%H:%M:%SZ')","unmeasured":false,
+   "seat":{"status":"active","ends":null,"ended":false},
+   "weekly":{"remaining_pct":55,"resets_at":"$(date -u -v+3d '+%Y-%m-%dT%H:%M:%S+00:00')","expired":false},
+   "five_hour":{"remaining_pct":80}},
+  {"label":"spent@example.com","email":"spent@example.com","alias":"spent","active":false,
+   "data":"live","quota_data":"live","quota_source":null,
+   "quota_measured_at":"$(date -u '+%Y-%m-%dT%H:%M:%SZ')","unmeasured":false,
+   "seat":{"status":"active","ends":null,"ended":false},
+   "weekly":{"remaining_pct":0,"resets_at":"$(date -u -v+2d '+%Y-%m-%dT%H:%M:%S+00:00')","expired":false},
+   "five_hour":{"remaining_pct":100}},
+  {"label":"team@example.com","email":"team@example.com","alias":"team","active":false,
+   "config_dir":"$TMP/pool/team",
+   "data":"peer","quota_data":"peer","quota_source":"ballito",
+   "quota_measured_at":"$(date -u -v-1d '+%Y-%m-%dT%H:%M:%SZ')",$1
+   "seat":{"status":"cancelled","ends":"$UN_ENDS","ended":false},
+   "weekly":{"remaining_pct":$2,"resets_at":"$(date -u -v-2H '+%Y-%m-%dT%H:%M:%S+00:00')","expired":true},
+   "five_hour":{"remaining_pct":100}}
+ ]}
+J
+STUB
+  chmod +x "$LIB/rota-engine.sh"
+}
+
+# A row's field, straight out of --json, so the machine surface is pinned next to
+# the table one instead of being inferred from it.
+jrow() { python3 -c 'import json,sys;print([a[sys.argv[3]] for a in json.loads(sys.argv[1])["accounts"] if a["account"]==sys.argv[2]][0])' "$1" "$2" "$3"; }
+# Is the reset this row publishes actually in the future? The whole point is that
+# the one it USED to publish was not.
+reset_is_future() { python3 -c '
+import json,sys
+from datetime import datetime
+r=[a for a in json.loads(sys.argv[1])["accounts"] if a["account"]==sys.argv[2]][0]
+n=r["next_weekly_reset"]
+print(bool(n) and datetime.fromisoformat(n) > datetime.now().astimezone())' "$1" "$2"; }
+# ⚠️ THE WEEKLY CELL ALONE, SLICED OUT BY COLUMN. Grepping the whole row for a
+# percentage cannot tell the weekly figure from the 5H one two columns over, so
+# "no number is invented here" would pass or fail on a number it is not about.
+# The cell is the 21 bytes after "  " + the 36-wide SEAT column + one space.
+weekly_cell() { python3 -c '
+import sys
+row=[l for l in sys.argv[1].splitlines() if l.startswith("  "+sys.argv[2])][0]
+print(row[39:60].strip())' "$1" "$2"; }
+# ⚠️ ALIGNMENT, PINNED IN BYTES. The table is column-aligned and the UNMEASURED
+# cell is six characters wider than every other weekly cell; a cell that quietly
+# pushes its row out of line is invisible to every grep for the words on it. So:
+# AMOUNT's last byte on the header and the last byte of every seat row's amount
+# must all land on the same column.
+columns_line_up() { python3 -c '
+import sys
+L=sys.argv[1].splitlines()
+h=[l for l in L if l.strip().startswith("SEAT")][0]
+rows=[l for l in L if "@example.com" in l and "$" in l]
+ends={h.index("AMOUNT")+len("AMOUNT")} | {l.index("$")+len(l[l.index("$"):].split()[0]) for l in rows}
+print(len(rows) >= 2 and len(ends) == 1)' "$1"; }
+
+export CLAUDE_BILLING_JSON="$UN_BILL"
+write_unmeasured_stub '"unmeasured":true,' 'null' 20
+OUT="$("$LIB/rota-billing.sh" 2>/dev/null)"
+JOUT="$("$LIB/rota-billing.sh" --json 2>/dev/null)"
+
+check "unmeasured: the weekly cell IS the marker, whole and nothing else" \
+  '[ "$(weekly_cell "$OUT" team@example.com)" = "????????? UNMEASURED" ]'
+check "unmeasured: a genuinely SPENT seat fills the same cell with a bar and 0%" \
+  '[ "$(weekly_cell "$OUT" spent@example.com)" = "░░░░░░░░░   0%" ]'
+check "unmeasured: NO percentage is invented for the unmeasured seat" \
+  '! grep -qE "[0-9]" <<<"$(weekly_cell "$OUT" team@example.com)"'
+check "unmeasured: GONE IN is no longer 'due' (the reset it named has already happened)" \
+  '! grep "team@example.com" <<<"$OUT" | grep -qE " due +[A-Z]"'
+check "unmeasured: QUOTA RESETS names a reset in the FUTURE" \
+  '[ "$(reset_is_future "$JOUT" team@example.com)" = True ]'
+check "unmeasured: the seat's LAST window is called out on the row it is about" \
+  'grep "team@example.com" <<<"$OUT" | grep -q "LAST window"'
+check "unmeasured: CANCELLED still composes on that same row" \
+  'grep "team@example.com" <<<"$OUT" | grep -q "CANCELLED, ends"'
+check "unmeasured: the provenance-and-age marker still composes on that same row" \
+  'grep "team@example.com" <<<"$OUT" | grep -q "\[via ballito, 1d old\]"'
+check "unmeasured: the command that would answer it is named under the table" \
+  'grep -q "rota usage --record team <weekly-used-%>" <<<"$OUT"'
+check "unmeasured: and the polarity is spelled out, because --record takes USED and the table shows LEFT" \
+  'grep -q "USED %" <<<"$OUT"'
+check "unmeasured: the hint is NOT stuffed into the row's NOTES column" \
+  '! grep "team@example.com" <<<"$OUT" | grep -q "\-\-record"'
+check "unmeasured: it is never what USE NEXT recommends" \
+  '! grep -A1 "USE NEXT" <<<"$OUT" | grep -q "rota switch team"'
+check "unmeasured: the row does not push any column out of line" \
+  '[ "$(columns_line_up "$OUT")" = True ]'
+check "unmeasured: json says so under the engine's own field name" \
+  '[ "$(jrow "$JOUT" team@example.com unmeasured)" = True ]'
+check "unmeasured: json still carries NO weekly percentage (unknown stays unknown)" \
+  '[ "$(jrow "$JOUT" team@example.com weekly_left_pct)" = None ]'
+check "unmeasured: json publishes last_window, so a script gets the same warning the row does" \
+  '[ "$(jrow "$JOUT" team@example.com last_window)" = True ]'
+
+# RESERVED has to survive all of it: whose seat it is and whether its quota was
+# measured are different questions, and the row has to answer both at once.
+mkdir -p "$TMP/pool/team"
+printf 'owner=airmond-runner\nwhy=pushed to the runners\n' > "$TMP/pool/team/RESERVED"
+OUT="$("$LIB/rota-billing.sh" 2>/dev/null)"
+check "unmeasured: RESERVED composes with UNMEASURED on one row" \
+  'grep "team@example.com" <<<"$OUT" | grep -q "RESERVED" && grep "team@example.com" <<<"$OUT" | grep -qF "UNMEASURED"'
+check "unmeasured: RESERVED, CANCELLED and the provenance marker all still render together" \
+  'grep "team@example.com" <<<"$OUT" | grep -q "airmond-runner" && grep "team@example.com" <<<"$OUT" | grep -q "CANCELLED" && grep "team@example.com" <<<"$OUT" | grep -q "\[via ballito"'
+check "unmeasured: and none of it pushes the columns apart" \
+  '[ "$(columns_line_up "$OUT")" = True ]'
+check "unmeasured: a reserved seat with no number is not offered as a withheld option either" \
+  '! grep -A1 "NOT OFFERED" <<<"$OUT" | grep -q "team ("'
+rm -rf "$TMP/pool/team"
+
+# ⚠️ AN UNMEASURED SEAT IS NOT AN "EARLIEST BACK". With nothing over the floor
+# the table used to name the seat whose reset comes soonest, and pointing at an
+# unmeasured seat's next reset tells you to wait for quota you may be holding
+# right now: the same inversion the whole bucket exists to undo.
+write_unmeasured_stub '"unmeasured":true,' 'null' 99
+OUT="$("$LIB/rota-billing.sh" 2>/dev/null)"
+check "unmeasured: with nothing over the floor, it is not named as 'earliest back'" \
+  'grep -A1 "USE NEXT" <<<"$OUT" | grep -q "earliest back" && ! grep -A1 "USE NEXT" <<<"$OUT" | grep -q "earliest back is team"'
+check "unmeasured: the block above still says what to do about it" \
+  'grep -q "rota usage --record team" <<<"$OUT"'
+
+# --- the recorded number flips the row back to a real figure -------------------
+# `rota usage --record <seat> <weekly-used-%>` is the whole point of naming the
+# command: once a number exists the engine stops calling the row unmeasured, and
+# this table has to follow it back.
+write_unmeasured_stub '"unmeasured":false,' '88' 20
+OUT="$("$LIB/rota-billing.sh" 2>/dev/null)"
+JOUT="$("$LIB/rota-billing.sh" --json 2>/dev/null)"
+check "recorded: the row shows the real percentage again" \
+  'grep "team@example.com" <<<"$OUT" | grep -q " 88%"'
+check "recorded: and the UNMEASURED cell is gone" \
+  '! grep "team@example.com" <<<"$OUT" | grep -qF "UNMEASURED"'
+check "recorded: the block under the table goes with it" \
+  '! grep -q "rota usage --record" <<<"$OUT"'
+check "recorded: the seat is rankable again (88% beats the 55% seat, and it dies first)" \
+  'grep -A1 "USE NEXT" <<<"$OUT" | grep -q "rota switch team"'
+check "recorded: json carries the number, not a null" \
+  '[ "$(jrow "$JOUT" team@example.com weekly_left_pct)" = 88 ]'
+
+# ⚠️ THE NUMBER WINS WHENEVER THERE IS ONE. If the two halves ever disagree, a
+# real measurement must not be hidden behind "may be full" - that is the only
+# direction in which this can be wrong safely.
+write_unmeasured_stub '"unmeasured":true,' '88' 20
+OUT="$("$LIB/rota-billing.sh" 2>/dev/null)"
+check "conflict: a row with a percentage leaves the bucket, whatever the flag says" \
+  'grep "team@example.com" <<<"$OUT" | grep -q " 88%" && ! grep "team@example.com" <<<"$OUT" | grep -qF "UNMEASURED"'
+
+# --- an OLDER engine, publishing no `unmeasured` field, must be untouched -------
+# Degrade silently: the same stale row from a copy of rota-engine.sh that predates
+# the field renders exactly what it rendered before any of this existed - a bare
+# dash, `due`, and the stamp of the reset that has already gone by.
+write_unmeasured_stub '' 'null' 20
+OUT="$("$LIB/rota-billing.sh" 2>/dev/null)"
+JOUT="$("$LIB/rota-billing.sh" --json 2>/dev/null)"
+STALE_RESET="$(date -v-2H '+%a %d %b %H:')"
+check "older engine: the weekly cell is a bare dash again, exactly as before" \
+  '[ "$(weekly_cell "$OUT" team@example.com)" = "-" ] && ! grep -qF "UNMEASURED" <<<"$OUT"'
+check "older engine: GONE IN is 'due' again for a reset that has passed" \
+  'grep "team@example.com" <<<"$OUT" | grep -q " due "'
+check "older engine: QUOTA RESETS still shows the stale stamp, unrolled" \
+  'grep "team@example.com" <<<"$OUT" | grep -q "$STALE_RESET"'
+check "older engine: no block appears under the table" \
+  '! grep -q "rota usage --record" <<<"$OUT"'
+check "older engine: json reports unmeasured false rather than omitting it" \
+  '[ "$(jrow "$JOUT" team@example.com unmeasured)" = False ]'
+check "older engine: columns still line up" \
+  '[ "$(columns_line_up "$OUT")" = True ]'
+
+# --- cancelled with no end date must not be a traceback ------------------------
+# billing.json is hand-maintained; `status: cancelled` with no `ends` is a typo
+# away at all times, and it used to reach datetime.fromisoformat(None). An
+# operator never sees a stack trace under a half-drawn table.
+#
+# ⚠️ STRIPPED FROM BOTH SOURCES. billing.json is where the date belongs, but the
+# engine republishes that same file as seat.ends and this table now falls back to
+# it, so removing it from only one side would quietly exercise the fallback
+# instead of the missing-date path. (That the first attempt at this test did
+# exactly that is the reason the note is here.)
+python3 -c 'import json,sys;p=sys.argv[1];d=json.load(open(p));d["accounts"]["team@example.com"].pop("ends");json.dump(d,open(p,"w"))' "$UN_BILL"
+sed -i.bak 's/"ends":"[0-9][0-9-]*"/"ends":null/' "$LIB/rota-engine.sh"
+OUT="$("$LIB/rota-billing.sh" 2>"$TMP/err")"; RC=$?
+check "cancelled with no end date: exit 0, no traceback" \
+  '[ "$RC" -eq 0 ] && ! grep -q "Traceback" "$TMP/err"'
+check "cancelled with no end date: the row says so with a '?' instead" \
+  'grep "team@example.com" <<<"$OUT" | grep -q "CANCELLED, ends ?"'
+unset CLAUDE_BILLING_JSON
+
 printf 'billing.test.sh: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
