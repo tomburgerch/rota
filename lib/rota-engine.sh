@@ -210,11 +210,13 @@
 #                                     against pool credential BYTES (see the block
 #                                     above), no `claude` subprocess, so it stays fast.
 #   rota failover usage [--no-refresh] [--json] [--verbose] [--color|--no-color]
+#   rota failover usage --record <alias> <weekly-used-%> [<5h-used-%>] [<weekly-reset-iso>]
 #                                     Usage dashboard (alias: `accounts`), laid out in
-#                                     THREE BUCKETS so the first five lines answer the
+#                                     FOUR BUCKETS so the first five lines answer the
 #                                     question it is actually run to answer, which
 #                                     account am I on, which can I switch to right now,
-#                                     and which are dead until when:
+#                                     which have a number nobody has measured, and which
+#                                     are dead until when:
 #                                       ▶ ACTIVE        the shared ~/.claude account,
 #                                                       with a 15-cell meter per window
 #                                                       whose FILLED cells are what is
@@ -225,8 +227,23 @@
 #                                                       table can never advertise a switch
 #                                                       the optimizer refuses, each with
 #                                                       the exact `rota switch <alias>`
+#                                       UNMEASURED      quota UNKNOWN, not spent: no source
+#                                                       (live fetch, cache, peer, hand
+#                                                       reading) produced a number for the
+#                                                       window you would spend right now,
+#                                                       because the window behind it has
+#                                                       rolled or the usage API answered
+#                                                       429. The SEAT is fine and only the
+#                                                       number is missing. Names each
+#                                                       cancelled seat's end date and the
+#                                                       `rota usage --record` that
+#                                                       answers it
 #                                       UNAVAILABLE     everything else, with a SHORT
 #                                                       reason and when it comes back
+#                                                       (a seat past its `ends` date in
+#                                                       billing.json reads `seat ended
+#                                                       <date>`, the one state that
+#                                                       really is finished)
 #                                     and the recommendation LAST, where it reads as the
 #                                     conclusion of the picture above it, followed by the
 #                                     PANES block, how many tmux panes in the configured
@@ -581,6 +598,34 @@ PEER_SKIP=0
 # It says nothing about the account you are already on, see EXHAUSTED_PCT.
 MIN_WEEKLY="${CLAUDE_FAILOVER_MIN_WEEKLY:-20}"
 MIN_SESSION="${CLAUDE_FAILOVER_MIN_SESSION:-10}"
+
+# ── the SEAT's own lifecycle, which is not a quota fact ──────────────────────
+#
+# ⚠️ A CANCELLED SEAT IS STILL A LIVE SEAT UNTIL ITS END DATE, and this tool
+# spent weeks implying otherwise. The operator, 2026-08-21: two seats had been
+# cancelled and were still perfectly usable, with two or three more weekly
+# refreshes each still to come, and every session was writing them off.
+#
+# The sessions were not being careless, the tool told them to. A cached weekly
+# window that had already rolled rendered as "weekly window expired" under
+# UNAVAILABLE. The string means "the number I have is stale, go and measure it".
+# It READS as "this account is finished". Measured 2026-08-21 08:30, both
+# cancelled seats showed exactly that while each still had roughly two more full
+# weekly refreshes of quota that is already paid for.
+#
+# The facts needed to tell those apart already existed, billing.json has carried
+# `status` and `ends` per seat since 2026-08-15, and this script simply never
+# looked. It does now. Nothing here measures anything: the seat's lifecycle is
+# the half no usage API exposes, which is that file's whole reason for existing
+# ("THIS file holds the half that no API exposes").
+#
+# ⚠️ $CFG_DIR, NEVER A REPO-RELATIVE PATH. billing.json is per-machine state and
+# lives beside the accounts file, exactly where rota-billing.sh reads it; the
+# repo ships only config/billing.example.json, a template of made-up seats. A
+# repo-relative default would consult that example on every box and answer
+# "active, no end date" for every real seat while looking like it had read
+# something.
+BILLING_JSON="${CLAUDE_BILLING_JSON:-$CFG_DIR/billing.json}"
 
 # ── the two modes ────────────────────────────────────────────────────────────
 # The 20% floor above is the RIGHT rule in general and stays the default: leaving 12%
@@ -2633,6 +2678,13 @@ peer_row() {  # peer_row <payload> <email>
 #      actually measured its number later
 #   3. nothing → the row stays exactly as it was, `-` and [quota none]
 #
+# A number recorded by hand (`rota usage --record`, for the seats whose token the
+# usage API answers 429 for) is a MEASUREMENT under rule 2 like any other: it
+# reaches this function already adopted into the `cached` slot, carrying its
+# read_at_epoch in U_AGE, so the same newer-wins test below arbitrates it with no
+# special case. It is not privileged for having been typed and not demoted for it
+# either; see the block above the human_get call in collect_usage.
+#
 # Peer numbers are deliberately NOT written into this box's usage-cache.json.
 # That cache means "what THIS box measured"; seeding it from a peer would let a
 # borrowed number come back next run wearing local clothes, with the provenance
@@ -2766,6 +2818,229 @@ peer_fill() {
 #               surface that prints an age reads this, so "how old is this number"
 #               has exactly one answer per row.
 # Plus the shared ~/.claude credential's own row in S_*.
+# ── seat lifecycle: read once, keyed by email ────────────────────────────────
+#
+# seat_field <email> 1 -> active|cancelled ;  seat_field <email> 2 -> YYYY-MM-DD end date
+#
+# Read-only and best-effort: a missing or unreadable billing file leaves every
+# seat "active with no end date", which is exactly the behaviour this script had
+# before it read the file at all. billing.json is optional (rota works without
+# one), so a quota tool must not start failing because a BILLING note is absent.
+# ⚠️ ONE TSV BLOB, NOT AN ASSOCIATIVE ARRAY. macOS ships bash 3.2, which has no
+# `declare -A`, and this script runs under `#!/usr/bin/env bash` on every Mac.
+# A hash here fails at PARSE time with "declare: -A: invalid option", so the
+# whole tool dies rather than degrading, caught the first time this ran.
+SEATS_TSV=""
+SEATS_LOADED=0
+load_seats() {
+  (( SEATS_LOADED )) && return 0
+  SEATS_LOADED=1
+  [[ -r "$BILLING_JSON" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  SEATS_TSV="$(jq -r '(.accounts // {}) | to_entries[]
+                      | [.key, (.value.status // "active"), (.value.ends // "")] | @tsv' \
+                 "$BILLING_JSON" 2>/dev/null || true)"
+  return 0
+}
+
+# seat_field <email> <1=status|2=ends>. Empty when the seat is not in the file,
+# which is the same answer as "active, no end date" everywhere it is used.
+#
+# ⚠️ `f+1`, because awk's $1 is the EMAIL the row is keyed by, not the first
+# VALUE. Without the offset every caller asking for the status got the email
+# back, a non-empty string, so `seat_cancelled` silently answered "no" for every
+# cancelled seat and the whole point of this change was inert while looking like
+# it worked.
+seat_field() {
+  load_seats
+  [[ -n "${1:-}" ]] || return 0
+  printf '%s\n' "$SEATS_TSV" | awk -F'\t' -v e="$1" -v f="$2" '$1==e{print $(f+1); exit}'
+}
+
+# Has the seat itself ENDED? This is the ONLY one of the three states that means
+# "this account is finished", and it is a date comparison, never an inference
+# from a stale number.
+seat_ended() {  # seat_ended <slot-index>
+  load_seats
+  local e="${U_EMAIL[$1]:-}" ends
+  [[ -n "$e" ]] || return 1
+  ends="$(seat_field "$e" 2)"
+  [[ -n "$ends" ]] || return 1
+  [[ "$ends" < "$(date '+%Y-%m-%d')" ]]
+}
+
+# Temporary limit changes the vendor announces on its own site and no API
+# reports.
+#
+# ⚠️ A PERCENTAGE IS ONLY MEANINGFUL AGAINST A KNOWN BASELINE, AND THE BASELINE
+# MOVES. Weekly Claude Code limits were 50% higher through 2026-08-31, so "40%
+# left" during that window is more absolute quota than "40% left" after it, and
+# any plan made against a remembered baseline is wrong for as long as the boost
+# runs. There is no API field for it, so it is read off the vendor's usage page
+# and written into billing.json.
+#
+# Each entry carries its own `through` date and is simply not printed once that
+# date passes, so a boost that ends cannot linger as a false footnote, the
+# failure mode a hard-coded sentence would have had.
+render_boosts() {
+  [[ -r "$BILLING_JSON" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  local today line
+  today="$(date '+%Y-%m-%d')"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    printf '  %s\n' "$(paint "$CLR_YELLOW" "$line")"
+  done < <(jq -r --arg today "$today" \
+      '(.boosts // [])[] | select(.through >= $today)
+       | "boost until \(.through): \(.what)"' "$BILLING_JSON" 2>/dev/null || true)
+  return 0
+}
+
+seat_ends_on() { seat_field "${U_EMAIL[$1]:-}" 2; }
+seat_cancelled() { [[ "$(seat_field "${U_EMAIL[$1]:-}" 1)" == "cancelled" ]]; }
+
+# ⚠️ A CANCELLED SEAT IS THE MOST USE-IT-OR-LOSE-IT QUOTA IN THE POOL, NOT THE
+# LEAST. It has a fixed number of weekly windows left, ever: after its end date
+# that quota is gone whether it was spent or not. So the deadline that ranks a
+# row is min(weekly reset, seat end), not the weekly reset alone, and a
+# cancelled seat with NO measured weekly window still has a real deadline rather
+# than falling to the "nothing is expiring" tier.
+seat_deadline() {  # seat_deadline <slot-index> -> ISO instant, or empty
+  local wkr="${U_WKR[$1]:-}" ends
+  ends="$(seat_ends_on "$1")"
+  # A date sorts against an ISO instant correctly under a plain string compare
+  # because both are ISO-8601 and lexicographic order IS chronological order;
+  # a bare date is treated as that day's midnight, which is the conservative
+  # end of the seat's last day.
+  [[ -n "$ends" ]] && ends="${ends}T00:00:00Z"
+  if [[ -z "$wkr" ]]; then printf '%s' "$ends"; return 0; fi
+  if [[ -z "$ends" ]]; then printf '%s' "$wkr"; return 0; fi
+  if [[ "$ends" < "$wkr" ]]; then printf '%s' "$ends"; else printf '%s' "$wkr"; fi
+}
+
+# ── what a human read off the vendor's usage page, because the API would not ──
+#
+# billing.json's header states the principle this follows: "THIS file holds the
+# half that no API exposes". A measurement is the same KIND of fact when the API
+# refuses, but it is per-machine and it PERISHES, so it lives beside the usage
+# cache in $CFG_DIR rather than in billing.json, where a hand-typed number
+# copied between machines would read as measured.
+HUMAN_USAGE="${CLAUDE_HUMAN_USAGE:-$CFG_DIR/human-usage.json}"
+H_WKU=""; H_WKR=""; H_SEU=""; H_SER=""; H_TS=""; H_TE=""
+human_get() {  # human_get <email>
+  H_WKU=""; H_WKR=""; H_SEU=""; H_SER=""; H_TS=""; H_TE=""
+  [[ -r "$HUMAN_USAGE" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  local row
+  # ⚠️ UNIT SEPARATOR, NOT TAB. Tab is IFS *whitespace*, so bash collapses a run
+  # of them into ONE delimiter, and this row has two fields that are routinely
+  # empty (no 5h reading). With @tsv the timestamp shifted into the 5h slot and
+  # the row rendered as `[cached ]` with no date: a hand-typed measurement that
+  # looked like it had no age at all, which is precisely the dishonesty this
+  # whole change exists to remove. \x1f is not whitespace, so empty fields hold
+  # their place. Same rule, same reason, as cache_get above.
+  row="$(jq -r --arg e "$1" '(.accounts // {})[$e]
+          | if . == null then empty
+            else [(.weekly_used//""),(.weekly_resets_at//""),(.five_hour_used//""),
+                  (.five_hour_resets_at//""),(.read_at//""),(.read_at_epoch//"")]
+                 | map(tostring) | join("\u001f") end' "$HUMAN_USAGE" 2>/dev/null || true)"
+  [[ -n "$row" ]] || return 0
+  IFS=$'\x1f' read -r H_WKU H_WKR H_SEU H_SER H_TS H_TE <<<"$row"
+  return 0
+}
+
+# `rota usage --record <alias> <weekly-used-%> [<5h-used-%>]`
+#
+# The numbers are the ones the vendor's usage page prints, in the polarity that
+# page prints them (USED, not left): asking somebody to invert a number they are
+# copying off a screen is how a typo becomes a wrong decision.
+#
+# ⚠️ IT STAMPS THE WEEKLY WINDOW IT BELONGS TO, so it expires on its own. A
+# measurement with no window is indistinguishable from a fresh one forever,
+# which is the exact defect this whole change is about, a number outliving the
+# window it described. Absent a stated reset, the window is assumed to end seven
+# days from now, and `window_expired` retires it after that like any other.
+record_human_usage() {  # record_human_usage <alias> <weekly-used> [<5h-used>] [<weekly-reset-iso>]
+  local alias="${1:-}" wk="${2:-}" se="${3:-}" wkr="${4:-}"
+  [[ -n "$alias" && -n "$wk" ]] || die "usage --record needs a seat alias and the weekly USED %, e.g. \`rota usage --record spare 12\`"
+  [[ "$wk" =~ ^[0-9]+$ ]] && (( wk <= 100 )) || die "weekly USED % must be 0-100, got '$wk'"
+  [[ -z "$se" || ( "$se" =~ ^[0-9]+$ && "$se" -le 100 ) ]] || die "5h USED % must be 0-100, got '$se'"
+  local dir="$POOL_ROOT/$alias" email
+  [[ -d "$dir" ]] || die "no pool dir at $(tilde "$dir"), is '$alias' a real seat alias?"
+  email="$(config_email "$dir")"
+  [[ -n "$email" ]] || die "cannot tell which account $(tilde "$dir") holds"
+  [[ -n "$wkr" ]] || wkr="$(date -u -v+7d '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+                            || date -u -d '+7 days' '+%Y-%m-%dT%H:%M:%SZ')"
+  mkdir -p "$CFG_DIR"
+  [[ -s "$HUMAN_USAGE" ]] || printf '{"_comment":"Usage percentages a human read off the vendor usage page, for seats whose token the usage API will not answer for. Percentages are USED, as that page prints them. Each entry carries the window it belongs to and is ignored once that window has passed.","accounts":{}}\n' > "$HUMAN_USAGE"
+  local tmp; tmp="$(mktemp "$HUMAN_USAGE.XXXXXX")"
+  jq --arg e "$email" --argjson wk "$wk" \
+     --argjson se "$( [[ -n "$se" ]] && printf '%s' "$se" || printf 'null' )" \
+     --arg wkr "$wkr" --arg ts "$(date '+%b %-d %H:%M')" \
+     --argjson te "$(date '+%s')" \
+     '.accounts[$e] = {weekly_used:$wk, weekly_resets_at:$wkr,
+                       five_hour_used:$se, five_hour_resets_at:null,
+                       read_at:$ts, read_at_epoch:$te,
+                       source:"vendor usage page, read by hand"}' \
+     "$HUMAN_USAGE" > "$tmp" && mv "$tmp" "$HUMAN_USAGE"
+  printf 'recorded for %s: weekly %s%% used, window until %s\n' "$email" "$wk" "$wkr"
+  printf '  it feeds `rota usage` only while that window lasts, and only when the API will not answer.\n'
+  # shellcheck disable=SC2016  # literal backticks, nothing to expand
+  printf '  a peer that measured this seat MORE RECENTLY still wins; the newer measurement always does.\n'
+}
+
+# Is this row's WEEKLY quota simply UNKNOWN? Either the cached window has since
+# rolled (so the number describes a window that no longer exists) or the usage
+# API refused to answer at all, the 429 case, which on a busy pool host is the
+# norm and not a blip.
+#
+# ⚠️ Measured 2026-08-21 09:35 on the pool host: GET /api/oauth/usage returned
+# HTTP 429 for both cancelled seats across six attempts over two and a half
+# minutes, with no live session on either and a valid credential in every pool
+# dir. The row's own note says "retry in ~1 min, live sessions share this
+# token"; that is not what is happening here, and no retry loop rescues it. So
+# "unknown" has to be a state the report can show honestly, not a transient to
+# be papered over.
+# ⚠️ NARROW ON PURPOSE, "unknown" IS NOT "unusable". The first cut of this asked
+# only "is there a weekly number", which swept in every row whose CREDENTIAL is
+# the problem: no stored credential, one the CLI cleared, a refresh already
+# rejected. Those accounts really are unavailable, they need a login before
+# anybody can spend them, and inviting a measurement is useless advice. Seven
+# tests caught it, and they were right to.
+#
+# So this is exactly the two facts the 2026-08-21 measurement established: a
+# cached window that has ROLLED (the number describes a window that no longer
+# exists) and a usage API that answered 429. In both, the seat is fine and only
+# the NUMBER is missing.
+#
+# ⚠️ "MISSING" MEANS MISSING FROM THE REPORT, NOT MISSING FROM THIS BOX'S OWN
+# PROBE, and that distinction only started to matter when peer rows arrived
+# (2026-08-27). U_WHY answers "why did THIS box fail to fetch", and after
+# peer_fill a row can carry a 429 in U_WHY and, at the same time, a real
+# current-window number that a peer measured over ssh. Asking U_WHY alone then
+# filed a perfectly good borrowed number under UNMEASURED, which prints no
+# number at all and tells the operator to go and read one off the vendor's page:
+# the exact inversion this bucket exists to prevent, pointing the other way.
+#
+# So the question is asked about the ROW, not about the probe. In order:
+#   1. the window this row's number describes has ROLLED  -> unknown, whoever
+#      measured it (local cache, a peer, or a hand reading): the number is about
+#      a window that no longer exists
+#   2. there IS a number for the CURRENT window           -> measured. Where it
+#      came from is a freshness question the state tag already answers
+#      (`cached Mon 14:02`, `via ballito, 2d old`), never a bucket question
+#   3. no number, and the probe was REFUSED (429)         -> unknown
+#   4. no number, and the CREDENTIAL is the problem       -> not unknown, see the
+#      "narrow on purpose" note above: that seat needs a login, not a measurement
+weekly_unknown() {  # weekly_unknown <slot-index>
+  (( U_WKX[$1] == 1 )) && return 0
+  [[ -n "${U_WKU[$1]:-}" ]] && return 1
+  case "${U_WHY[$1]:-}" in
+    *429*) return 0 ;;
+  esac
+  return 1
+}
+
 NET=1                      # 0 = --no-refresh: cache only, never touch the network
 RUN_MEASURED_AT=""         # UTC ISO instant this pass's LIVE numbers were measured
 COLLECTED=0
@@ -2934,6 +3209,40 @@ collect_usage() {
       fi
     fi
     cache_get "$email"
+    # ⚠️ A HAND-READ MEASUREMENT OUTRANKS AN EXPIRED CACHE, AND ONLY AN EXPIRED
+    # ONE. On a busy pool host the usage API answers 429 far more often than it
+    # answers (measured 2026-08-21: six attempts over two and a half minutes,
+    # both cancelled seats, no live session on either, a valid credential in
+    # every pool dir), so for some seats there is no automated path to the
+    # number at all, while the number itself is two clicks away on the vendor's
+    # usage page. `rota usage --record` stores what a human read there; this is
+    # where it is used.
+    #
+    # It never displaces a LIVE fetch and never displaces a cache that is still
+    # describing its own window: a typed number is the answer of last resort,
+    # not a preference.
+    #
+    # ⚠️ AND AGAINST A PEER ROW (2026-08-27, the question `--record` predates):
+    # THE NEWER MEASUREMENT WINS, which is R4, unchanged, applied to one more
+    # kind of measurement. A hand reading lands in the `cached` slot below with
+    # its read_at_epoch in U_AGE, so peer_fill's own newer-wins comparison
+    # arbitrates it exactly as it arbitrates this box's cache. Deliberately no
+    # privilege in either direction:
+    #   - typed a minute ago, peer's payload is a day old -> the typed number
+    #     wins, which is the whole reason it was typed
+    #   - peer measured this seat live 30s ago, the typed number is yesterday's
+    #     -> the peer wins, and should: it is an API reading of the same seat
+    # The one asymmetry is already handled above by window, not by source: a
+    # hand reading whose window has rolled is dropped here before it is ever
+    # adopted, because `--record` stamps a window precisely so it can expire.
+    if [[ -z "$json" ]] && { [[ -z "$C_WKU$C_SEU" ]] || window_expired "$C_WKR"; }; then
+      human_get "$email"
+      if [[ -n "$H_WKU" ]] && ! window_expired "$H_WKR"; then
+        C_WKU="$H_WKU"; C_WKR="$H_WKR"; C_SEU="$H_SEU"; C_SER="$H_SER"
+        C_TS="$H_TS"; C_TE="$H_TE"
+        U_VIA[i]="read off the vendor usage page by hand $H_TS, the usage API would not answer"
+      fi
+    fi
     if [[ -n "$C_WKU$C_SEU" ]]; then
       U_STATE[i]="cached"
       U_WKU[i]="$C_WKU"; U_WKR[i]="$C_WKR"; U_SEU[i]="$C_SEU"; U_SER[i]="$C_SER"
@@ -3426,6 +3735,15 @@ active_burndown_hold() {   # 0 = hold the active account, 1 = let the ranking de
 # watching, while the keeper adds its own 30%-left floor and 80% ceiling because
 # it fires unattended. A change to either side's floor should still be weighed
 # against the other.
+#
+# ⚠️ ONE KNOWN GAP IN THAT ALIGNMENT, opened deliberately here and NOT yet closed
+# in the keeper: this picker now ranks on min(weekly reset, SEAT END), see
+# seat_deadline. The keeper still ranks on the weekly reset alone, so where a
+# cancelled seat's end date falls before its next reset the two can choose
+# differently, and only this one prefers the seat that is about to disappear
+# for good. Closing it means teaching the keeper's own picker the same deadline;
+# until then this is a difference to KNOW about, not one to "fix" by reverting
+# the ranking here.
 REC_SLOT=-1; REC_EMAIL=""; REC_RESET=""; REC_FRESH=0; REC_CACHED=0
 REC_HOLD=0; REC_NEXT_EMAIL=""; REC_NEXT_ALIAS=""
 compute_recommendation() {  # compute_recommendation <exclude_active 0|1> <require_pool_dir 0|1> [allow_cached 0|1]
@@ -3474,15 +3792,22 @@ compute_recommendation() {  # compute_recommendation <exclude_active 0|1> <requi
       U_REASON[i]="already the active account"; continue
     fi
     U_REC[i]=1
-    if [[ -z "${U_WKR[$i]}" ]]; then
+    # ⚠️ THE DEADLINE IS min(weekly reset, SEAT END), NOT THE WEEKLY RESET ALONE.
+    # Ranking on the weekly reset alone treats a cancelled seat as just another
+    # account, when it is the most use-it-or-lose-it quota in the pool: it has a
+    # fixed number of weekly windows left, ever, and whatever is unspent on its
+    # end date is gone. A cancelled seat with no measured window is not
+    # "nothing is expiring" either, the SEAT is.
+    local deadline; deadline="$(seat_deadline "$i")"
+    if [[ -z "$deadline" ]]; then
       # tier 2: nothing is expiring, so it only takes the pick while tier 1 is empty
       if (( REC_SLOT < 0 )); then
         REC_SLOT="$i"; REC_RESET=""; REC_EMAIL="${U_EMAIL[$i]}"; REC_FRESH=1
         REC_CACHED="$cached_row"
       fi
-    elif (( REC_SLOT < 0 )) || (( REC_FRESH )) || [[ "${U_WKR[$i]}" < "$REC_RESET" ]]; then
-      # tier 1: a real reset always outranks a fresh account, then soonest wins
-      REC_SLOT="$i"; REC_RESET="${U_WKR[$i]}"; REC_EMAIL="${U_EMAIL[$i]}"; REC_FRESH=0
+    elif (( REC_SLOT < 0 )) || (( REC_FRESH )) || [[ "$deadline" < "$REC_RESET" ]]; then
+      # tier 1: a real deadline always outranks a fresh account, then soonest wins
+      REC_SLOT="$i"; REC_RESET="$deadline"; REC_EMAIL="${U_EMAIL[$i]}"; REC_FRESH=0
       REC_CACHED="$cached_row"
     fi
   done
@@ -3684,6 +4009,36 @@ render_alt_row() {  # render_alt_row <slot-index> <email-width>
     "$(paint "$CLR_DIM" "[$(state_tag "$i")]")"
 }
 
+# One UNMEASURED line: what is not known, the DEADLINE that actually matters,
+# and the exact command that would answer it.
+#
+# ⚠️ THE END DATE IS THE COLUMN THAT CHANGES BEHAVIOUR. For a cancelled seat the
+# question is never "is this account any good", it is "how many weekly windows
+# does it have left, ever". Naming the date turns a row that read as an obituary
+# into a deadline, which is what it always was.
+#
+# The reason column is 23 wide (short_reason's one 23-char arm lands here) and
+# the note column 33 (the width of "cancelled, quota until <ISO date>"), so
+# every row in this bucket puts its command in the same place.
+render_unmeasured_row() {  # render_unmeasured_row <slot-index> <email-width>
+  local i="$1" ew="$2" ends note alias
+  ends="$(seat_ends_on "$i")"
+  alias="$(basename "${DIRS[$i]}")"
+  if seat_cancelled "$i" && [[ -n "$ends" ]]; then
+    note="cancelled, quota until $ends"
+  else
+    note="not measured this run"
+  fi
+  # PAD FIRST, PAINT SECOND, the same order render_alt_row uses: an escape
+  # sequence counts as characters inside a printf field width, so colouring a
+  # cell before padding it shreds every column to its right.
+  printf '  %s %s\n' "$(paint "$CLR_YELLOW" '?')" \
+    "$(printf '%-*s  %-23s  %s  %s' \
+        "$ew" "${U_EMAIL[$i]}" "$(short_reason "$i")" \
+        "$(paint "$CLR_BOLD" "$(printf '%-33s' "$note")")" \
+        "$(paint "$CLR_DIM" "[$(state_tag "$i")]  rota usage --record $alias <weekly-used-%>")")"
+}
+
 # One UNAVAILABLE line: a SHORT reason and when it comes back. The long
 # `skipped …` sentence is not lost, it moved to --verbose.
 render_unavail_row() {  # render_unavail_row <slot-index> <email-width>
@@ -3721,8 +4076,27 @@ short_reason() {  # short_reason <slot-index>
     *'its home IS the shared'*)   printf 'home is ~/.claude' ;;
     *)
       # everything left is "no LIVE numbers (<why>)", the WHY is the part worth
-      # a column, and an already-reset cached window is its own answer
-      if (( U_WKX[i] == 1 )); then printf 'weekly window expired'; return 0; fi
+      # a column.
+      #
+      # ⚠️ THIS ARM USED TO PRINT "weekly window expired" FOR EVERY STALE ROW,
+      # AND THAT ONE STRING WAS THREE DIFFERENT FACTS WEARING ONE COAT:
+      #   - the SEAT has ended            -> genuinely finished
+      #   - the weekly quota is SPENT     -> back at the named reset
+      #   - the MEASUREMENT is stale      -> unknown, and very possibly FULL
+      # Only the first two are bad news. The third is an instruction to go and
+      # measure, and it read as an obituary: every session that saw it wrote off
+      # two cancelled-but-live seats carrying roughly two more full weekly
+      # refreshes each. See the seat-lifecycle block near the top.
+      if seat_ended "$i"; then
+        printf 'seat ended %s' "$(seat_ends_on "$i")"; return 0
+      fi
+      if (( U_WKX[i] == 1 )); then
+        # Never "expired", the WINDOW rolled, which is the opposite of bad: the
+        # quota behind it is new and unmeasured. This arm is the one exception to
+        # the 22-char rule below at 23 chars, and it only ever renders in the
+        # UNMEASURED bucket, whose renderer pads its reason column to 23 to match.
+        printf 'unmeasured, may be full'; return 0
+      fi
       # every arm is <= the 22-char reason column, so a long reason never pushes
       # the "back <when>" column out of alignment on the row that has one
       case "$why" in
@@ -3969,6 +4343,7 @@ render_usage_table() {
 
   printf '%s\n\n' "$(paint "$CLR_BOLD" "Claude account pool, $(date '+%a %-d %b %H:%M %Z')")"
   render_billing_now
+  render_boosts
   echo
 
   # Warnings stay in the DEFAULT view, they are rare, and they are the reason
@@ -4011,10 +4386,24 @@ render_usage_table() {
   fi
   echo
 
-  # ── 2/3. the split: the optimizer's own verdict decides which side ─────────
+  # ── 2/3/4. the split ───────────────────────────────────────────────────────
+  #
+  # ⚠️ THERE IS A THIRD PLACE A ROW CAN GO, AND ADDING IT IS THE POINT OF THIS
+  # REPORT. "UNAVAILABLE" is a verdict about the ACCOUNT, and only two of the
+  # three not-recommendable states are actually about the account: the seat has
+  # ended, or the quota is spent. The third, "I have not measured this", is a
+  # statement about THIS TOOL, and filing it under UNAVAILABLE told every reader
+  # the opposite of the truth about two seats that were fully loaded.
+  #
+  # So an unmeasured seat goes to a bucket that INVITES a measurement instead of
+  # pronouncing on the account.
+  local unmeas=""
   for i in "${!DIRS[@]}"; do
     (( SHARED_SLOT >= 0 )) && (( i == SHARED_SLOT )) && continue
-    if (( U_REC[i] == 1 )); then alts="$alts $i"; else unav="$unav $i"; fi
+    if (( U_REC[i] == 1 )); then alts="$alts $i"
+    elif seat_ended "$i"; then unav="$unav $i"
+    elif weekly_unknown "$i" && [[ "${U_STATE[$i]}" != "dup" ]]; then unmeas="$unmeas $i"
+    else unav="$unav $i"; fi
   done
 
   printf '  %s%s\n' "$(paint "$CLR_BOLD" 'ALTERNATIVES')" \
@@ -4025,6 +4414,13 @@ render_usage_table() {
     printf '  %s\n' "$(paint "$CLR_DIM" 'none, no other account clears the health floor right now')"
   fi
   echo
+
+  if [[ -n "$unmeas" ]]; then
+    printf '  %s%s\n' "$(paint "$CLR_BOLD" 'UNMEASURED')" \
+      "$(paint "$CLR_DIM" ', quota UNKNOWN, not spent. Very possibly full; go and look')"
+    for i in $unmeas; do render_unmeasured_row "$i" "$ew"; render_verbose_detail "$i"; done
+    echo
+  fi
 
   printf '  %s\n' "$(paint "$CLR_BOLD" 'UNAVAILABLE')"
   if [[ -n "$unav" ]]; then
@@ -4747,6 +5143,19 @@ json_usage() {
     #                      generated. The two differ by days on a seat nothing runs
     #                      sessions on, and a machine consumer deserves the same
     #                      honesty the table gets, see age_short.
+    # ── the seat's lifecycle, ADDITIVE (2026-08-25) ─────────────────────────
+    # A consumer that only ever saw `weekly.expired` could not tell "finished"
+    # from "unmeasured" either, and the dashboard reads this object.
+    # `unmeasured` is the state the table now calls UNMEASURED; `seat.ended` is
+    # the only field that means the account is actually done.
+    local seat_status seat_ends seat_done unmeasured
+    seat_status="$(seat_field "${U_EMAIL[$i]}" 1)"; : "${seat_status:=active}"
+    seat_ends="$(seat_ends_on "$i")"
+    seat_done=false; seat_ended "$i" && seat_done=true
+    unmeasured=false
+    if [[ "$seat_done" == false ]] && weekly_unknown "$i" && [[ "${U_STATE[$i]}" != "dup" ]]; then
+      unmeasured=true
+    fi
     logged_in=false; slot_logged_in "$i" && logged_in=true
     is_live=false; [[ "${U_STATE[$i]}" == "live" ]] && is_live=true
     is_stale=false; usage_row_stale "$i" && is_stale=true
@@ -4754,6 +5163,8 @@ json_usage() {
       --argjson wk_in "$wk_in" --argjson se_in "$se_in" \
       --argjson logged_in "$logged_in" --argjson is_live "$is_live" \
       --argjson is_stale "$is_stale" \
+      --argjson seat_done "$seat_done" --argjson unmeasured "$unmeasured" \
+      --arg seat_status "$seat_status" --arg seat_ends "$seat_ends" \
       --arg label "${LABELS[$i]}" \
       --arg email "${U_EMAIL[$i]}" \
       --arg dir "${DIRS[$i]}" \
@@ -4777,6 +5188,9 @@ json_usage() {
       --argjson rec "$( (( U_REC[i] == 1 )) && echo true || echo false )" \
       '{label:$label, email:$email, config_dir:$dir, alias:$alias, active:$active,
         current:$active, loggedIn:$logged_in, live:$is_live, stale:$is_stale,
+        unmeasured:$unmeasured,
+        seat:{status:$seat_status, ends:(if $seat_ends=="" then null else $seat_ends end),
+              ended:$seat_done},
         data:$state, cached_at:(if $cached_at=="" then null else $cached_at end),
         quota_data:$state,
         quota_source:(if $src=="" then null else $src end),
@@ -4958,7 +5372,13 @@ main() {
           --verbose|-v)    VERBOSE=1 ;;
           --color)         COLOR_MODE=always ;;
           --no-color)      COLOR_MODE=never ;;
-          *) die "usage: rota failover usage [--no-refresh] [--json] [--verbose] [--color|--no-color]" ;;
+          # `--record` writes and returns; it never falls through to the report,
+          # because the report it would print is the one made stale by the very
+          # number just typed in.
+          --record)        shift; command -v jq >/dev/null 2>&1 || die "usage --record needs jq"
+                           record_human_usage "${1:-}" "${2:-}" "${3:-}" "${4:-}"; return 0 ;;
+          *) die "usage: rota failover usage [--no-refresh] [--json] [--verbose] [--color|--no-color]
+       rota failover usage --record <alias> <weekly-used-%> [<5h-used-%>] [<weekly-reset-iso>]" ;;
         esac
         shift
       done

@@ -10,6 +10,7 @@
     "status": "'active' or 'cancelled'. A cancelled seat needs `ends`.",
     "ends": "ISO date (YYYY-MM-DD) after which a cancelled seat stops working. Only used for cancelled seats; a charge that would land on or after this date is dropped from the total.",
     "source": "Free text: where you read the numbers from and when, so the next person knows how stale they are.",
+    "boosts": "Optional. Temporary limit changes the vendor announces and no API reports. One object per change: 'through' (ISO date, the last day it applies), 'what' (one line, shown verbatim) and 'source'. `rota usage` prints each entry until its 'through' date passes, then it disappears on its own, so a stale boost can never keep inflating the baseline a percentage is read against. Delete nothing, expiry is automatic. It matters because a percentage is only meaningful against a known baseline: '40% left' during a 50%-higher week is more absolute quota than '40% left' after it.",
     "not_in_the_pool": "Optional. Seats you pay for but do NOT pool (a family member's Pro seat, say). Never read by rota; listed so nobody counts that receipt as a pool seat."
   },
 
@@ -21,6 +22,14 @@
   ],
 
   "currency_note": "amount_display is what was actually charged, including tax and in the currency billed. usd_approx is only for totalling.",
+
+  "boosts": [
+    {
+      "through": "2026-08-31",
+      "what": "Weekly Claude Code limits are 50% higher",
+      "source": "vendor usage page, read 2026-08-21"
+    }
+  ],
 
   "accounts": {
     "work@example.com": {
