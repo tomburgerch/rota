@@ -558,6 +558,24 @@ set -euo pipefail
 # examples are found relative to it (through a symlink chain if any).
 ROTA_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# ⚠️ "WHICH SEAT IS NEXT" IS NOT ANSWERED IN THIS FILE ANY MORE. The deadline
+# rule and the ordering around it live in rota-ranking.sh, sourced by this
+# script AND by rota-keeper.sh, because the two used to hold the same rule
+# separately and drifted apart the moment one of them learned something (see
+# that file's header). Everything below still owns its own ELIGIBILITY floors.
+#
+# ⚠️ HARD FAIL, never a silent degrade. Without it the ranking calls below would
+# be "command not found" halfway through a report, or worse, quietly skipped:
+# a picker that has lost its ranking rule and says nothing is the exact failure
+# this split exists to prevent. die() is not defined this early, so this is a
+# plain printf + exit.
+if [[ ! -r "$ROTA_LIB/rota-ranking.sh" ]]; then
+  printf 'rota-engine.sh: %s/rota-ranking.sh is missing; this is an incomplete checkout (it holds the seat ranking, shared with rota-keeper.sh)\n' "$ROTA_LIB" >&2
+  exit 1
+fi
+# shellcheck source=lib/rota-ranking.sh
+. "$ROTA_LIB/rota-ranking.sh"
+
 CFG_DIR="${CLAUDE_FAILOVER_HOME:-$HOME/.config/claude-failover}"
 ACCOUNTS_FILE="$CFG_DIR/accounts"
 STATE_FILE="$CFG_DIR/current"
@@ -2822,40 +2840,12 @@ peer_fill() {
 #
 # seat_field <email> 1 -> active|cancelled ;  seat_field <email> 2 -> YYYY-MM-DD end date
 #
-# Read-only and best-effort: a missing or unreadable billing file leaves every
-# seat "active with no end date", which is exactly the behaviour this script had
-# before it read the file at all. billing.json is optional (rota works without
-# one), so a quota tool must not start failing because a BILLING note is absent.
-# ⚠️ ONE TSV BLOB, NOT AN ASSOCIATIVE ARRAY. macOS ships bash 3.2, which has no
-# `declare -A`, and this script runs under `#!/usr/bin/env bash` on every Mac.
-# A hash here fails at PARSE time with "declare: -A: invalid option", so the
-# whole tool dies rather than degrading, caught the first time this ran.
-SEATS_TSV=""
-SEATS_LOADED=0
-load_seats() {
-  (( SEATS_LOADED )) && return 0
-  SEATS_LOADED=1
-  [[ -r "$BILLING_JSON" ]] || return 0
-  command -v jq >/dev/null 2>&1 || return 0
-  SEATS_TSV="$(jq -r '(.accounts // {}) | to_entries[]
-                      | [.key, (.value.status // "active"), (.value.ends // "")] | @tsv' \
-                 "$BILLING_JSON" 2>/dev/null || true)"
-  return 0
-}
-
-# seat_field <email> <1=status|2=ends>. Empty when the seat is not in the file,
-# which is the same answer as "active, no end date" everywhere it is used.
-#
-# ⚠️ `f+1`, because awk's $1 is the EMAIL the row is keyed by, not the first
-# VALUE. Without the offset every caller asking for the status got the email
-# back, a non-empty string, so `seat_cancelled` silently answered "no" for every
-# cancelled seat and the whole point of this change was inert while looking like
-# it worked.
-seat_field() {
-  load_seats
-  [[ -n "${1:-}" ]] || return 0
-  printf '%s\n' "$SEATS_TSV" | awk -F'\t' -v e="$1" -v f="$2" '$1==e{print $(f+1); exit}'
-}
+# ⚠️ THE READER ITSELF LIVES IN rota-ranking.sh, so the keeper reads the seat
+# lifecycle out of the same file, in the same shape, with the same
+# missing-file behaviour. These two are thin BINDINGS of that reader to this
+# script's own $BILLING_JSON; every call site below is unchanged.
+load_seats() { rota_load_seats "$BILLING_JSON"; }
+seat_field() { rota_seat_field "$BILLING_JSON" "${1:-}" "${2:-}"; }
 
 # Has the seat itself ENDED? This is the ONLY one of the three states that means
 # "this account is finished", and it is a date comparison, never an inference
@@ -2905,17 +2895,19 @@ seat_cancelled() { [[ "$(seat_field "${U_EMAIL[$1]:-}" 1)" == "cancelled" ]]; }
 # row is min(weekly reset, seat end), not the weekly reset alone, and a
 # cancelled seat with NO measured weekly window still has a real deadline rather
 # than falling to the "nothing is expiring" tier.
-seat_deadline() {  # seat_deadline <slot-index> -> ISO instant, or empty
-  local wkr="${U_WKR[$1]:-}" ends
-  ends="$(seat_ends_on "$1")"
-  # A date sorts against an ISO instant correctly under a plain string compare
-  # because both are ISO-8601 and lexicographic order IS chronological order;
-  # a bare date is treated as that day's midnight, which is the conservative
-  # end of the seat's last day.
-  [[ -n "$ends" ]] && ends="${ends}T00:00:00Z"
-  if [[ -z "$wkr" ]]; then printf '%s' "$ends"; return 0; fi
-  if [[ -z "$ends" ]]; then printf '%s' "$wkr"; return 0; fi
-  if [[ "$ends" < "$wkr" ]]; then printf '%s' "$ends"; else printf '%s' "$wkr"; fi
+#
+# ⚠️ THE RULE IS NOT WRITTEN HERE. rota_seat_deadline (rota-ranking.sh) owns it,
+# so rota-keeper.sh's unattended picker cannot rank a seat differently from the
+# surface that told the operator what to do. Do not re-inline the comparison, and
+# do not "simplify" either copy back to the weekly reset alone; that is the older
+# rule, it agrees with this one almost always, and it is wrong exactly on a
+# cancelled seat's last partial week.
+#
+# This is the SLOT-INDEXED binding of it: it looks the two dates up for a row and
+# passes the pair through. Answers "<deadline-iso>\t<reset|seat-end>", because the
+# sentence a surface prints has to be able to name WHICH date bound the choice.
+seat_deadline() {  # seat_deadline <slot-index> -> "<ISO instant>\t<reset|seat-end>", or "\t"
+  rota_seat_deadline "${U_WKR[$1]:-}" "$(seat_ends_on "$1")"
 }
 
 # ── what a human read off the vendor's usage page, because the API would not ──
@@ -3725,30 +3717,39 @@ active_burndown_hold() {   # 0 = hold the active account, 1 = let the ranking de
 # own knobs (AUTO_SWITCH_PCT, AUTO_SWITCH_TARGET_MAX_PCT,
 # AUTO_SWITCH_TARGET_MIN_LEFT_PCT, AUTO_SWITCH_BOUNCE_SECS).
 #
-# 2026-08-16, CÉDRIC DECIDED, and the two are now INTENTIONALLY ALIGNED ON THE
-# RANKING: "always work on the one that expires next and burn all those tokens
-# before switching to the one right after", soonest weekly reset, here and in
-# the keeper. That the keeper used to rank by lowest utilization is history; the
-# match is deliberate, not accidental drift, so do not "restore" the difference.
-# What remains deliberately DIFFERENT is the floors: this picker's MIN_WEEKLY
-# (20%-left) + MIN_SESSION (10%-left) serve an interactive choice the operator is
-# watching, while the keeper adds its own 30%-left floor and 80% ceiling because
-# it fires unattended. A change to either side's floor should still be weighed
-# against the other.
+# 2026-08-16, CÉDRIC DECIDED, and the two are now ALIGNED ON THE RANKING:
+# "always work on the one that expires next and burn all those tokens before
+# switching to the one right after", here and in the keeper. That the keeper used
+# to rank by lowest utilization is history; the match is deliberate, not
+# accidental drift, so do not "restore" the difference.
 #
-# ⚠️ ONE KNOWN GAP IN THAT ALIGNMENT, opened deliberately here and NOT yet closed
-# in the keeper: this picker now ranks on min(weekly reset, SEAT END), see
-# seat_deadline. The keeper still ranks on the weekly reset alone, so where a
-# cancelled seat's end date falls before its next reset the two can choose
-# differently, and only this one prefers the seat that is about to disappear
-# for good. Closing it means teaching the keeper's own picker the same deadline;
-# until then this is a difference to KNOW about, not one to "fix" by reverting
-# the ranking here.
+# ⚠️ AND SINCE 2026-08-28 THE ALIGNMENT IS NOT A CONVENTION ANY MORE, IT IS ONE
+# FUNCTION. Both pickers call rota_seat_deadline + rota_deadline_beats
+# (rota-ranking.sh). Convention was not enough: this picker moved to
+# min(weekly reset, SEAT END) on 2026-08-27 and the keeper did not, so for a
+# cancelled seat whose end date falls before its next reset the two named
+# DIFFERENT seats - live on the pool within days. Do not re-inline the
+# comparison here to "make this file self-contained"; that is precisely how the
+# two copies drifted, and do NOT close a future gap by reverting the deadline to
+# the weekly reset alone.
+#
+# What remains deliberately DIFFERENT is the ELIGIBILITY floors: this picker's
+# MIN_WEEKLY (20%-left) + MIN_SESSION (10%-left) serve an interactive choice the
+# operator is watching, while the keeper adds its own 30%-left floor and 80%
+# ceiling because it fires unattended. Those decide WHICH seats may be picked,
+# not in what ORDER, so they stay per-caller. A change to either side's floor
+# should still be weighed against the other.
+#
+# REC_BEST_USED is the incumbent's weekly USED %, carried only so the tie-break
+# (rule 3 in rota_deadline_beats) has something to compare against; it is never
+# printed.
 REC_SLOT=-1; REC_EMAIL=""; REC_RESET=""; REC_FRESH=0; REC_CACHED=0
+REC_BEST_USED=""; REC_DEADLINE_KIND=""
 REC_HOLD=0; REC_NEXT_EMAIL=""; REC_NEXT_ALIAS=""
 compute_recommendation() {  # compute_recommendation <exclude_active 0|1> <require_pool_dir 0|1> [allow_cached 0|1]
   local excl_active="${1:-0}" need_pool="${2:-0}" allow_cached="${3:-0}" i wkl sel cached_row
   REC_SLOT=-1; REC_EMAIL=""; REC_RESET=""; REC_FRESH=0; REC_CACHED=0
+  REC_BEST_USED=""; REC_DEADLINE_KIND=""
   REC_HOLD=0; REC_NEXT_EMAIL=""; REC_NEXT_ALIAS=""
   BURN_WKL=""; BURN_SEL=""; BURN_CACHED=0; BURN_BLOCKED=0
   resolve_mode
@@ -3792,22 +3793,26 @@ compute_recommendation() {  # compute_recommendation <exclude_active 0|1> <requi
       U_REASON[i]="already the active account"; continue
     fi
     U_REC[i]=1
-    # ⚠️ THE DEADLINE IS min(weekly reset, SEAT END), NOT THE WEEKLY RESET ALONE.
-    # Ranking on the weekly reset alone treats a cancelled seat as just another
-    # account, when it is the most use-it-or-lose-it quota in the pool: it has a
-    # fixed number of weekly windows left, ever, and whatever is unspent on its
-    # end date is gone. A cancelled seat with no measured window is not
-    # "nothing is expiring" either, the SEAT is.
-    local deadline; deadline="$(seat_deadline "$i")"
-    if [[ -z "$deadline" ]]; then
-      # tier 2: nothing is expiring, so it only takes the pick while tier 1 is empty
-      if (( REC_SLOT < 0 )); then
-        REC_SLOT="$i"; REC_RESET=""; REC_EMAIL="${U_EMAIL[$i]}"; REC_FRESH=1
-        REC_CACHED="$cached_row"
-      fi
-    elif (( REC_SLOT < 0 )) || (( REC_FRESH )) || [[ "$deadline" < "$REC_RESET" ]]; then
-      # tier 1: a real deadline always outranks a fresh account, then soonest wins
-      REC_SLOT="$i"; REC_RESET="$deadline"; REC_EMAIL="${U_EMAIL[$i]}"; REC_FRESH=0
+    # ⚠️ THE DEADLINE IS min(weekly reset, SEAT END), NOT THE WEEKLY RESET ALONE,
+    # and the comparison is rota_deadline_beats, NOT an inline `<`. Both live in
+    # rota-ranking.sh so rota-keeper.sh's unattended picker orders the pool the
+    # same way this one does. The three rules it encodes, all of which used to be
+    # written out here: a real deadline always outranks an account with nothing
+    # expiring; then soonest wins; then an exact tie goes to the lowest weekly
+    # utilization, so the pick never falls back on accounts-file order.
+    local dl_pair deadline dl_kind used_pct
+    dl_pair="$(seat_deadline "$i")"
+    deadline="${dl_pair%%$'\t'*}"; dl_kind="${dl_pair#*$'\t'}"
+    used_pct="$(used "${U_WKU[$i]}")"
+    if (( REC_SLOT < 0 )) \
+       || rota_deadline_beats "$deadline" "$used_pct" "$REC_RESET" "$REC_BEST_USED"; then
+      REC_SLOT="$i"; REC_RESET="$deadline"; REC_EMAIL="${U_EMAIL[$i]}"
+      REC_BEST_USED="$used_pct"; REC_DEADLINE_KIND="$dl_kind"
+      # FRESH is "this row has no deadline at all", the empty-string sentinel,
+      # and it is what stops the sentences below naming an instant that does not
+      # exist. It is derived from the deadline rather than tracked separately, so
+      # the two can never say different things about the same pick.
+      REC_FRESH=0; [[ -n "$deadline" ]] || REC_FRESH=1
       REC_CACHED="$cached_row"
     fi
   done
@@ -3825,6 +3830,10 @@ compute_recommendation() {  # compute_recommendation <exclude_active 0|1> <requi
     REC_SLOT="$SHARED_SLOT"; REC_EMAIL="${U_EMAIL[$SHARED_SLOT]}"
     REC_RESET="${U_WKR[$SHARED_SLOT]}"
     REC_FRESH=0; [[ -z "$REC_RESET" ]] && REC_FRESH=1
+    # A HOLD is not a deadline pick: the hold sentence names the WEEKLY window it
+    # is spending down, so the kind is stated rather than left over from whatever
+    # the ranking had chosen before the override.
+    REC_DEADLINE_KIND="reset"; [[ -n "$REC_RESET" ]] || REC_DEADLINE_KIND=""
     REC_CACHED="$BURN_CACHED"
     # the row we now recommend must not also print "skipped … under the 20%-left floor"
     U_REC[SHARED_SLOT]=1; U_REASON[SHARED_SLOT]=""
@@ -4279,6 +4288,19 @@ recommendation_text() {
     printf '→ switch to %s: `rota switch %s`\n' "$REC_EMAIL" "$alias_of"
     if (( REC_FRESH )); then
       printf '  a fully unspent account: its weekly window has not started yet (weekly %s%% used · %s%% left; 5h %s%% used · %s%% left), and no account clearing the health floor has headroom expiring sooner.%s\n' \
+        "$(used "${U_WKU[$REC_SLOT]}")" "$(remaining "${U_WKU[$REC_SLOT]}")" \
+        "$(used "${U_SEU[$REC_SLOT]}")" "$(remaining "${U_SEU[$REC_SLOT]}")" "$act_note"
+    elif [[ "$REC_DEADLINE_KIND" == "seat-end" ]]; then
+      # ⚠️ NAME THE DATE THAT ACTUALLY BOUND THE CHOICE. The ranking is
+      # min(weekly reset, seat end), so on a cancelled seat's FINAL partial week
+      # the winner is chosen by its END DATE - and this sentence used to call
+      # that "soonest weekly reset" regardless: the right answer under the wrong
+      # noun, pointing the reader at a date that had nothing to do with the
+      # pick. REC_DEADLINE_KIND comes straight out of rota_seat_deadline, the
+      # same call that produced the ordering, so the sentence and the sort can
+      # never name different dates.
+      printf '  soonest deadline among the accounts clearing the health floor: this seat ENDS %s, before its weekly window would reset, so this is its LAST window (weekly %s%% used · %s%% left; 5h %s%% used · %s%% left) and whatever is unspent on it is gone for good.%s\n' \
+        "$(seat_ends_on "$REC_SLOT")" \
         "$(used "${U_WKU[$REC_SLOT]}")" "$(remaining "${U_WKU[$REC_SLOT]}")" \
         "$(used "${U_SEU[$REC_SLOT]}")" "$(remaining "${U_SEU[$REC_SLOT]}")" "$act_note"
     else

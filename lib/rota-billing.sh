@@ -245,7 +245,20 @@ def ends_at(r):
 # bottom of this file. They used to be able to disagree: the column counted down
 # to the weekly reset while the ranking sorted on min(reset, seat end), so a
 # cancelled seat's row and its position told two different stories about the
-# same date. This is billing's half of rota-engine.sh's seat_deadline.
+# same date.
+#
+# ⚠️ THE RULE ITSELF IS lib/rota-ranking.sh's rota_seat_deadline, which
+# rota-engine.sh and rota-keeper.sh both CALL. This is the only surface that
+# cannot call it (the ranking here is Python, that one is bash), so it is the one
+# place the rule is still restated - and the restatement is deliberately
+# minimal: min(next reset, seat end), tie to the reset, exactly as over there.
+# Do NOT "simplify" it back to the weekly reset alone; that older rule agrees
+# almost always and is wrong exactly on a cancelled seat's last partial week.
+#
+# ONE INPUT IS DELIBERATELY DIFFERENT, and it is not a drift: next_reset() rolls
+# a stale UNMEASURED stamp forward to the reset the seat will actually see,
+# because this table prints that instant in its own column. The bash pickers
+# rank a measured row and feed the raw weekly reset. Same rule, different input.
 def loses_at(r):
     """When this seat's CURRENT quota window goes away: min(next reset, seat end)."""
     when = [x for x in (next_reset(r), ends_at(r)) if x is not None]

@@ -658,6 +658,153 @@ grep -q "switch=to:$(email_of primary)" "$RUN/cfg/keeper-status" \
   && ok "bounce → and it is a knob: AUTO_SWITCH_BOUNCE_SECS=0 lets the same pick through" \
   || bad "bounce → knob (status: $(cat "$RUN/cfg/keeper-status"))"
 
+# ── 5c. ONE RANKING: the keeper and the engine must name the SAME seat ───────
+#
+# rota has TWO pickers - the engine's compute_recommendation behind
+# `rota usage` / `rota switch`, and this keeper's unattended auto-switch at the
+# 90% wall. They were kept in step BY CONVENTION, each carrying a comment saying
+# the other ranked the same way. Convention failed the moment one of them
+# learned something: on 2026-08-27 the engine moved to min(weekly reset, SEAT
+# END) and the keeper did not, so for a CANCELLED seat whose end date falls
+# before its next weekly reset the two named DIFFERENT seats. That shape was
+# live on the real pool within days (tartare@ ending 1 Sep and thea.hawk@ ending
+# 6 Sep, both with their quota resetting first). A picker that disagrees with
+# ITSELF is worse than either rule: neither answer can be trusted without
+# knowing which code path produced it.
+#
+# Both now call rota_seat_deadline + rota_deadline_beats (lib/rota-ranking.sh),
+# and these scenarios are what stops the two drifting again. THE ASSERTION IS
+# AGREEMENT, not "the keeper picks X": a test that only pinned one side would go
+# green again the moment the other side moved.
+#
+# ONE set of numbers is served to BOTH pickers - the keeper reads them through
+# its CLAUDE_FAILOVER_USAGE_CMD stub (keyed by EMAIL), the engine through the
+# curl stub (keyed by the seat's access TOKEN). Same bytes in both files, so any
+# disagreement is the ranking and never the input.
+pair_fixture() {  # pair_fixture <alias> <weekly-util> <5h-util> <5h-reset-iso> <weekly-reset-iso ("" = fresh)>
+  local wkr body
+  # a FRESH weekly window is resets_at:null, the API's own shape for "this
+  # window has not started"; an empty string here would be a third state neither
+  # picker has ever seen.
+  if [ -n "${5:-}" ]; then wkr="\"$5\""; else wkr=null; fi
+  body="$(printf '{"seven_day":{"utilization":%s,"resets_at":%s},"five_hour":{"utilization":%s,"resets_at":"%s"}}' \
+    "$2" "$wkr" "$3" "$4")"
+  printf '%s' "$body" > "$FAKE_STATE/usage-$(email_of "$1").json"
+  printf '%s' "$body" > "$FAKE_STATE/usage-TOK-$1.json"
+}
+
+# billing.json in $RUN/cfg, i.e. at the DEFAULT path both scripts resolve from
+# $CFG_DIR. Passing it by env would prove less: the keeper had never read this
+# file before, so "does it find it where the engine finds it" is part of the claim.
+seat_fixture() {  # seat_fixture [<alias>:<status>:<ends-date> ...]
+  local spec entries="" a
+  for spec in "$@"; do
+    a="${spec%%:*}"; spec="${spec#*:}"
+    entries="$entries$(printf '"%s":{"plan":"Max 20x","status":"%s","ends":"%s"},' \
+      "$(email_of "$a")" "${spec%%:*}" "${spec#*:}")"
+  done
+  printf '{"accounts":{%s}}' "${entries%,}" > "$RUN/cfg/billing.json"
+}
+
+# The alias the ENGINE's own picker names, straight out of the surface a human
+# reads (`rota usage`), not a re-derivation.
+engine_pick() {
+  local j
+  set +e
+  j="$(bash "$FAILOVER" usage --json 2>/dev/null)"
+  set -e
+  jq -r '.recommendation.alias // ""' <<<"$j" 2>/dev/null
+}
+keeper_pick() {  # the alias the KEEPER switched to this tick, or ""
+  sed -n 's/.*switch=to:\([^@ ]*\)@example\.com.*/\1/p' "$RUN/cfg/keeper-status" 2>/dev/null
+}
+
+# THE SHAPE THE WHOLE TASK EXISTS FOR: a cancelled seat whose END DATE precedes
+# its weekly reset. Separated by construction, so the two rules cannot both be
+# right:
+#   wk    CANCELLED, ends in 2 DAYS, weekly resets in 6 DAYS  -> deadline +2d
+#   team  active,                    weekly resets in 3 DAYS  -> deadline +3d
+# Ranking on the weekly reset alone picks TEAM; ranking on min(reset, seat end)
+# picks WK, correctly - whatever is unspent on wk in two days is gone forever,
+# while team's window merely rolls.
+mk_pool kagree
+pair_fixture alpha   91 50 "$(iso_in +2H)" "$(iso_in +4d)"   # the claim, over the wall
+pair_fixture wk      40 10 "$(iso_in +2H)" "$(iso_in +6d)"   # ends first, resets LAST
+pair_fixture team    40 10 "$(iso_in +2H)" "$(iso_in +3d)"   # resets first, never ends
+pair_fixture primary 40 10 "$(iso_in +2H)" "$(iso_in +5d)"
+seat_fixture "wk:cancelled:$(date -u -v+2d '+%Y-%m-%d')"
+EP="$(engine_pick)"
+run_keeper "${keeper_env[@]}"
+KP="$(keeper_pick)"
+[ -n "$EP" ] && [ "$EP" = "$KP" ] \
+  && ok "one ranking → keeper and engine name the SAME seat for a cancelled seat ending before its reset (both: ${EP:-none})" \
+  || bad "one ranking → the two pickers disagree (engine: ${EP:-none}, keeper: ${KP:-none})"
+[ "$EP" = wk ] \
+  && ok "one ranking → and the seat they agree on is the one that ENDS first, not the one that resets first" \
+  || bad "one ranking → min(weekly reset, seat end) must pick wk (engine: ${EP:-none}, keeper: ${KP:-none})"
+grep -q 'seat ENDS' "$RUN/cfg/keeper.log" \
+  && ok "one ranking → the keeper's log names the SEAT END as the reason, not a reset it did not use" \
+  || bad "one ranking → keeper log names the binding date (log: $(grep auto-switch "$RUN/cfg/keeper.log" | tail -1))"
+
+# THE ORDINARY CASE, and it has to be able to fail differently: the same seat is
+# still cancelled, but now its end is FAR (10 days) and its reset is near (2
+# days), so the deadline is its RESET. If min() were reading the seat end here,
+# wk would rank last (+10d) and team (+3d) would win, so this pins the min()
+# rather than a blanket "cancelled seats first".
+mk_pool kagreereset
+pair_fixture alpha   91 50 "$(iso_in +2H)" "$(iso_in +4d)"
+pair_fixture wk      40 10 "$(iso_in +2H)" "$(iso_in +2d)"   # resets first, ends far away
+pair_fixture team    40 10 "$(iso_in +2H)" "$(iso_in +3d)"
+pair_fixture primary 40 10 "$(iso_in +2H)" "$(iso_in +5d)"
+seat_fixture "wk:cancelled:$(date -u -v+10d '+%Y-%m-%d')"
+EP="$(engine_pick)"
+run_keeper "${keeper_env[@]}"
+KP="$(keeper_pick)"
+[ "$EP" = wk ] && [ "$KP" = wk ] \
+  && ok "one ranking → a seat whose RESET precedes its end still ranks on the reset, and both pickers agree" \
+  || bad "one ranking → reset-bound pick (engine: ${EP:-none}, keeper: ${KP:-none})"
+! grep -q 'seat ENDS' "$RUN/cfg/keeper.log" \
+  && ok "one ranking → and the log calls it a reset when the reset is what bound it" \
+  || bad "one ranking → reset-bound pick must not claim a seat end (log: $(grep auto-switch "$RUN/cfg/keeper.log" | tail -1))"
+
+# ⚠️ THE "NOTHING IS EXPIRING" SENTINEL MUST RANK LAST, NEVER FIRST. It is the
+# empty string, and an empty string sorts BEFORE every real ISO timestamp under
+# a string compare, so the healthiest seat in the pool would otherwise be
+# recommended as the most urgent. wk here has no weekly reset instant at all (a
+# window that has not started) and no end date, so it must lose to team's real
+# +3d deadline in BOTH pickers.
+mk_pool kfresh
+pair_fixture alpha   91 50 "$(iso_in +2H)" "$(iso_in +4d)"
+pair_fixture wk      40 10 "$(iso_in +2H)" ""                # fresh: nothing expiring
+pair_fixture team    40 10 "$(iso_in +2H)" "$(iso_in +3d)"   # a real deadline
+pair_fixture primary 40 10 "$(iso_in +2H)" "$(iso_in +5d)"
+seat_fixture "alpha:active:"
+EP="$(engine_pick)"
+run_keeper "${keeper_env[@]}"
+KP="$(keeper_pick)"
+[ "$EP" = team ] && [ "$KP" = team ] \
+  && ok "sentinel → a seat with NO deadline ranks LAST in both pickers, never ahead of a real one" \
+  || bad "sentinel → fresh seat must not win (engine: ${EP:-none}, keeper: ${KP:-none})"
+
+# ⚠️ AN EXACT TIE ON THE DEADLINE GOES TO THE LOWEST UTILIZATION. This is the
+# keeper's older rule, kept as the tie-break so the pick stays deterministic
+# where the newer policy is silent. Without it the tie falls to whatever order
+# the accounts file happens to list, which is not a rule anyone chose: wk is
+# listed BEFORE team here, so a first-wins tie would name wk.
+mk_pool ktie
+TIE_RESET="$(iso_in +3d)"
+pair_fixture alpha   91 50 "$(iso_in +2H)" "$(iso_in +4d)"
+pair_fixture wk      60 10 "$(iso_in +2H)" "$TIE_RESET"      # listed first, but emptier
+pair_fixture team    40 10 "$(iso_in +2H)" "$TIE_RESET"      # same instant, more left
+pair_fixture primary 40 10 "$(iso_in +2H)" "$(iso_in +5d)"
+seat_fixture "alpha:active:"
+EP="$(engine_pick)"
+run_keeper "${keeper_env[@]}"
+KP="$(keeper_pick)"
+[ "$EP" = team ] && [ "$KP" = team ] \
+  && ok "tie-break → an exact deadline tie goes to the LOWEST utilization in both pickers, not to accounts-file order" \
+  || bad "tie-break → lowest utilization on a tie (engine: ${EP:-none}, keeper: ${KP:-none})"
+
 # ── 6. keeper: keepalive is OFF by default (2026-08-16) ──────────────────────
 # It husked 23 credential files across two machines in one day and verified
 # not one rotation (~201 attempts), so step 2 is a no-op unless

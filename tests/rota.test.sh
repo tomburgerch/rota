@@ -36,6 +36,16 @@ for v in usage accounts switch login billing status keeper-status keeper cred-gu
   check "help lists '$v'" 'grep -qE "^  [a-z| -]*\b'"$v"'\b" <<<"$HELP"'
 done
 check "help: no home paths leak" '! grep -qE "/Users/|/home/" <<<"$HELP"'
+# `--record` is the ONLY way to answer an UNMEASURED seat (the usage API refuses,
+# so a human reads the number off the vendor's page and types it in), and it was
+# missing from this text entirely: reachable only by someone who already knew it
+# existed, which is the same as not existing. `rota help` is where a reader looks.
+check "help lists 'usage --record'" 'grep -q -- "usage --record" <<<"$HELP"'
+# and the POLARITY rides with it: the tables print what is LEFT, --record takes
+# what is USED, and inverting a number you are copying off a screen is how a typo
+# becomes a wrong decision (rota-billing.sh's UNMEASURED block and the engine's
+# own --record help say the same thing, in the same words).
+check "help: --record names the USED polarity" 'grep -q "USED %" <<<"$HELP"'
 
 # --- version ---------------------------------------------------------------------
 check "version prints 0.1.0" '[ "$("$R" version)" = "0.1.0" ]'
