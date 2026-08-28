@@ -889,6 +889,43 @@ grep -q "switch to spare@example.com" <<<"$SR_OUT" \
   && ok "seat deadline → and the later-ending seat is not preferred just for resetting sooner" \
   || bad "seat deadline → alpha must not win (got: $SR_OUT)"
 
+# ⚠️ AND THE SENTENCE MUST NAME THE DATE THAT ACTUALLY BOUND THE CHOICE. This
+# pick was decided by the SEAT END, and the rationale used to call it "soonest
+# weekly reset" anyway, then print a reset instant six days out that had nothing
+# to do with it: the right answer under the wrong noun, pointing the reader at
+# the wrong date to sanity-check it against.
+grep -q "this seat ENDS $(date -u -v+2d '+%Y-%m-%d')" <<<"$SR_OUT" \
+  && ok "seat deadline → the rationale names the SEAT END, with the date that bound the pick" \
+  || bad "seat deadline → rationale must name the seat end (got: $SR_OUT)"
+grep -q "LAST window" <<<"$SR_OUT" \
+  && ok "seat deadline → and says why that matters: it is the seat's LAST window" \
+  || bad "seat deadline → rationale must say last window (got: $SR_OUT)"
+! grep -q "soonest weekly reset among" <<<"$SR_OUT" \
+  && ok "seat deadline → and does NOT claim a soonest-weekly-reset rationale it did not use" \
+  || bad "seat deadline → must not claim the reset decided it (got: $SR_OUT)"
+
+# THE CONTROL, one field different: the seat now ends in 8 days, AFTER its own
+# weekly reset at +6d, so nothing is bound by a seat end any more and alpha's
+# +5d reset is the soonest deadline in the pool. The pick flips AND the noun
+# flips with it - without this the assertions above would pass on a sentence
+# that says "seat ENDS" unconditionally.
+jq -n --arg ends "$(date -u -v+8d '+%Y-%m-%d')" \
+  '{accounts:{"spare@example.com":{plan:"Max 20x",status:"cancelled",ends:$ends},
+              "alpha@example.com":{plan:"Max 20x",status:"active"}}}' > "$RUN/billing.json"
+set +e
+SR_OUT2="$(FAKE_NEW_EMAIL=primary@example.com CLAUDE_BILLING_JSON="$RUN/billing.json" \
+           "$SCRIPT" usage 2>/dev/null)"
+set -e
+grep -q "switch to alpha@example.com" <<<"$SR_OUT2" \
+  && ok "seat deadline (control) → an end date AFTER the reset stops binding, and the soonest reset wins" \
+  || bad "seat deadline (control) → alpha must win (got: $SR_OUT2)"
+grep -q "soonest weekly reset among the accounts clearing the health floor" <<<"$SR_OUT2" \
+  && ok "seat deadline (control) → and the rationale says RESET when the reset is what bound it" \
+  || bad "seat deadline (control) → rationale must name the reset (got: $SR_OUT2)"
+! grep -q "this seat ENDS" <<<"$SR_OUT2" \
+  && ok "seat deadline (control) → the seat-end wording is not printed unconditionally" \
+  || bad "seat deadline (control) → must not claim a seat end (got: $SR_OUT2)"
+
 # --- 10c. a boost is dated data, and expires itself -------------------------
 # A percentage is only meaningful against a known baseline, and the baseline
 # moves: weekly Claude Code limits were 50% higher through 2026-08-31. A
@@ -3446,6 +3483,13 @@ husk_json() {
 # with that single last line removed is pure definitions and can be sourced.
 LIB="$ROOT/failover-lib.sh"
 sed '$d' "$SCRIPT" > "$LIB"
+# ⚠️ AND ITS SIBLING. The script sources $ROTA_LIB/rota-ranking.sh (the seat
+# ranking it shares with the keeper), and ROTA_LIB is the dirname of whatever
+# copy is running, so a copy alone in $ROOT cannot find it and dies at source
+# time. Every positive `lib …` assertion below then fails for a reason that has
+# nothing to do with what it is testing (and every NEGATED one silently
+# "passes"), which is exactly how this was found.
+cp "$REPO_ROOT/lib/rota-ranking.sh" "$ROOT/rota-ranking.sh"
 lib() { bash -c 'source "$1"; shift; "$@"' _ "$LIB" "$@"; }
 
 new_run credpred

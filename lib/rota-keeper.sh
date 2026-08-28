@@ -42,13 +42,17 @@
 #                  dashboard's staleness rendering and this daemon read one file.
 #   4. AUTO-SWITCH at AUTO_SWITCH_PCT (90) on the ACTIVE account's binding
 #                  weekly OR five-hour utilization: pick the best target
-#                  (logged in, not dead, SOONEST weekly reset among accounts
+#                  (logged in, not dead, SOONEST DEADLINE among accounts
 #                  with at least AUTO_SWITCH_TARGET_MIN_LEFT_PCT (30) weekly
 #                  left; the operator's 2026-08-16 policy: work the account that
 #                  expires next and burn it before moving on), `switch-all
 #                  <target> [--restart-idle]`, notify once. Hysteresis: never
 #                  switch back to the account we just left within 30 min,
-#                  never onto an account above 80%.
+#                  never onto an account above 80%. The deadline is
+#                  min(weekly reset, SEAT END) and the ordering around it lives
+#                  in rota-ranking.sh, SHARED with rota-engine.sh's own picker,
+#                  so the unattended switch and the interactive advice cannot
+#                  name different seats.
 #   4b. PANE CONVERGE (2026-08-12), after a switch, EVERY pane must end up
 #                  on the active account without further action: idle panes
 #                  immediately (the switch's own default restart), and panes
@@ -111,9 +115,31 @@ set -euo pipefail
 export PATH="${CLAUDE_KEEPER_PATH_PREFIX:-/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin}:/usr/bin:/bin${PATH:+:$PATH}"
 
 ROTA_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ⚠️ THE AUTO-SWITCH PICKER'S RANKING IS NOT WRITTEN IN THIS FILE. It is
+# rota_seat_deadline + rota_deadline_beats, shared with rota-engine.sh's
+# compute_recommendation, because the two used to hold the same rule separately
+# and drifted the moment one of them learned something (see rota-ranking.sh).
+# Sourcing it defines functions and nothing else.
+#
+# ⚠️ HARD FAIL, never a silent degrade: an unattended daemon that has quietly
+# lost its ranking rule would keep switching seats, just to the wrong ones, and
+# nobody is watching it at 03:00.
+if [[ ! -r "$ROTA_LIB/rota-ranking.sh" ]]; then
+  printf 'rota-keeper: %s/rota-ranking.sh is missing; this is an incomplete checkout (it holds the seat ranking, shared with rota-engine.sh)\n' "$ROTA_LIB" >&2
+  exit 1
+fi
+# shellcheck source=lib/rota-ranking.sh
+. "$ROTA_LIB/rota-ranking.sh"
+
 CFG_DIR="${CLAUDE_FAILOVER_HOME:-$HOME/.config/claude-failover}"
 ACCOUNTS_FILE="$CFG_DIR/accounts"
 USAGE_CACHE="$CFG_DIR/usage-cache.json"
+# The seat lifecycle (status + end date) the ranking needs. Same default and
+# same override as rota-engine.sh's, so both pickers read ONE file; absent, every
+# seat is "active with no end date" and the ranking degrades to the weekly reset,
+# which is what this picker did before it read the file at all.
+BILLING_JSON="${CLAUDE_BILLING_JSON:-$CFG_DIR/billing.json}"
 USAGE_API="${CLAUDE_KEEPER_USAGE_API:-https://api.anthropic.com/api/oauth/usage}"
 # The UA is load-bearing: the usage API buckets unknown agents into a much
 # tighter rate limit (spec §3). Override only in tests.
@@ -1210,20 +1236,34 @@ main() {
     if [[ -n "$wk" || -n "$se" ]] && { { [[ -n "$wk" ]] && (( wk >= AUTO_SWITCH_PCT )); } \
                                         || { [[ -n "$se" ]] && (( se >= AUTO_SWITCH_PCT )); }; }; then
       # THE KEEPER'S PICKER. NB a SECOND picker exists: the engine's
-      # compute_recommendation (floor/burn-down modes, soonest-reset ranking)
-      # drives the interactive `rota switch`/`rota usage` surfaces.
+      # compute_recommendation (floor/burn-down modes) drives the interactive
+      # `rota switch`/`rota usage` surfaces.
       #
       # 2026-08-16, THE OPERATOR DECIDED (asked explicitly). The old rule here was
       # "lowest binding weekly utilization, tie-break soonest weekly reset";
       # his policy is the other way round: "always work on the one that
       # expires next and burn all those tokens before switching to the one
-      # right after". So the RANKING is now SOONEST WEEKLY RESET, and the two
+      # right after". So the RANKING is soonest-deadline-first, and the two
       # pickers are INTENTIONALLY ALIGNED on it, that alignment is a decision,
       # not accidental drift, and a future reader should not "fix" it back.
-      # What stays separate is the FLOORS: the leaf runs MIN_WEEKLY (20%-left)
-      # + MIN_SESSION (10%-left) for an interactive choice the operator is watching;
-      # this one runs AUTO_SWITCH_TARGET_MIN_LEFT_PCT (30%-left) plus the
-      # AUTO_SWITCH_TARGET_MAX_PCT ceiling and the bounce hysteresis, because
+      #
+      # ⚠️ AND SINCE 2026-08-28 THAT ALIGNMENT IS ONE FUNCTION, NOT A CONVENTION.
+      # Both pickers call rota_seat_deadline + rota_deadline_beats
+      # (rota-ranking.sh). The convention was NOT enough: on 2026-08-27 the
+      # engine moved to min(weekly reset, SEAT END) and this file did not, so for
+      # a cancelled seat whose end date falls before its next weekly reset the two
+      # named DIFFERENT seats - live on the pool within days (tartare@ ending
+      # 1 Sep, thea.hawk@ ending 6 Sep, both resetting first). Do not re-inline
+      # the comparison here, and do NOT "restore" the weekly reset alone: that
+      # older rule agrees with this one almost always and is wrong exactly on a
+      # cancelled seat's last partial week, which is the one week that cannot be
+      # had back.
+      #
+      # What stays separate is the ELIGIBILITY floors, because they answer WHICH
+      # seats may be picked rather than in what ORDER: the leaf runs MIN_WEEKLY
+      # (20%-left) + MIN_SESSION (10%-left) for an interactive choice the operator
+      # is watching; this one runs AUTO_SWITCH_TARGET_MIN_LEFT_PCT (30%-left) plus
+      # the AUTO_SWITCH_TARGET_MAX_PCT ceiling and the bounce hysteresis, because
       # it fires unattended at the 90% wall and must not land the operator on an
       # account that is nearly spent too. Changing either side's floors is
       # still a decision to weigh against the other.
@@ -1231,14 +1271,16 @@ main() {
       # Pick: logged in, not dead, not the active, weekly ≤
       # AUTO_SWITCH_TARGET_MAX_PCT (ceiling, default 80) AND at least
       # AUTO_SWITCH_TARGET_MIN_LEFT_PCT weekly left (floor, default 30 → at
-      # most 70% used), then SOONEST weekly reset. Two refinements the ranking
-      # itself does not spell out: an account with NO weekly reset instant is
-      # a fresh window (nothing expiring) and therefore ranks LAST, never
-      # first, an empty string would otherwise sort ahead of every real
-      # timestamp; and an exact tie on the reset instant keeps the old rule as
-      # the tie-break (lowest utilization wins), so the pick stays
-      # deterministic where the new policy is silent.
-      local best=-1 best_wk="" best_reset="" best_fresh=0 j jwk jreset jfresh
+      # most 70% used), then the shared ranking. Two refinements it carries that
+      # this file used to spell out itself, and which rota_deadline_beats now
+      # owns for both callers: an account with NO deadline at all is a fresh
+      # window (nothing expiring) and therefore ranks LAST, never first, since an
+      # empty string would otherwise sort ahead of every real timestamp; and an
+      # exact tie on the deadline keeps the old rule as the tie-break (lowest
+      # utilization wins), so the pick stays deterministic where the newer
+      # policy is silent.
+      local best=-1 best_wk="" best_reset="" best_deadline="" best_kind=""
+      local j jwk jreset jends jpair jdeadline jkind
       for j in "${!DIRS[@]}"; do
         [[ "${LABELS[$j]}" == "$claim" ]] && continue
         cred="${DIRS[$j]}/.credentials.json"
@@ -1251,12 +1293,15 @@ main() {
         (( jwk > AUTO_SWITCH_TARGET_MAX_PCT )) && continue          # ceiling
         (( 100 - jwk < AUTO_SWITCH_TARGET_MIN_LEFT_PCT )) && continue  # headroom floor
         jreset="${U_WKR[$ui]}"
-        jfresh=0; [[ -n "$jreset" ]] || jfresh=1
+        # The seat's own end date, keyed by the label, which IS the login email
+        # and is what billing.json keys its accounts by.
+        jends="$(rota_seat_field "$BILLING_JSON" "${LABELS[$j]}" 2)"
+        jpair="$(rota_seat_deadline "$jreset" "$jends")"
+        jdeadline="${jpair%%$'\t'*}"; jkind="${jpair#*$'\t'}"
         if (( best < 0 )) \
-           || { (( ! jfresh )) && (( best_fresh )); } \
-           || { (( ! jfresh )) && (( ! best_fresh )) && [[ "$jreset" < "$best_reset" ]]; } \
-           || { (( jfresh == best_fresh )) && [[ "$jreset" == "$best_reset" ]] && (( jwk < best_wk )); }; then
-          best="$j"; best_wk="$jwk"; best_reset="$jreset"; best_fresh="$jfresh"
+           || rota_deadline_beats "$jdeadline" "$jwk" "$best_deadline" "$best_wk"; then
+          best="$j"; best_wk="$jwk"; best_reset="$jreset"
+          best_deadline="$jdeadline"; best_kind="$jkind"
         fi
       done
       # hysteresis: don't bounce back to the account we switched OFF within
@@ -1274,7 +1319,15 @@ main() {
       if (( best >= 0 )); then
         local sw_args=("switch-all" "${LABELS[$best]}") sw_out sw_rc=0
         [[ "$AUTO_SWITCH_RESTART_IDLE" == "1" ]] && sw_args+=("--restart-idle")
-        log "auto-switch: $claim at weekly ${wk:-?}% / 5h ${se:-?}% (threshold $AUTO_SWITCH_PCT%) → ${LABELS[$best]} (weekly ${best_wk}%, resets ${best_reset:-a fresh window}, soonest-reset pick above the ${AUTO_SWITCH_TARGET_MIN_LEFT_PCT}%-left floor)"
+        # ⚠️ THE LOG NAMES THE DATE THAT ACTUALLY BOUND THE PICK. Writing "resets
+        # <x>" for a seat chosen because it ENDS first is the right decision under
+        # the wrong noun, and this line is the only record of why an unattended
+        # switch happened at 03:00. best_kind comes out of the same
+        # rota_seat_deadline call that produced the ordering.
+        local why_clause="resets ${best_reset:-a fresh window}"
+        [[ "$best_kind" == "seat-end" ]] \
+          && why_clause="seat ENDS ${best_deadline%%T*}, before its weekly reset (${best_reset:-none}), so this is its LAST window"
+        log "auto-switch: $claim at weekly ${wk:-?}% / 5h ${se:-?}% (threshold $AUTO_SWITCH_PCT%) → ${LABELS[$best]} (weekly ${best_wk}%, $why_clause, soonest-deadline pick above the ${AUTO_SWITCH_TARGET_MIN_LEFT_PCT}%-left floor)"
         set +e
         sw_out="$(bash "$FAILOVER" "${sw_args[@]}" 2>&1)"
         sw_rc=$?

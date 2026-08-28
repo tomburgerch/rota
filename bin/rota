@@ -44,6 +44,9 @@ usage_text() {
 rota <verb> [args]
 
   usage                  measure every seat's quota live (--json, --no-refresh)
+  usage --record <seat> <weekly-used-%> [<5h-used-%>]
+                         type in a number the API will not answer for (the USED %
+                         the vendor's usage page prints, not what is left)
   accounts               the human table: quota, renewal, cost, and whose seat it is
   switch [seat]          bare: switch to the best seat; with a seat: switch-all <seat> [flags]
   login <seat>           open `claude` pinned to <seat>'s config dir so you can run /login
