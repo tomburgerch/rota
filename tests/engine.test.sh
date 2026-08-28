@@ -904,6 +904,41 @@ grep -q "LAST window" <<<"$SR_OUT" \
   && ok "seat deadline → and does NOT claim a soonest-weekly-reset rationale it did not use" \
   || bad "seat deadline → must not claim the reset decided it (got: $SR_OUT)"
 
+# ⚠️ AND THE MACHINE SURFACE MUST BE AS HONEST AS THE SENTENCE ABOVE. The
+# recommendation published this same instant under the key `weekly_resets_at`
+# from 2026-08-27 to 2026-08-28, i.e. THIS pick - bound by a seat end two days
+# out - shipped that end date under a name promising a weekly reset that is six
+# days out. The date was right, the noun was wrong, and a consumer doing "when
+# does quota come back" arithmetic on it got an answer to a question it never
+# asked. `deadline_at` names the instant and `deadline_kind` names WHICH of the
+# two dates it is; the kind is the load-bearing half, because a bare timestamp
+# cannot tell the two apart and that ambiguity was the whole defect.
+set +e
+SR_JSON="$(FAKE_NEW_EMAIL=primary@example.com CLAUDE_BILLING_JSON="$RUN/billing.json" \
+           "$SCRIPT" usage --json 2>/dev/null)"
+set -e
+[ "$(jq -r '.recommendation.email' <<<"$SR_JSON" 2>/dev/null)" = "spare@example.com" ] \
+  && ok "seat deadline (json) → the seat-end-bound pick is the one published" \
+  || bad "seat deadline (json) → spare must be the pick (got: $(jq -c '.recommendation' <<<"$SR_JSON" 2>/dev/null))"
+[ "$(jq -r '.recommendation.deadline_at' <<<"$SR_JSON" 2>/dev/null)" = "$(date -u -v+2d '+%Y-%m-%d')T00:00:00Z" ] \
+  && ok "seat deadline (json) → deadline_at carries the SEAT END, the date that bound the pick" \
+  || bad "seat deadline (json) → deadline_at must be the seat end (got: $(jq -c '.recommendation' <<<"$SR_JSON" 2>/dev/null))"
+[ "$(jq -r '.recommendation.deadline_kind' <<<"$SR_JSON" 2>/dev/null)" = "seat-end" ] \
+  && ok "seat deadline (json) → deadline_kind says seat-end, so the date cannot be read as a reset" \
+  || bad "seat deadline (json) → deadline_kind must be seat-end (got: $(jq -c '.recommendation' <<<"$SR_JSON" 2>/dev/null))"
+# the misnamed key is GONE, not kept beside the honest one: nothing outside this
+# repo ever read it, so a parallel field would only preserve the lie
+[ "$(jq -r '.recommendation | has("weekly_resets_at")' <<<"$SR_JSON" 2>/dev/null)" = "false" ] \
+  && ok "seat deadline (json) → the misnamed weekly_resets_at is removed, not left alongside" \
+  || bad "seat deadline (json) → weekly_resets_at must be gone (got: $(jq -c '.recommendation' <<<"$SR_JSON" 2>/dev/null))"
+# ⚠️ AND THE FIXTURE MUST GENUINELY SEPARATE THE TWO DATES. They agree on almost
+# every real seat, so without this the assertions above would pass on a pool where
+# `deadline_at` could still be the raw weekly reset and nobody would know.
+SR_SPARE_RESET="$(jq -r '.accounts[] | select(.email=="spare@example.com") | .weekly.resets_at' <<<"$SR_JSON" 2>/dev/null)"
+[ -n "$SR_SPARE_RESET" ] && [ "${SR_SPARE_RESET%%T*}" != "$(date -u -v+2d '+%Y-%m-%d')" ] \
+  && ok "seat deadline (json) → the picked seat's own weekly reset is a DIFFERENT date, so the assertion discriminates" \
+  || bad "seat deadline (json) → reset and seat end must differ in this fixture (reset: $SR_SPARE_RESET)"
+
 # THE CONTROL, one field different: the seat now ends in 8 days, AFTER its own
 # weekly reset at +6d, so nothing is bound by a seat end any more and alpha's
 # +5d reset is the soonest deadline in the pool. The pick flips AND the noun
@@ -925,6 +960,21 @@ grep -q "soonest weekly reset among the accounts clearing the health floor" <<<"
 ! grep -q "this seat ENDS" <<<"$SR_OUT2" \
   && ok "seat deadline (control) → the seat-end wording is not printed unconditionally" \
   || bad "seat deadline (control) → must not claim a seat end (got: $SR_OUT2)"
+# the machine surface flips with it, and `deadline_at` is that account's OWN
+# weekly reset to the instant, compared against the row rather than against a
+# recomputed clock, so the two can never disagree about the same pick
+set +e
+SR_JSON2="$(FAKE_NEW_EMAIL=primary@example.com CLAUDE_BILLING_JSON="$RUN/billing.json" \
+            "$SCRIPT" usage --json 2>/dev/null)"
+set -e
+[ "$(jq -r '.recommendation.deadline_kind' <<<"$SR_JSON2" 2>/dev/null)" = "reset" ] \
+  && ok "seat deadline (control, json) → deadline_kind flips to reset when the reset is what bound it" \
+  || bad "seat deadline (control, json) → deadline_kind must be reset (got: $(jq -c '.recommendation' <<<"$SR_JSON2" 2>/dev/null))"
+SR_ALPHA_RESET="$(jq -r '.accounts[] | select(.email=="alpha@example.com") | .weekly.resets_at' <<<"$SR_JSON2" 2>/dev/null)"
+[ -n "$SR_ALPHA_RESET" ] \
+  && [ "$(jq -r '.recommendation.deadline_at' <<<"$SR_JSON2" 2>/dev/null)" = "$SR_ALPHA_RESET" ] \
+  && ok "seat deadline (control, json) → deadline_at is the picked account's own weekly reset" \
+  || bad "seat deadline (control, json) → deadline_at must equal alpha's reset $SR_ALPHA_RESET (got: $(jq -c '.recommendation' <<<"$SR_JSON2" 2>/dev/null))"
 
 # --- 10c. a boost is dated data, and expires itself -------------------------
 # A percentage is only meaningful against a known baseline, and the baseline
@@ -1377,9 +1427,16 @@ grep -q "weekly window has not started yet" <<<"$OUT" \
 [ "$(jq -r '.recommendation.action' <<<"$JSON_OUT" 2>/dev/null)" = "switch" ] \
   && ok "fresh wins (json) → action is switch" \
   || bad "fresh wins (json) → action is switch (got: $(jq -c '.recommendation' <<<"$JSON_OUT" 2>/dev/null))"
-[ "$(jq -r '.recommendation.weekly_resets_at' <<<"$JSON_OUT" 2>/dev/null)" = "null" ] \
-  && ok "fresh wins (json) → weekly_resets_at is null, not an empty string" \
-  || bad "fresh wins (json) → weekly_resets_at is null (got: $(jq -c '.recommendation' <<<"$JSON_OUT" 2>/dev/null))"
+[ "$(jq -r '.recommendation.deadline_at' <<<"$JSON_OUT" 2>/dev/null)" = "null" ] \
+  && ok "fresh wins (json) → deadline_at is null, not an empty string" \
+  || bad "fresh wins (json) → deadline_at is null (got: $(jq -c '.recommendation' <<<"$JSON_OUT" 2>/dev/null))"
+# ⚠️ AND THE KIND GOES NULL WITH IT. A kind beside no date would be a claim about
+# a deadline that does not exist, the same shape of dishonesty this pair replaced;
+# rota_seat_deadline returns BOTH fields empty for a seat with neither date, and
+# the published pair mirrors that rather than inventing a default of "reset".
+[ "$(jq -r '.recommendation.deadline_kind' <<<"$JSON_OUT" 2>/dev/null)" = "null" ] \
+  && ok "fresh wins (json) → deadline_kind is null too, never a kind without a date" \
+  || bad "fresh wins (json) → deadline_kind is null (got: $(jq -c '.recommendation' <<<"$JSON_OUT" 2>/dev/null))"
 [ "$(jq -r '.recommendation.weekly_fresh' <<<"$JSON_OUT" 2>/dev/null)" = "true" ] \
   && ok "fresh wins (json) → weekly_fresh marks the null reset as fresh, not missing" \
   || bad "fresh wins (json) → weekly_fresh is true (got: $(jq -c '.recommendation' <<<"$JSON_OUT" 2>/dev/null))"
@@ -2684,7 +2741,7 @@ norm_json() {
          | (.accounts[].session.resetsInSeconds) |= null
          | (.accounts[].weekly.resets_at, .accounts[].weekly.resetsAt,
             .accounts[].five_hour.resets_at, .accounts[].session.resetsAt,
-            .recommendation.weekly_resets_at) |= (if . == null then null else "<iso>" end)
+            .recommendation.deadline_at) |= (if . == null then null else "<iso>" end)
          | .recommendation.reason |= (gsub("\\(in [^)]*\\)"; "(in <t>)")
                                       | gsub("[0-9]{2}:[0-9]{2} [A-Za-z0-9 ]+?(?=\\)|;|,)"; "<time>"))'
 }
@@ -2696,9 +2753,10 @@ EX_JSON="$(FAKE_NEW_EMAIL=primary@example.com CLAUDE_BILLING_JSON="$RUN/no-billi
 # LC_ALL=C so the ordering is ASCII and identical on every box, a locale-sorted
 # expectation would pass here and fail on a runner with a different LC_COLLATE.
 EX_JSON_PATHS="$(jq -S -r 'paths | join(".")' <<<"$EX_JSON" | sed -E 's/\.[0-9]+/.N/g' | LC_ALL=C sort -u | tr '\n' ' ')"
-# ⚠️ GREW BY NINE PATHS ACROSS TWO CHANGES, and every one of them is ADDITIVE:
-# nothing was renamed or removed, which is the promise this assertion exists to
-# hold the dashboard to.
+# ⚠️ GREW BY NINE PATHS ACROSS TWO ADDITIVE CHANGES, then took its FIRST
+# BREAKING ONE. Read the third entry before assuming the promise is still
+# "nothing is ever renamed or removed": it is not, and this line is where a
+# rename has to be argued for rather than slipped through.
 #   2026-08-25  `seat.{status,ends,ended}` and `unmeasured`, because a consumer
 #               that only ever saw `weekly.expired` could not tell "this account
 #               is finished" from "I have not measured this", the same confusion
@@ -2706,7 +2764,16 @@ EX_JSON_PATHS="$(jq -S -r 'paths | join(".")' <<<"$EX_JSON" | sed -E 's/\.[0-9]+
 #   2026-08-27  `quota_data` / `quota_source` / `quota_measured_at` per row and the
 #               top-level `peer` object, so a consumer can see WHOSE measurement a
 #               number is and HOW OLD it is, not merely that one exists
-EX_JSON_PATHS_WANT="accounts accounts.N accounts.N.active accounts.N.alias accounts.N.cached_at accounts.N.config_dir accounts.N.current accounts.N.data accounts.N.email accounts.N.five_hour accounts.N.five_hour.expired accounts.N.five_hour.fresh accounts.N.five_hour.remaining_pct accounts.N.five_hour.resets_at accounts.N.five_hour.used_pct accounts.N.label accounts.N.live accounts.N.loggedIn accounts.N.note accounts.N.quota_data accounts.N.quota_measured_at accounts.N.quota_source accounts.N.reason accounts.N.recommendable accounts.N.seat accounts.N.seat.ended accounts.N.seat.ends accounts.N.seat.status accounts.N.session accounts.N.session.expired accounts.N.session.fresh accounts.N.session.leftPct accounts.N.session.resetsAt accounts.N.session.resetsInSeconds accounts.N.session.usedPct accounts.N.stale accounts.N.stale_reason accounts.N.unmeasured accounts.N.weekly accounts.N.weekly.expired accounts.N.weekly.fresh accounts.N.weekly.kind accounts.N.weekly.leftPct accounts.N.weekly.remaining_pct accounts.N.weekly.resetsAt accounts.N.weekly.resetsInSeconds accounts.N.weekly.resets_at accounts.N.weekly.scope accounts.N.weekly.usedPct accounts.N.weekly.used_pct active active.auth_status active.auth_warning active.email active.fingerprint active.nested_config_warning active.source active.warning activeEmail floors floors.comfortable_pct floors.exhausted_pct floors.session_pct floors.weekly_pct peer recommendation recommendation.action recommendation.alias recommendation.best_alternative recommendation.best_alternative.email recommendation.best_alternative.weekly_left_pct recommendation.burn_down_hold recommendation.email recommendation.from_cached_numbers recommendation.label recommendation.mode recommendation.mode_forced recommendation.reason recommendation.weekly_fresh recommendation.weekly_resets_at "
+#   2026-08-28  BREAKING, deliberately: `recommendation.weekly_resets_at` REMOVED,
+#               `recommendation.deadline_at` + `recommendation.deadline_kind` added.
+#               The old key had held min(weekly reset, seat end) since 2026-08-27,
+#               so on a seat-end-bound pick it published an end date under a name
+#               promising a reset. A fleet-wide grep found it read in exactly two
+#               places, both this file, so keeping it would have preserved a lie
+#               for an audience of zero. THIS ASSERTION IS WHY THAT WAS SAFE: the
+#               rename could not land quietly, it reds here until the published
+#               contract is edited by hand and the diff is reviewed.
+EX_JSON_PATHS_WANT="accounts accounts.N accounts.N.active accounts.N.alias accounts.N.cached_at accounts.N.config_dir accounts.N.current accounts.N.data accounts.N.email accounts.N.five_hour accounts.N.five_hour.expired accounts.N.five_hour.fresh accounts.N.five_hour.remaining_pct accounts.N.five_hour.resets_at accounts.N.five_hour.used_pct accounts.N.label accounts.N.live accounts.N.loggedIn accounts.N.note accounts.N.quota_data accounts.N.quota_measured_at accounts.N.quota_source accounts.N.reason accounts.N.recommendable accounts.N.seat accounts.N.seat.ended accounts.N.seat.ends accounts.N.seat.status accounts.N.session accounts.N.session.expired accounts.N.session.fresh accounts.N.session.leftPct accounts.N.session.resetsAt accounts.N.session.resetsInSeconds accounts.N.session.usedPct accounts.N.stale accounts.N.stale_reason accounts.N.unmeasured accounts.N.weekly accounts.N.weekly.expired accounts.N.weekly.fresh accounts.N.weekly.kind accounts.N.weekly.leftPct accounts.N.weekly.remaining_pct accounts.N.weekly.resetsAt accounts.N.weekly.resetsInSeconds accounts.N.weekly.resets_at accounts.N.weekly.scope accounts.N.weekly.usedPct accounts.N.weekly.used_pct active active.auth_status active.auth_warning active.email active.fingerprint active.nested_config_warning active.source active.warning activeEmail floors floors.comfortable_pct floors.exhausted_pct floors.session_pct floors.weekly_pct peer recommendation recommendation.action recommendation.alias recommendation.best_alternative recommendation.best_alternative.email recommendation.best_alternative.weekly_left_pct recommendation.burn_down_hold recommendation.deadline_at recommendation.deadline_kind recommendation.email recommendation.from_cached_numbers recommendation.label recommendation.mode recommendation.mode_forced recommendation.reason recommendation.weekly_fresh "
 [ "$EX_JSON_PATHS" = "$EX_JSON_PATHS_WANT" ] \
   && ok "json byte-identity → every published key path is exactly what the dashboard was promised" \
   || bad "json byte-identity → key paths drifted:
@@ -2715,9 +2782,9 @@ $(diff <(tr ' ' '\n' <<<"$EX_JSON_PATHS_WANT") <(tr ' ' '\n' <<<"$EX_JSON_PATHS"
 EX_JSON_VALS="$(jq -S -c '{a:[.accounts[]|{email,data,active,loggedIn,live,stale,recommendable,
                                             wk:[.weekly.used_pct,.weekly.remaining_pct,.weekly.usedPct,.weekly.leftPct,.weekly.fresh,.weekly.expired,.weekly.kind,.weekly.scope],
                                             se:[.five_hour.used_pct,.five_hour.remaining_pct,.session.usedPct,.session.leftPct,.session.fresh,.session.expired]}],
-                           r:(.recommendation|{action,email,label,alias,weekly_fresh,from_cached_numbers,mode,mode_forced,burn_down_hold,best_alternative}),
+                           r:(.recommendation|{action,email,label,alias,deadline_kind,weekly_fresh,from_cached_numbers,mode,mode_forced,burn_down_hold,best_alternative}),
                            f:.floors, ae:.activeEmail}' <<<"$EX_JSON")"
-EX_JSON_VALS_WANT='{"a":[{"active":true,"data":"live","email":"primary@example.com","live":true,"loggedIn":true,"recommendable":false,"se":[50,50,50,50,false,false],"stale":false,"wk":[98,2,98,2,false,false,null,null]},{"active":false,"data":"live","email":"wk@example.com","live":true,"loggedIn":true,"recommendable":true,"se":[0,100,0,100,false,false],"stale":false,"wk":[20,80,20,80,false,false,null,null]},{"active":false,"data":"live","email":"alpha@example.com","live":true,"loggedIn":true,"recommendable":false,"se":[10,90,10,90,false,false],"stale":false,"wk":[95,5,95,5,false,false,null,null]}],"ae":"primary@example.com","f":{"comfortable_pct":50,"exhausted_pct":2,"session_pct":10,"weekly_pct":20},"r":{"action":"switch","alias":"wk","best_alternative":{"email":"wk@example.com","weekly_left_pct":80},"burn_down_hold":false,"email":"wk@example.com","from_cached_numbers":false,"label":"wk@example.com","mode":"floor","mode_forced":false,"weekly_fresh":false}}'
+EX_JSON_VALS_WANT='{"a":[{"active":true,"data":"live","email":"primary@example.com","live":true,"loggedIn":true,"recommendable":false,"se":[50,50,50,50,false,false],"stale":false,"wk":[98,2,98,2,false,false,null,null]},{"active":false,"data":"live","email":"wk@example.com","live":true,"loggedIn":true,"recommendable":true,"se":[0,100,0,100,false,false],"stale":false,"wk":[20,80,20,80,false,false,null,null]},{"active":false,"data":"live","email":"alpha@example.com","live":true,"loggedIn":true,"recommendable":false,"se":[10,90,10,90,false,false],"stale":false,"wk":[95,5,95,5,false,false,null,null]}],"ae":"primary@example.com","f":{"comfortable_pct":50,"exhausted_pct":2,"session_pct":10,"weekly_pct":20},"r":{"action":"switch","alias":"wk","best_alternative":{"email":"wk@example.com","weekly_left_pct":80},"burn_down_hold":false,"deadline_kind":"reset","email":"wk@example.com","from_cached_numbers":false,"label":"wk@example.com","mode":"floor","mode_forced":false,"weekly_fresh":false}}'
 [ "$EX_JSON_VALS" = "$EX_JSON_VALS_WANT" ] \
   && ok "json byte-identity → every published VALUE is unchanged too, not just the names" \
   || bad "json byte-identity → values drifted:
