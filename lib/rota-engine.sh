@@ -5232,7 +5232,35 @@ json_usage() {
         recommendable:$rec,
         reason:(if $reason=="" then null else $reason end)}')"$'\n'
   done
-  local action="none" rec_email="null" rec_alias="null" rec_label="null" rec_reset="null"
+  # ⚠️ THE DATE THE RECOMMENDATION PUBLISHES IS THE DEADLINE, min(weekly reset,
+  # SEAT END), NOT THE WEEKLY RESET. It was published as `weekly_resets_at` from
+  # 2026-08-27 (when the ranking moved to the deadline) until 2026-08-28, which
+  # meant that on a cancelled seat whose end date falls before its next reset the
+  # key named one thing and carried another: `tartare@codeandstate.com` resets
+  # 3 Sep and ends 1 Sep, so a pick bound by that seat published 1 Sep under a key
+  # promising a weekly reset. Right value, wrong noun, on the MACHINE surface -
+  # the exact defect rota#9 had just fixed on the human one (recommendation_text
+  # said "soonest weekly reset" when the seat end had bound the choice).
+  #
+  # So the key is `deadline_at` and it is published WITH `deadline_kind`. The kind
+  # is not decoration: a bare instant cannot say which of the two things it is, and
+  # that ambiguity IS the defect - renaming without it would move the problem
+  # rather than end it. Its values are `reset` and `seat-end` verbatim out of
+  # rota_seat_deadline (rota-ranking.sh), never re-spelled here, so the published
+  # noun and the rule that chose it can never drift apart; kebab also matches the
+  # only other multi-word enum on this same object, `mode: "burn-down"`.
+  #
+  # The rename was outright rather than additive because a grep of the whole fleet
+  # on 2026-08-28 found `recommendation.weekly_resets_at` read in exactly two
+  # places, both this repo's own tests, so a parallel field or a deprecation window
+  # would have been ceremony for an audience of zero. What made it SAFE is the
+  # schema lock in tests/engine.test.sh (EX_JSON_PATHS_WANT): the rename cannot
+  # land silently, it reds that assertion until the published contract is edited
+  # by hand. Do NOT extend this rename to `weekly_resets_at` elsewhere - on
+  # `cdt billing --json`'s per-account rows, and on this file's own
+  # `accounts[].weekly.resets_at`, that name is correct and load-bearing.
+  local action="none" rec_email="null" rec_alias="null" rec_label="null"
+  local rec_deadline="null" rec_deadline_kind="null"
   local rec_fresh=false
   (( REC_FRESH )) && rec_fresh=true
   if (( REC_SLOT >= 0 )); then
@@ -5240,9 +5268,13 @@ json_usage() {
     rec_email="$(jq -n --arg v "$REC_EMAIL" '$v')"
     rec_alias="$(jq -n --arg v "$(basename "${DIRS[$REC_SLOT]}")" '$v')"
     rec_label="$(jq -n --arg v "${LABELS[$REC_SLOT]}" '$v')"
-    # a FRESH pick has no reset instant, null, matching the windows' own resets_at,
-    # rather than the empty string that would read as a malformed timestamp
-    [[ -n "$REC_RESET" ]] && rec_reset="$(jq -n --arg v "$REC_RESET" '$v')"
+    # a FRESH pick has no deadline instant, null, matching the windows' own resets_at,
+    # rather than the empty string that would read as a malformed timestamp. The KIND
+    # goes null with it, and that pairing is the point: a kind beside no date would be
+    # a claim about a deadline that does not exist. rota_seat_deadline returns both
+    # fields empty for a seat with neither date, so null/null mirrors its answer.
+    [[ -n "$REC_RESET" ]] && rec_deadline="$(jq -n --arg v "$REC_RESET" '$v')"
+    [[ -n "$REC_DEADLINE_KIND" ]] && rec_deadline_kind="$(jq -n --arg v "$REC_DEADLINE_KIND" '$v')"
   fi
   # The recommendation's own words, taken from the function the human dashboard
   # prints, not paraphrased here, or the phone and the terminal would start giving
@@ -5266,7 +5298,8 @@ json_usage() {
     --arg action "$action" \
     --arg rec_reason "$rec_reason" \
     --argjson rec_email "$rec_email" --argjson rec_alias "$rec_alias" \
-    --argjson rec_label "$rec_label" --argjson rec_reset "$rec_reset" \
+    --argjson rec_label "$rec_label" --argjson rec_deadline "$rec_deadline" \
+    --argjson rec_deadline_kind "$rec_deadline_kind" \
     --argjson rec_fresh "$rec_fresh" \
     --argjson rec_cached "$( (( REC_CACHED )) && echo true || echo false )" \
     --argjson rec_hold "$( (( REC_HOLD )) && echo true || echo false )" \
@@ -5293,7 +5326,8 @@ json_usage() {
                   generated_at:(if $peer_gen=="" then null else $peer_gen end)} end),
       accounts:.,
       recommendation:{action:$action, email:$rec_email, label:$rec_label,
-                      alias:$rec_alias, weekly_resets_at:$rec_reset,
+                      alias:$rec_alias,
+                      deadline_at:$rec_deadline, deadline_kind:$rec_deadline_kind,
                       weekly_fresh:$rec_fresh,
                       from_cached_numbers:$rec_cached,
                       mode:$mode, mode_forced:$mode_forced,
