@@ -965,6 +965,26 @@ grep -q 'access token expired' "$RUN/cfg/keeper.log" \
   && ok "warming → the log names WHY the seat was nudged (expired access token)" \
   || bad "warming → log reason (got: $(grep 'warm' "$RUN/cfg/keeper.log" | tail -3))"
 
+# a RESERVED seat with an expired token: decided (marker stamps), never nudged.
+# Its chain is also held on the owner's box; see seat_is_reserved in rota-ranking.sh.
+mk_pool warmreserved
+usage_fixture wk      10 30 "$(iso_in +2H)"       # open, skip
+usage_fixture team    10 30 "$(iso_in +2H)"       # open, skip
+usage_fixture primary 10 30 "$(iso_in +2H)"       # open, skip
+printf '{"claudeAiOauth":{"accessToken":"TOK-alpha","refreshToken":"rt-TOK-alpha","expiresAt":%s,"refreshTokenExpiresAt":%s}}' \
+  "$(( ($(date +%s) - 5 * 86400) * 1000 ))" "$EXP_MS" > "$RUN/.claude-pool/alpha/.credentials.json"
+touch "$RUN/.claude-pool/alpha/RESERVED"
+run_keeper "${warm_env[@]}"
+! grep -q "claude-pool/alpha|" "$FAKE_STATE/claude-calls" 2>/dev/null \
+  && ok "warming → a RESERVED seat with an expired token is NOT nudged (its owner's box rotates the chain)" \
+  || bad "warming → reserved seat nudged (calls: $(cat "$FAKE_STATE/claude-calls" 2>/dev/null || echo none))"
+ls "$RUN/cfg"/warmed-* >/dev/null 2>&1 \
+  && ok "warming → and the day's marker still stamps: reserved is DECIDED, not undecided" \
+  || bad "warming → marker missing for a reserved seat (status: $(cat "$RUN/cfg/keeper-status"))"
+grep -q 'reserved seat' "$RUN/cfg/keeper.log" \
+  && ok "warming → the log says WHY it was skipped (reserved seat)" \
+  || bad "warming → log reason (got: $(grep 'warm' "$RUN/cfg/keeper.log" | tail -3))"
+
 # ── 8. the reconcile→normalize COMPOSITION (stage-1 review, finding 1) ───────
 # reconcile --apply rewrites the labels to match the dirs, which destroys the
 # label-mismatch evidence normalize's own detection needs. The pending record

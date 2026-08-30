@@ -4641,6 +4641,60 @@ grep -qE '^  \? expired@example\.com +stored token stale' <<<"$(unmeasured_block
   && ok "usage_fetch → probes with the keeper's User-Agent (claude-code/2.x), one probe shape for both" \
   || bad "usage_fetch → User-Agent (got: $(cat "$RUN/state/ua-TOK-X-LIVE" 2>/dev/null || echo none))"
 
+# --- 58. a RESERVED seat is never nudged from this box, expired token or not
+# gmail is the Airmond runner's seat and tommy is Joe's: each of those refresh
+# chains is ALSO held on the owner's machine, and a nudge from the pool host
+# rotates the chain out from under that copy (measured 2026-08-30: gmail had
+# already been rotated on both sides once). So scenario 57's nudge must not fire
+# for a reserved seat, on either of billing's two reservation sources, and the
+# row must say who answers it instead. ROTA_NUDGE_RESERVED=1 is the override.
+new_run reservedseat
+mkdir -p "$RUN/.claude-pool/live" "$RUN/.claude-pool/marked" "$RUN/.claude-pool/listed"
+cred_json TOK-R-LIVE > "$RUN/.claude/.credentials.json"
+cp "$RUN/.claude/.credentials.json" "$RUN/.claude-pool/live/.credentials.json"
+printf '{"oauthAccount":{"emailAddress":"live@example.com"}}' > "$RUN/.claude-pool/live/.claude.json"
+printf '{"oauthAccount":{"emailAddress":"live@example.com"}}' > "$RUN/.claude.json"
+for seat in marked listed; do
+  printf '{"claudeAiOauth":{"accessToken":"TOK-R-%s","refreshToken":"RT-TOK-R-%s","expiresAt":%s000,"refreshTokenExpiresAt":%s000,"scopes":["user:inference"],"subscriptionType":"max"}}' \
+    "$seat" "$seat" "$(date -u -v-5d +%s)" "$RT_FUTURE" > "$RUN/.claude-pool/$seat/.credentials.json"
+  printf '{"oauthAccount":{"emailAddress":"%s@example.com"}}' "$seat" > "$RUN/.claude-pool/$seat/.claude.json"
+  printf '429' > "$RUN/state/usage-TOK-R-$seat.code"
+done
+touch "$RUN/.claude-pool/marked/RESERVED"                         # source 1: the marker file
+printf 'listed runner  pushed to the runner\n' > "$RUN/cfg/reserved"   # source 2: the config line
+cat > "$RUN/cfg/accounts" <<EOF
+live@example.com|$RUN/.claude-pool/live
+marked@example.com|$RUN/.claude-pool/marked
+listed@example.com|$RUN/.claude-pool/listed
+EOF
+printf '{"seven_day":{"utilization":10,"resets_at":"%s"},"five_hour":{"utilization":10,"resets_at":"%s"}}' \
+  "$(iso_in +2d)" "$(iso_in +2H)" > "$RUN/state/usage-TOK-R-LIVE.json"
+run_usage
+R_JSON="$(FAKE_NEW_EMAIL=live@example.com "$SCRIPT" usage --json 2>/dev/null)"
+! grep -qE '^(marked|listed)$' "$RUN/state/nudges" 2>/dev/null \
+  && ok "reserved seat → neither reservation source is nudged, expired token or not" \
+  || bad "reserved seat → must not nudge (nudges: $(cat "$RUN/state/nudges" 2>/dev/null || echo none))"
+for seat in marked listed; do
+  R_ROW="$(prow "$seat@example.com" "$R_JSON")"
+  grep -q 'reserved seat' <<<"$(jq -r '.stale_reason' <<<"$R_ROW")" \
+    && grep -q 'access token expired' <<<"$(jq -r '.stale_reason' <<<"$R_ROW")" \
+    && grep -q "rota usage --record $seat" <<<"$(jq -r '.stale_reason' <<<"$R_ROW")" \
+    && ok "reserved seat ($seat) → the reason says reserved, names the expired token and the --record command that answers it" \
+    || bad "reserved seat ($seat) → honest reason (got: $(jq -r '.stale_reason' <<<"$R_ROW"))"
+  [ "$(jq -r '.unmeasured' <<<"$R_ROW")" = true ] \
+    && ok "reserved seat ($seat) → the JSON row is unmeasured, not spent" \
+    || bad "reserved seat ($seat) → JSON unmeasured (got: $R_ROW)"
+done
+grep -qE '^  \? marked@example\.com +reserved seat' <<<"$(unmeasured_block <<<"$OUT")" \
+  && grep -qE '^  \? listed@example\.com +reserved seat' <<<"$(unmeasured_block <<<"$OUT")" \
+  && ok "reserved seat → the table files both under UNMEASURED as 'reserved seat', not 'stored token stale' or 'rate-limited'" \
+  || bad "reserved seat → table label (got: $(unmeasured_block <<<"$OUT"))"
+: > "$RUN/state/nudges"
+ROTA_NUDGE_RESERVED=1 run_usage
+grep -q '^marked$' "$RUN/state/nudges" 2>/dev/null && grep -q '^listed$' "$RUN/state/nudges" 2>/dev/null \
+  && ok "reserved seat → ROTA_NUDGE_RESERVED=1 overrides and both are nudged like any expired seat" \
+  || bad "reserved seat → override must nudge (nudges: $(cat "$RUN/state/nudges" 2>/dev/null || echo none))"
+
 restore_home
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

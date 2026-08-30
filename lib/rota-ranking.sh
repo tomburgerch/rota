@@ -154,3 +154,28 @@ rota_deadline_beats() {  # rota_deadline_beats <cand-deadline> <cand-used-pct> <
   [[ "$bu" =~ ^[0-9]+$ ]] || return 0
   (( cu < bu ))
 }
+
+# Is this seat somebody else's to spend? The same union rule rota-billing.sh reads
+# for the table: a RESERVED file inside the seat's own config dir, OR the seat's
+# alias (its dir basename) or label named first on a line of $CFG_DIR/reserved.
+# Both sources, never "markers else config". Shared here because the engine's
+# usage nudge and the keeper's warming both have to refuse a reserved seat: a
+# nudge rotates the refresh chain, and a reserved seat's chain is ALSO held by
+# its owner's box (the Airmond runner's copy of gmail, Joe's copy of tommy), so
+# whichever side rotates first kills the other. Measured 2026-08-30: gmail had
+# been rotated on both sides once already. ROTA_NUDGE_RESERVED=1 overrides.
+seat_is_reserved() {  # seat_is_reserved <label> <dir>
+  local label="${1:-}" dir="${2:-}" alias line first
+  local f="${CFG_DIR:-$HOME/.config/claude-failover}/reserved"
+  [[ -n "$dir" && -f "$dir/RESERVED" ]] && return 0
+  [[ -f "$f" ]] || return 1
+  alias="$(basename "$dir")"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    first="${line%%[[:space:]]*}"
+    [[ -n "$first" ]] || continue
+    [[ "$first" == "$alias" || "$first" == "$label" ]] && return 0
+  done < "$f"
+  return 1
+}

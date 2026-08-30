@@ -3192,7 +3192,12 @@ collect_usage() {
         local pre_complete=0 pre_fp=""
         cred_is_complete "$credfile" && pre_complete=1
         pre_fp="$(cred_fingerprint "$credfile" 2>/dev/null || true)"
-        if (( pre_complete )) && refresh_known_dead "$alabel" "$credfile"; then
+        if seat_is_reserved "$alabel" "$adir" && [[ "${ROTA_NUDGE_RESERVED:-0}" != "1" ]]; then
+          # somebody else's seat: its refresh chain is also held on the owner's box
+          # (the Airmond runner, Joe's laptop), and a nudge from here rotates the
+          # chain out from under that copy. Say why it is unmeasured and who answers.
+          U_WHY[i]="reserved seat, not nudged from this box (its owner's machine rotates the token)${tok_expired_ago:+; stored access token expired $tok_expired_ago ago}; rota usage --record $(basename "$adir") <weekly-used-%> answers it, ROTA_NUDGE_RESERVED=1 overrides"
+        elif (( pre_complete )) && refresh_known_dead "$alabel" "$credfile"; then
           # already watched this exact credential's refresh be rejected. Nudging it
           # again cannot succeed and CAN destroy it; the answer is a re-login.
           U_WHY[i]="refresh already rejected, this stored credential is dead and needs a re-login: CLAUDE_CONFIG_DIR=$(tilde "$adir") claude"
@@ -4172,6 +4177,9 @@ short_reason() {  # short_reason <slot-index>
         # stale BEFORE 429: an expired token's reason quotes the HTTP code the vendor
         # refused it with (429, measured 2026-08-30), and "rate-limited" would send
         # the operator waiting a minute for a number that never comes
+        # reserved BEFORE stale/429: the seat is unmeasured because this box may
+        # not nudge it, not because anything is wrong with it; its owner answers
+        *'reserved seat'*)           printf 'reserved seat' ;;
         *'stored token is stale'*)   printf 'stored token stale' ;;
         *429*)                       printf 'usage API rate-limited' ;;
         # printf '%s', not a bare literal: a leading "--" would be eaten as an
