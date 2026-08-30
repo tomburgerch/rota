@@ -903,6 +903,10 @@ nudge_account() {  # nudge_account <label> <dir> <why>
   cred_is_complete "$cred" || { log "skip nudge $label: credential incomplete (husk, needs a browser login)"; return 1; }
   refresh_known_dead "$label" "$cred" && { log "skip nudge $label: refresh already rejected for this credential (dead-refresh marker)"; return 1; }
   dir_has_live_process "$dir" && { log "skip nudge $label: a live claude process is pinned to $(tilde "$dir") (it refreshes its own chain)"; return 1; }
+  if seat_is_reserved "$label" "$dir" && [[ "${ROTA_NUDGE_RESERVED:-0}" != "1" ]]; then
+    log "skip nudge $label: reserved seat, its owner's machine rotates the token and a nudge from here would rotate the chain out from under it (ROTA_NUDGE_RESERVED=1 overrides)"
+    return 1
+  fi
   pre_fp="$(cred_fingerprint "$cred" 2>/dev/null || true)"
   pre_exp="$(jq -r '.claudeAiOauth.expiresAt // empty' "$cred" 2>/dev/null || true)"
   [[ "$pre_exp" =~ ^[0-9]+$ ]] || pre_exp=""
@@ -1462,10 +1466,33 @@ main() {
       cred="${DIRS[$i]}/.credentials.json"
       cred_is_complete "$cred" || continue
       refresh_known_dead "${LABELS[$i]}" "$cred" && continue
+      if seat_is_reserved "${LABELS[$i]}" "${DIRS[$i]}" && [[ "${ROTA_NUDGE_RESERVED:-0}" != "1" ]]; then
+        # decided, not undecided: the marker still stamps, and the seat is measured
+        # wherever it is actually used (or recorded by hand), never warmed from here
+        log "warm ${LABELS[$i]}: reserved seat, not nudged from this box (its owner's machine rotates the token; ROTA_NUDGE_RESERVED=1 overrides)"
+        continue
+      fi
       # window OPEN = a five-hour resets_at in the future, or any utilization
       # already spent. Cold = utilization 0 with a null/past resets_at.
       ui="$(usage_for "${LABELS[$i]}")"
       if [[ -z "$ui" ]]; then
+        # No usage data AND the stored access token has already expired: the
+        # fetch could not have answered and never will until something rotates
+        # the token, and with keepalive off this nudge is the only thing that
+        # does. So the seat is COLD by construction, not undecided. Before this,
+        # four seats on the pool host (2026-08-25 → 08-30) sat in a loop: no data
+        # because the token was expired, no nudge because there was no data, 144
+        # "retrying next tick" lines a day. Decided either way after the nudge:
+        # rotated (measurable next tick), husked (marked dead, skipped from now
+        # on) or ineffective (logged by nudge_account, not retried every tick).
+        left="$(token_expiry_in "$cred")"
+        if [[ -n "$left" ]] && (( left <= 0 )); then
+          log "warm ${LABELS[$i]}: no usage data and the stored access token expired $(( -left / 60 ))min ago, cold by construction, nudging once (the nudge is also the only refresh path with keepalive off)"
+          if nudge_account "${LABELS[$i]}" "${DIRS[$i]}" "warming: access token expired $(( -left / 60 ))min ago"; then
+            warmed=$((warmed + 1))
+          fi
+          continue
+        fi
         # UNDECIDED, not skipped (stage-1 review, 2026-08-12): without usage
         # data we cannot tell open from cold, and stamping the marker anyway
         # would let one transient fetch failure at 03:00 kill warming for the
