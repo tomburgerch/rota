@@ -935,6 +935,36 @@ run_keeper "${warm_env[@]}"
   && ok "warming → WARM_ACCOUNTS=active warms only the active account" \
   || bad "warming → active-only (calls: $(cat "$FAKE_STATE/claude-calls" 2>/dev/null || echo none))"
 
+# A seat whose stored ACCESS token has already expired can produce no usage data
+# until something refreshes it, and with keepalive off the warm nudge IS the only
+# thing that does. The old "no usage data → undecided → retry next tick" rule met
+# that seat with a loop: no data because the token is expired, no nudge because
+# there is no data, 144 log lines a day and the seat unmeasurable for five days
+# (the pool host, 2026-08-25 → 08-30, four seats). Expired + no data = COLD, and
+# it gets its one nudge; every guard inside nudge_account still applies.
+mk_pool warmexpired
+usage_fixture wk      10 30 "$(iso_in +2H)"       # open, skip
+usage_fixture team    10 30 "$(iso_in +2H)"       # open, skip
+usage_fixture primary 10 30 "$(iso_in +2H)"       # open, skip
+printf '{"claudeAiOauth":{"accessToken":"TOK-alpha","refreshToken":"rt-TOK-alpha","expiresAt":%s,"refreshTokenExpiresAt":%s}}' \
+  "$(( ($(date +%s) - 5 * 86400) * 1000 ))" "$EXP_MS" > "$RUN/.claude-pool/alpha/.credentials.json"
+# NO usage fixture for alpha: the API will not answer an expired token
+run_keeper "${warm_env[@]}"
+[ -f "$FAKE_STATE/claude-calls" ] \
+  && [ "$(grep -c '' "$FAKE_STATE/claude-calls")" -eq 1 ] \
+  && grep -q "claude-pool/alpha|" "$FAKE_STATE/claude-calls" \
+  && ok "warming → a seat with NO usage data and an EXPIRED access token is nudged (it is cold by construction)" \
+  || bad "warming → expired-token seat nudged (calls: $(cat "$FAKE_STATE/claude-calls" 2>/dev/null || echo none))"
+grep -q 'warmed=1' "$RUN/cfg/keeper-status" \
+  && ok "warming → and counts as warmed, not as 'retry'" \
+  || bad "warming → warmed=1 (status: $(cat "$RUN/cfg/keeper-status"))"
+ls "$RUN/cfg"/warmed-* >/dev/null 2>&1 \
+  && ok "warming → the day's marker is stamped, no 144-line retry loop" \
+  || bad "warming → marker missing after the expired-token nudge"
+grep -q 'access token expired' "$RUN/cfg/keeper.log" \
+  && ok "warming → the log names WHY the seat was nudged (expired access token)" \
+  || bad "warming → log reason (got: $(grep 'warm' "$RUN/cfg/keeper.log" | tail -3))"
+
 # ── 8. the reconcile→normalize COMPOSITION (stage-1 review, finding 1) ───────
 # reconcile --apply rewrites the labels to match the dirs, which destroys the
 # label-mismatch evidence normalize's own detection needs. The pending record

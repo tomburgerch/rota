@@ -974,6 +974,27 @@ cred_token() {
   jq -r '.claudeAiOauth.accessToken // empty' "$f" 2>/dev/null || true
 }
 
+# How long ago the stored ACCESS token expired ("5d8h", "3h12m"), or nothing when it
+# is still in date or the file carries no usable expiresAt. Reads one timestamp,
+# never the token. An access token lives ~8h and only the CLI rotates it, so a seat
+# nobody has run a session on since yesterday morning holds an expired one, and
+# (measured on the pool host 2026-08-30, 150s of quiet before each probe, no live
+# session on the seat) the usage API answers HTTP 429 to that token, not 401: 401
+# is what a garbage token gets. The two callers below use this to tell "the vendor
+# refused an expired token" from "panes are rate-limiting this token", which the
+# HTTP code alone cannot.
+cred_token_expired_ago() {  # cred_token_expired_ago <credentials-json-file>
+  local f="${1:-}" exp now d
+  [[ -f "$f" ]] || return 0
+  exp="$(jq -r '.claudeAiOauth.expiresAt // empty' "$f" 2>/dev/null || true)"
+  [[ "$exp" =~ ^[0-9]+$ ]] || return 0
+  (( exp > 100000000000 )) && exp=$(( exp / 1000 ))
+  now="$(date +%s)"
+  (( now > exp )) || return 0
+  d="$(human_delta $(( now - exp )))"
+  printf '%s' "${d#in }"
+}
+
 # Does this dir hold a usable stored credential? `status` only needs the yes/no.
 has_credential() {
   local f="$1/.credentials.json"
@@ -2025,6 +2046,16 @@ shared_email() {
 USAGE_HTTP=""
 USAGE_JSON=""
 USAGE_CURL_TIMEOUT=10
+# ⚠️ THE USER-AGENT CHANGES THE ANSWER. The keeper has sent `claude-code/2.x`
+# since 2026-08-12 and calls it mandatory; this probe never did, and the two
+# disagreed about the same token. Measured on the pool host 2026-08-30, 150s of
+# quiet before each call, no live session on the seat, one EXPIRED access token:
+#   no User-Agent (curl's default)   → HTTP 429 "Rate limited. Please try again later."
+#   User-Agent: claude-code/2.x      → HTTP 401 "OAuth access token has expired."
+# So the 429 this probe kept reporting for four seats was the vendor's answer to
+# an expired token under the default UA, not rate limiting, and the row's "retry
+# in ~1 min" advice was built on it. Same header as the keeper, one probe shape.
+USAGE_UA="${CLAUDE_FAILOVER_USAGE_UA:-claude-code/2.x}"
 usage_fetch() {
   local token="$1" resp
   USAGE_HTTP=""; USAGE_JSON=""
@@ -2032,6 +2063,7 @@ usage_fetch() {
   resp="$(curl -s --max-time "$USAGE_CURL_TIMEOUT" -w $'\n%{http_code}' \
     -H "Authorization: Bearer $token" \
     -H "anthropic-beta: oauth-2025-04-20" \
+    -H "User-Agent: $USAGE_UA" \
     "$USAGE_API" 2>/dev/null || true)"
   USAGE_HTTP="${resp##*$'\n'}"
   [[ "$USAGE_HTTP" == "200" ]] || return 0
@@ -3028,6 +3060,11 @@ weekly_unknown() {  # weekly_unknown <slot-index>
   (( U_WKX[$1] == 1 )) && return 0
   [[ -n "${U_WKU[$1]:-}" ]] && return 1
   case "${U_WHY[$1]:-}" in
+    # an EXPIRED access token (refresh token still in date) is the same shape: the
+    # seat is fine, only the number is missing, and a login is NOT the fix, one
+    # session (or the nudge) is. Listed before 429 because its reason string
+    # quotes the HTTP code the vendor answered with.
+    *'access token expired'*) return 0 ;;
     *429*) return 0 ;;
   esac
   return 1
@@ -3102,6 +3139,7 @@ collect_usage() {
     # for reference and for the guard rules it documents.
 
     local json="" http="" token="" credfile="$adir/.credentials.json"
+    local tok_expired_ago=""   # reset per slot: it feeds the reason below, whichever branch ran
     token="$(cred_token "$adir")"
     if [[ -z "$token" ]]; then
       # NAME THE REAL DEFECT. On 2026-08-07 a gutted file reported "no stored
@@ -3127,12 +3165,22 @@ collect_usage() {
       U_WHY[i]="--no-refresh: cached numbers only"
     else
       usage_fetch "$token"; json="$USAGE_JSON"; http="$USAGE_HTTP"
-      if [[ -z "$json" && "$http" != "429" ]]; then
+      # ⚠️ A 429 ON AN ALREADY-EXPIRED TOKEN IS NOT RATE LIMITING. Measured on the
+      # pool host 2026-08-30 (150s quiet before each call, no live session on the
+      # seat): the usage API answered 429 to a real access token five days past its
+      # expiresAt, and 401 to a garbage one. Nothing can be "sharing" a token that
+      # expired days ago, so the 429 skip below must not fire for it: that skip is
+      # what left four of five seats UNMEASURED for up to five days (2026-08-25 →
+      # 08-30) while the row promised "retry in ~1 min". The nudge is the one path
+      # that rotates a stored token, and it is exactly what an expired one needs.
+      tok_expired_ago="$(cred_token_expired_ago "$credfile")"
+      if [[ -z "$json" ]] && { [[ "$http" != "429" ]] || [[ -n "$tok_expired_ago" ]]; }; then
         # a stored token only rotates when a session USES the account, so spend one
         # haiku token, the CLI refreshes + persists the credential itself. cwd=/ plus
         # this exact prompt marks the run as a synthetic session, so anything that
-        # mines transcripts can tell these nudges apart from real work. (Skipped on 429: that is per-token
-        # rate limiting on the usage API, not a stale token.)
+        # mines transcripts can tell these nudges apart from real work. (Skipped on a
+        # 429 for a token still IN DATE: that is per-token rate limiting on the usage
+        # API, not a stale token.)
         #
         # ⚠ THIS IS THE WRITE THAT GUTTED THE PERSONAL SEAT ON 2026-08-07, see the header block.
         # The nudge only ever runs for an account whose token is already stale, which
@@ -3194,7 +3242,12 @@ collect_usage() {
     # not live → fall back to the last-good cached numbers, age-marked, with any
     # window that has since reset shown as expired rather than as a number
     if [[ -z "${U_WHY[$i]}" ]]; then
-      if [[ "$http" == "429" ]]; then
+      if [[ -n "$tok_expired_ago" ]]; then
+        # the honest reason, whatever code the vendor used to refuse the token; and
+        # the honest next step: only a session on this seat (or the nudge above,
+        # which just ran) rotates it. "retry in ~1 min" was never going to come true.
+        U_WHY[i]="stored token is stale (access token expired ${tok_expired_ago} ago, usage API answered HTTP ${http:-none}), nothing rotates it while no session runs on this seat"
+      elif [[ "$http" == "429" ]]; then
         U_WHY[i]="usage API 429, retry in ~1 min, live sessions share this token"
       else
         U_WHY[i]="stored token is stale (HTTP ${http:-none}), the CLI only rotates it when a session uses this account"
@@ -4116,8 +4169,11 @@ short_reason() {  # short_reason <slot-index>
         *'was CLEARED'*|*'refresh rejected'*|*'refresh already rejected'*)
                                      printf 'cleared, needs login' ;;
         *'no stored credential'*)    printf 'no stored credential' ;;
-        *429*)                       printf 'usage API rate-limited' ;;
+        # stale BEFORE 429: an expired token's reason quotes the HTTP code the vendor
+        # refused it with (429, measured 2026-08-30), and "rate-limited" would send
+        # the operator waiting a minute for a number that never comes
         *'stored token is stale'*)   printf 'stored token stale' ;;
+        *429*)                       printf 'usage API rate-limited' ;;
         # printf '%s', not a bare literal: a leading "--" would be eaten as an
         # option and the column would render EMPTY
         *'--no-refresh'*)            printf '%s' '--no-refresh (cached)' ;;

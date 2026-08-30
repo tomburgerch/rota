@@ -1466,6 +1466,23 @@ main() {
       # already spent. Cold = utilization 0 with a null/past resets_at.
       ui="$(usage_for "${LABELS[$i]}")"
       if [[ -z "$ui" ]]; then
+        # No usage data AND the stored access token has already expired: the
+        # fetch could not have answered and never will until something rotates
+        # the token, and with keepalive off this nudge is the only thing that
+        # does. So the seat is COLD by construction, not undecided. Before this,
+        # four seats on the pool host (2026-08-25 → 08-30) sat in a loop: no data
+        # because the token was expired, no nudge because there was no data, 144
+        # "retrying next tick" lines a day. Decided either way after the nudge:
+        # rotated (measurable next tick), husked (marked dead, skipped from now
+        # on) or ineffective (logged by nudge_account, not retried every tick).
+        left="$(token_expiry_in "$cred")"
+        if [[ -n "$left" ]] && (( left <= 0 )); then
+          log "warm ${LABELS[$i]}: no usage data and the stored access token expired $(( -left / 60 ))min ago, cold by construction, nudging once (the nudge is also the only refresh path with keepalive off)"
+          if nudge_account "${LABELS[$i]}" "${DIRS[$i]}" "warming: access token expired $(( -left / 60 ))min ago"; then
+            warmed=$((warmed + 1))
+          fi
+          continue
+        fi
         # UNDECIDED, not skipped (stage-1 review, 2026-08-12): without usage
         # data we cannot tell open from cold, and stamping the marker anyway
         # would let one transient fetch failure at 03:00 kill warming for the
