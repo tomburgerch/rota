@@ -91,6 +91,12 @@ if [ "${1:-}" = "-p" ] && [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
     printf '{"claudeAiOauth":{"accessToken":"","refreshToken":"","refreshTokenExpiresAt":%s000,"scopes":["user:inference"],"subscriptionType":"max"}}' \
       "$(cat "$FAKE_STATE/deadrefresh-$base")" > "$CLAUDE_CONFIG_DIR/.credentials.json"
   fi
+  # the HEALTHY rotation, the opposite of the husk: when a nudged seat's refresh
+  # token is alive the real CLI installs a fresh credential; a scenario stages
+  # that by putting the post-rotation credential in $FAKE_STATE/rotate-<base>
+  if [ -f "$FAKE_STATE/rotate-$base" ]; then
+    cat "$FAKE_STATE/rotate-$base" > "$CLAUDE_CONFIG_DIR/.credentials.json"
+  fi
 fi
 n=$(cat "$FAKE_STATE/authcalls" 2>/dev/null || echo 0)
 n=$((n + 1))
@@ -4598,11 +4604,15 @@ printf '{"claudeAiOauth":{"accessToken":"TOK-X-EXPIRED","refreshToken":"RT-TOK-X
   "$(date -u -v-5d +%s)" "$RT_FUTURE" > "$RUN/.claude-pool/expired/.credentials.json"
 printf '{"oauthAccount":{"emailAddress":"expired@example.com"}}' > "$RUN/.claude-pool/expired/.claude.json"
 printf '429' > "$RUN/state/usage-TOK-X-EXPIRED.code"
-# limited: a token still in date that the API 429s, the genuine rate-limit case, must
-# keep its old behaviour byte for byte (no nudge, "retry in ~1 min")
+# limited: a token still in date that the API 429s WHILE a live session is
+# pinned to the seat, the genuine shared-token rate-limit case, must keep its
+# old behaviour byte for byte (no nudge, "retry in ~1 min"). The pin is what
+# says "shared" since the dormant-wake arm (scenario 59): an in-date 429 with
+# NO pin and nothing current in the cache gets one wake instead.
 cred_json TOK-X-LIMITED > "$RUN/.claude-pool/limited/.credentials.json"
 printf '{"oauthAccount":{"emailAddress":"limited@example.com"}}' > "$RUN/.claude-pool/limited/.claude.json"
 printf '429' > "$RUN/state/usage-TOK-X-LIMITED.code"
+printf 'PID TT STAT TIME COMMAND\n  71 s001  S+   0:00.10 claude CLAUDE_CONFIG_DIR=%s/.claude-pool/limited\n' "$RUN" > "$RUN/state/pool-ps.txt"
 cat > "$RUN/cfg/accounts" <<EOF
 live@example.com|$RUN/.claude-pool/live
 expired@example.com|$RUN/.claude-pool/expired
@@ -4618,8 +4628,8 @@ X_LIMITED="$(prow limited@example.com "$X_JSON")"
   && ok "expired token × 429 → the seat IS nudged (the CLI is the only thing that rotates a stored token)" \
   || bad "expired token × 429 → must nudge (nudges: $(cat "$RUN/state/nudges" 2>/dev/null || echo none))"
 ! grep -q '^limited$' "$RUN/state/nudges" 2>/dev/null \
-  && ok "expired token × 429 → a token still in date that 429s is NOT nudged (real rate limiting, unchanged)" \
-  || bad "expired token × 429 → in-date 429 must not nudge (nudges: $(cat "$RUN/state/nudges"))"
+  && ok "expired token × 429 → an in-date token that 429s under a live pin is NOT nudged (real shared-token rate limiting, unchanged)" \
+  || bad "expired token × 429 → pinned in-date 429 must not nudge (nudges: $(cat "$RUN/state/nudges"))"
 grep -q 'access token expired' <<<"$(jq -r '.stale_reason' <<<"$X_EXPIRED")" \
   && ! grep -q 'live sessions share' <<<"$(jq -r '.stale_reason' <<<"$X_EXPIRED")" \
   && ok "expired token × 429 → the reason names the EXPIRED token, never 'live sessions share this token'" \
@@ -4694,6 +4704,91 @@ ROTA_NUDGE_RESERVED=1 run_usage
 grep -q '^marked$' "$RUN/state/nudges" 2>/dev/null && grep -q '^listed$' "$RUN/state/nudges" 2>/dev/null \
   && ok "reserved seat → ROTA_NUDGE_RESERVED=1 overrides and both are nudged like any expired seat" \
   || bad "reserved seat → override must nudge (nudges: $(cat "$RUN/state/nudges" 2>/dev/null || echo none))"
+
+# --- 59. dormant seat × 429: the wake the operator used to have to remember -----
+# tommy, 2026-08-25 → 09-01: nothing touched the seat after its weekly window
+# rolled, the usage API 429'd its in-date token six days straight, the skip
+# filed it under "live sessions share this token", and the row sat UNMEASURED
+# until a human ran `CLAUDE_CONFIG_DIR=~/.claude-pool/tommy claude -p … "ok"`
+# by hand — which cured it instantly. The engine now spends that wake itself
+# when the "shared" theory is uncorroborated: in-date 429, NO live pin on the
+# dir, nothing current in the cache. Once per WAKE_STAMP_TTL per seat, so a
+# stuck seat costs one call, not one per keeper tick (the unbounded version of
+# this is what got KEEPALIVE killed on 2026-08-16).
+new_run dormantwake
+mkdir -p "$RUN/.claude-pool/live" "$RUN/.claude-pool/dormant" "$RUN/.claude-pool/stuck" "$RUN/.claude-pool/parked"
+cred_json TOK-DW-LIVE > "$RUN/.claude/.credentials.json"
+cp "$RUN/.claude/.credentials.json" "$RUN/.claude-pool/live/.credentials.json"
+printf '{"oauthAccount":{"emailAddress":"live@example.com"}}' > "$RUN/.claude-pool/live/.claude.json"
+printf '{"oauthAccount":{"emailAddress":"live@example.com"}}' > "$RUN/.claude.json"
+printf '{"seven_day":{"utilization":10,"resets_at":"%s"},"five_hour":{"utilization":10,"resets_at":"%s"}}' \
+  "$(iso_in +2d)" "$(iso_in +2H)" > "$RUN/state/usage-TOK-DW-LIVE.json"
+# dormant: in-date 429, no pin, no cache → ONE wake; the wake rotates the
+# credential (rotate-<base>, the healthy CLI behaviour) and the refetch with
+# the rotated token answers 200, so the row comes back LIVE in the same run
+cred_json TOK-DW-DORMANT > "$RUN/.claude-pool/dormant/.credentials.json"
+printf '{"oauthAccount":{"emailAddress":"dormant@example.com"}}' > "$RUN/.claude-pool/dormant/.claude.json"
+printf '429' > "$RUN/state/usage-TOK-DW-DORMANT.code"
+cred_json TOK-DW-WOKE > "$RUN/state/rotate-dormant"
+printf '{"seven_day":{"utilization":0,"resets_at":"%s"},"five_hour":{"utilization":0,"resets_at":"%s"}}' \
+  "$(iso_in +4d)" "$(iso_in +5H)" > "$RUN/state/usage-TOK-DW-WOKE.json"
+# stuck: same dormant shape but the wake cures nothing (still 429) → woken
+# ONCE, the reason says a wake was spent, and the stamp stops the next run
+cred_json TOK-DW-STUCK > "$RUN/.claude-pool/stuck/.credentials.json"
+printf '{"oauthAccount":{"emailAddress":"stuck@example.com"}}' > "$RUN/.claude-pool/stuck/.claude.json"
+printf '429' > "$RUN/state/usage-TOK-DW-STUCK.code"
+# parked: the dormant shape on a RESERVED seat → never woken from this box
+cred_json TOK-DW-PARKED > "$RUN/.claude-pool/parked/.credentials.json"
+printf '{"oauthAccount":{"emailAddress":"parked@example.com"}}' > "$RUN/.claude-pool/parked/.claude.json"
+printf '429' > "$RUN/state/usage-TOK-DW-PARKED.code"
+touch "$RUN/.claude-pool/parked/RESERVED"
+cat > "$RUN/cfg/accounts" <<EOF
+live@example.com|$RUN/.claude-pool/live
+dormant@example.com|$RUN/.claude-pool/dormant
+stuck@example.com|$RUN/.claude-pool/stuck
+parked@example.com|$RUN/.claude-pool/parked
+EOF
+run_usage
+[ "$(grep -c '^dormant$' "$RUN/state/nudges" 2>/dev/null || echo 0)" -eq 1 ] \
+  && ok "dormant × 429 → the unpinned in-date seat IS woken, exactly once" \
+  || bad "dormant × 429 → must wake once (nudges: $(cat "$RUN/state/nudges" 2>/dev/null || echo none))"
+DW_JSON="$(FAKE_NEW_EMAIL=live@example.com "$SCRIPT" usage --json 2>/dev/null)"
+DW_DORMANT="$(prow dormant@example.com "$DW_JSON")"
+[ "$(jq -r '.quota_data' <<<"$DW_DORMANT")" = "live" ] \
+  && ok "dormant × 429 → after the wake the row is measured LIVE in the same run, no human in the loop" \
+  || bad "dormant × 429 → row must be live (got: $DW_DORMANT)"
+[ "$(grep -c '^stuck$' "$RUN/state/nudges" 2>/dev/null || echo 0)" -eq 1 ] \
+  && ok "dormant × 429 → a seat the wake does not cure is still only woken once" \
+  || bad "dormant × 429 → stuck must be woken once (nudges: $(cat "$RUN/state/nudges" 2>/dev/null || echo none))"
+# the --json call is itself a fresh collect, so by now the stamp is set and the
+# reason reads "already spent"; either wording is honest, the banned one is the
+# uncorroborated "live sessions share this token"
+DW_STUCK="$(prow stuck@example.com "$DW_JSON")"
+grep -q 'wake' <<<"$(jq -r '.stale_reason' <<<"$DW_STUCK")" \
+  && ! grep -q 'live sessions share' <<<"$(jq -r '.stale_reason' <<<"$DW_STUCK")" \
+  && ok "dormant × 429 → the stuck reason names the spent wake, never 'live sessions share this token' with nothing pinned" \
+  || bad "dormant × 429 → honest stuck reason (got: $(jq -r '.stale_reason' <<<"$DW_STUCK"))"
+! grep -q '^parked$' "$RUN/state/nudges" 2>/dev/null \
+  && ok "dormant × 429 → a reserved seat in the dormant shape is still never woken from this box" \
+  || bad "dormant × 429 → reserved must not wake (nudges: $(cat "$RUN/state/nudges"))"
+# stamps are keyed by the seat's LABEL (its email in the accounts file), the
+# same key dead-refresh markers use
+[ -f "$RUN/cfg/wake-stamp/dormant@example.com" ] && [ -f "$RUN/cfg/wake-stamp/stuck@example.com" ] \
+  && [ ! -f "$RUN/cfg/wake-stamp/parked@example.com" ] \
+  && ok "dormant × 429 → wake stamps exist for the two woken seats and only those" \
+  || bad "dormant × 429 → stamps (got: $(ls "$RUN/cfg/wake-stamp" 2>/dev/null || echo none))"
+# second run inside the TTL: dormant now measures live off its rotated token,
+# stuck is NOT woken again, and its reason says a wake was already spent
+run_usage
+[ "$(grep -c '^stuck$' "$RUN/state/nudges" 2>/dev/null || echo 0)" -eq 1 ] \
+  && [ "$(grep -c '^dormant$' "$RUN/state/nudges" 2>/dev/null || echo 0)" -eq 1 ] \
+  && ok "dormant × 429 → a second run within the TTL spends NO further wake on either seat" \
+  || bad "dormant × 429 → no re-wake within TTL (nudges: $(cat "$RUN/state/nudges" 2>/dev/null || echo none))"
+DW_JSON2="$(FAKE_NEW_EMAIL=live@example.com "$SCRIPT" usage --json 2>/dev/null)"
+DW_STUCK2="$(prow stuck@example.com "$DW_JSON2")"
+grep -q 'already spent' <<<"$(jq -r '.stale_reason' <<<"$DW_STUCK2")" \
+  && ok "dormant × 429 → the second run's stuck reason says the wake was already spent, with the TTL" \
+  || bad "dormant × 429 → stamped reason (got: $(jq -r '.stale_reason' <<<"$DW_STUCK2"))"
 
 restore_home
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

@@ -1122,6 +1122,30 @@ refresh_known_dead() {  # refresh_known_dead <label> <credentials-json-file>
   [[ -n "$fp" && "$fp" == "$(cat "$m" 2>/dev/null || true)" ]]
 }
 
+# ── dormant-seat wake stamps ─────────────────────────────────────────────────
+# A seat nobody has used since its weekly window rolled answers the usage API
+# with a 429 on a token the file says is in date, and used to sit UNMEASURED
+# until a human remembered the manual haiku wake (tommy, 2026-08-25 → 09-01:
+# six days of "not measured this run"). collect_usage now spends that wake
+# itself — but at most once per seat per WAKE_STAMP_TTL, so a keeper ticking
+# every few minutes can never machine-gun nudges at a seat that stays stuck.
+# Unbounded periodic nudging is exactly what got the keeper's KEEPALIVE killed
+# on 2026-08-16 (it husked credentials and rotated nothing); the stamp is the
+# difference between "wake it once and look" and that.
+WAKE_STAMP_TTL="${ROTA_WAKE_STAMP_TTL:-21600}"   # seconds; 6h
+wake_stamp() { printf '%s' "$CFG_DIR/wake-stamp/$1"; }
+wake_stamp_fresh() {  # wake_stamp_fresh <label> → 0 when a wake ran within the TTL
+  local m mt; m="$(wake_stamp "${1:-}")"
+  [[ -f "$m" ]] || return 1
+  mt="$(stat -f %m "$m" 2>/dev/null || stat -c %Y "$m" 2>/dev/null)" || return 1
+  (( $(date +%s) - mt < WAKE_STAMP_TTL ))
+}
+wake_stamp_put() {  # wake_stamp_put <label>
+  local m; m="$(wake_stamp "${1:-}")"
+  mkdir -p "$(dirname "$m")" 2>/dev/null || return 0
+  : > "$m" 2>/dev/null || true
+}
+
 # ── self-heal on read ────────────────────────────────────────────────────────
 # The other half of the 2026-08-07 incident: the good credential was sitting in the
 # stash the whole time and nothing looked. So whenever a pool account's own copy is
@@ -3140,6 +3164,8 @@ collect_usage() {
 
     local json="" http="" token="" credfile="$adir/.credentials.json"
     local tok_expired_ago=""   # reset per slot: it feeds the reason below, whichever branch ran
+    local wake_dormant=0       # reset per slot: 1 = this run decided to wake a dormant seat
+    local wake_recent=0        # reset per slot: 1 = a wake was already spent within the TTL
     token="$(cred_token "$adir")"
     if [[ -z "$token" ]]; then
       # NAME THE REAL DEFECT. On 2026-08-07 a gutted file reported "no stored
@@ -3174,7 +3200,29 @@ collect_usage() {
       # 08-30) while the row promised "retry in ~1 min". The nudge is the one path
       # that rotates a stored token, and it is exactly what an expired one needs.
       tok_expired_ago="$(cred_token_expired_ago "$credfile")"
-      if [[ -z "$json" ]] && { [[ "$http" != "429" ]] || [[ -n "$tok_expired_ago" ]]; }; then
+      # ⚠️ A 429 ON AN IN-DATE TOKEN CAN ALSO BE A DORMANT SEAT, NOT RATE
+      # LIMITING. tommy, 2026-08-25 → 09-01: no session had touched the seat
+      # since its weekly window rolled, the API 429'd its stored token six days
+      # straight, the skip below filed it under "live sessions share this
+      # token", and the row sat UNMEASURED until a human ran the manual haiku
+      # wake — which cured it instantly. Nothing was sharing that token, and
+      # this box can SEE that: pids_pinned_to_dir knows whether any live
+      # session holds the dir. So when the 429 lands on an in-date token, no
+      # live session is pinned to the seat, the cache has nothing current to
+      # say (empty, or its weekly window has rolled), and no wake was already
+      # spent within WAKE_STAMP_TTL, the "shared token" theory is
+      # uncorroborated and one wake is worth spending. A 429 with a live pin
+      # keeps today's behaviour exactly: that IS per-token rate limiting.
+      if [[ -z "$json" && "$http" == "429" && -z "$tok_expired_ago" ]] \
+         && [[ -z "$(pids_pinned_to_dir "$adir")" ]]; then
+        if wake_stamp_fresh "$alabel"; then
+          wake_recent=1
+        else
+          cache_get "$email"
+          if [[ -z "$C_WKU$C_SEU" ]] || window_expired "$C_WKR"; then wake_dormant=1; fi
+        fi
+      fi
+      if [[ -z "$json" ]] && { [[ "$http" != "429" ]] || [[ -n "$tok_expired_ago" ]] || (( wake_dormant )); }; then
         # a stored token only rotates when a session USES the account, so spend one
         # haiku token, the CLI refreshes + persists the credential itself. cwd=/ plus
         # this exact prompt marks the run as a synthetic session, so anything that
@@ -3202,6 +3250,11 @@ collect_usage() {
           # again cannot succeed and CAN destroy it; the answer is a re-login.
           U_WHY[i]="refresh already rejected, this stored credential is dead and needs a re-login: CLAUDE_CONFIG_DIR=$(tilde "$adir") claude"
         else
+          # stamp BEFORE the call, and only the dormant arm: a stuck seat must
+          # not be re-woken by every run for WAKE_STAMP_TTL, while the
+          # expired-token nudge keeps its own guards (dead-refresh marker)
+          # and its existing cadence unchanged.
+          (( wake_dormant )) && wake_stamp_put "$alabel"
           (cd / && CLAUDE_CONFIG_DIR="$adir" claude -p "Reply with exactly the word: ok" --model claude-haiku-4-5-20251001 >/dev/null 2>&1) || true
           if (( pre_complete )) && ! cred_is_complete "$credfile"; then
             # complete going in, gutted coming out: the refresh was rejected and the
@@ -3253,7 +3306,16 @@ collect_usage() {
         # which just ran) rotates it. "retry in ~1 min" was never going to come true.
         U_WHY[i]="stored token is stale (access token expired ${tok_expired_ago} ago, usage API answered HTTP ${http:-none}), nothing rotates it while no session runs on this seat"
       elif [[ "$http" == "429" ]]; then
-        U_WHY[i]="usage API 429, retry in ~1 min, live sessions share this token"
+        if (( wake_dormant )); then
+          # a wake was just spent on it and the API still refuses: say that,
+          # never "live sessions share this token" about a seat this box can
+          # see nothing is pinned to
+          U_WHY[i]="usage API 429 even after a wake call (no live session is pinned to this seat), retry in ~1 min"
+        elif (( wake_recent )); then
+          U_WHY[i]="usage API 429, a wake was already spent on it within the last $((WAKE_STAMP_TTL / 3600))h (no live session is pinned to this seat), retry in ~1 min"
+        else
+          U_WHY[i]="usage API 429, retry in ~1 min, live sessions share this token"
+        fi
       else
         U_WHY[i]="stored token is stale (HTTP ${http:-none}), the CLI only rotates it when a session uses this account"
       fi
