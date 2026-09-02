@@ -306,6 +306,11 @@ unset ROTA_PEERS
 # assert against somebody's live seats and change its answer on the day a boost
 # expires.
 unset CLAUDE_BILLING_JSON CLAUDE_HUMAN_USAGE
+# Nor the transcript store: the restart machinery resolves a pane title to a
+# session id by reading it, and it defaults under $HOME (thrown away per
+# scenario), so an inherited override is the only way this suite could read
+# someone's real sessions, and resume one of them by id in an assertion.
+unset CLAUDE_PROJECTS_DIR
 
 # --- per-run fixture ----------------------------------------------------------
 # A fresh $HOME each run so state never leaks into the next scenario. v2 shape
@@ -3155,6 +3160,105 @@ set -e
 grep -qE '%1 +skipped, this is the pane running the switch' <<<"$RI_SELF" \
   && ok "restart-idle → never restarts the pane it is running in" \
   || bad "restart-idle → self-pane skipped (got: $RI_SELF)"
+
+# --- 43b. resume by SESSION ID; the title is only the lookup key (2026-09-02)
+# A pane title is not unique: sessions get renamed to their predecessor's
+# title, and `claude --resume "<title>"` on a non-unique title parks the pane
+# in a session picker nobody is watching (three of four restarted panes
+# stalled there). So the title is resolved to the id of the NEWEST transcript
+# whose CURRENT title is exactly that, and that id is what every surface
+# reports and sends. Transcripts live under CLAUDE_PROJECTS_DIR as
+# <cwd-slug>/<session-id>.jsonl; a fake store is built here:
+#   A  titled "rainbow rush game", an hour old          → the older twin
+#   B  titled "rainbow rush game", written just now     → THE pane's session
+#   C  was "rainbow rush game", renamed since, newest   → an earlier
+#      custom-title line must not count, only the last one is the title
+#   D  titled "rainbow rush game", newest, but a SIDECAR file below C's own
+#      directory                                        → never a session
+# and pane %5, titled "untracked pane", has no transcript at all, so the
+# title itself is sent, exactly as before.
+panes_fixture resumebyid
+FAKE_TMUX_PANES="%1${US}/dev/ttys001${US}claude.exe${US}✳ rainbow rush game
+%5${US}/dev/ttys005${US}claude.exe${US}✳ untracked pane"
+export FAKE_TMUX_PANES
+{ ps_row "$(( $(date +%s) - 3600 ))" claude.exe; } > "$FAKE_STATE/ps-ttys005.txt"
+RB_PROJ="$RUN/projects"
+RB_A=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa
+RB_B=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb
+RB_C=cccccccc-cccc-4ccc-8ccc-cccccccccccc
+RB_D=dddddddd-dddd-4ddd-8ddd-dddddddddddd
+mkdir -p "$RB_PROJ/-home-code/$RB_C"
+printf '{"type":"user","message":"hello"}\n{"type":"custom-title","customTitle":"rainbow rush game","sessionId":"%s"}\n' \
+  "$RB_A" > "$RB_PROJ/-home-code/$RB_A.jsonl"
+# a malformed line in front, the way a truncated write leaves one: skipped, not fatal
+printf 'not json at all\n{"type":"custom-title","customTitle":"rainbow rush game","sessionId":"%s"}\n' \
+  "$RB_B" > "$RB_PROJ/-home-code/$RB_B.jsonl"
+printf '{"type":"custom-title","customTitle":"rainbow rush game"}\n{"type":"custom-title","customTitle":"renamed since"}\n' \
+  > "$RB_PROJ/-home-code/$RB_C.jsonl"
+printf '{"type":"custom-title","customTitle":"rainbow rush game"}\n' > "$RB_PROJ/-home-code/$RB_C/$RB_D.jsonl"
+touch -t "$(date -r $(( $(date +%s) - 3600 )) '+%Y%m%d%H%M.%S')" "$RB_PROJ/-home-code/$RB_A.jsonl"
+export CLAUDE_PROJECTS_DIR="$RB_PROJ"
+set +e
+RB_DRY="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" switch-auto --dry-run --restart-idle 2>&1)"
+RB_DRY_RC=$?
+set -e
+[ "$RB_DRY_RC" -eq 0 ] \
+  && grep -q "%1 *would restart → CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" claude --resume \"$RB_B\"" <<<"$RB_DRY" \
+  && ok "resume by id → the plan resumes the NEWEST transcript carrying the title, by session id, not by title" \
+  || bad "resume by id → newest id in the plan (got $RB_DRY_RC: $RB_DRY)"
+! grep -q "$RB_A" <<<"$RB_DRY" \
+  && ok "resume by id → the older twin with the same title is never the pick" \
+  || bad "resume by id → picked the older twin (got: $RB_DRY)"
+! grep -q "$RB_C" <<<"$RB_DRY" \
+  && ok "resume by id → a session renamed AWAY from the title does not match on its old custom-title line, even as the newest file" \
+  || bad "resume by id → matched a renamed-away session (got: $RB_DRY)"
+! grep -q "$RB_D" <<<"$RB_DRY" \
+  && ok "resume by id → a sidecar file below a session directory is never a session, however new" \
+  || bad "resume by id → picked a sidecar file (got: $RB_DRY)"
+! grep -q 'claude --resume "rainbow rush game"' <<<"$RB_DRY" \
+  && ok "resume by id → once the id resolves, the bare title is never what gets resumed" \
+  || bad "resume by id → title still proposed (got: $RB_DRY)"
+grep -q "%5 *would restart → CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" claude --resume \"untracked pane\"" <<<"$RB_DRY" \
+  && ok "resume by id → a title with no transcript falls back to the title itself (today's behaviour, kept)" \
+  || bad "resume by id → title fallback (got: $RB_DRY)"
+
+# pane-converge is the other caller of the same machinery: same id
+cat > "$FAKE_STATE/pool-ps.txt" <<POOLPS
+PID TT STAT TIME COMMAND
+101 s001 S+ 0:00 /usr/local/bin/claude CLAUDE_CONFIG_DIR=$RUN/.claude-pool/wk HOME=$RUN
+105 s005 S+ 0:00 /usr/local/bin/claude CLAUDE_CONFIG_DIR=$RUN/.claude-pool/wk HOME=$RUN
+POOLPS
+set +e
+RB_PC="$("$SCRIPT" pane-converge --dry-run 2>&1)"
+set -e
+grep -q "%1 on wk@example.com → would restart (CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" claude --resume \"$RB_B\")" <<<"$RB_PC" \
+  && grep -q "%5 on wk@example.com → would restart (CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" claude --resume \"untracked pane\")" <<<"$RB_PC" \
+  && ok "resume by id → pane-converge resolves the same id (and the same fallback) through the shared restart machinery" \
+  || bad "resume by id → pane-converge lines (got: $RB_PC)"
+rm -f "$FAKE_STATE/pool-ps.txt"
+
+# the live run: what was planned is what is SENT, and what is reported
+RB_LOG="$ROOT/tmux-resumebyid.log"
+set +e
+RB_LIVE="$(TMUX_LOG="$RB_LOG" FAKE_NEW_EMAIL=wk@example.com FAKE_LAG=0 \
+  "$SCRIPT" switch-auto --restart-idle 2>&1)"
+RB_LIVE_RC=$?
+set -e
+[ "$RB_LIVE_RC" -eq 0 ] \
+  && grep -q "tmux send-keys -t %1 CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/wk\" claude --resume \"$RB_B\" Enter" "$RB_LOG" \
+  && ok "resume by id → the line sent to the pane carries the session id" \
+  || bad "resume by id → sent line (got $RB_LIVE_RC: $(cat "$RB_LOG"))"
+grep -q "tmux send-keys -t %5 CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/wk\" claude --resume \"untracked pane\" Enter" "$RB_LOG" \
+  && ok "resume by id → the unresolvable title is sent as the title, on the same run" \
+  || bad "resume by id → fallback sent line ($(cat "$RB_LOG"))"
+! grep -q 'claude --resume "rainbow rush game"' "$RB_LOG" \
+  && ok "resume by id → the resolvable title itself never reaches a pane" \
+  || bad "resume by id → title sent ($(grep 'send-keys' "$RB_LOG"))"
+grep -qE "%1 +restarted → CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/wk\" claude --resume \"$RB_B\"" <<<"$RB_LIVE" \
+  && ok "resume by id → the result line shows the id that was sent (one resolution per pane)" \
+  || bad "resume by id → result line (got: $RB_LIVE)"
+unset CLAUDE_PROJECTS_DIR
+panes_teardown
 
 # --- 44. with no configured session the whole thing is a SILENT no-op -----------
 # ROTA_TMUX_SESSION has no default: pane convergence is opt-in. Two shapes, both

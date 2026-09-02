@@ -4561,6 +4561,11 @@ PANES_US=$'\037'
 # How long --restart-idle waits for a pane's shell to come back after /quit.
 PANE_RESTART_TRIES="${ROTA_PANE_RESTART_TRIES:-20}"
 PANE_RESTART_SLEEP="${ROTA_PANE_RESTART_SLEEP:-1}"
+# Where Claude Code keeps its transcripts, <projects>/<cwd-slug>/<session-id>
+# .jsonl (every pool dir's `projects` is a link here, see POOL_LINKS), read by
+# pane_resume_target to turn a pane title into the session id to resume.
+# Overridable for tests, same shape as CLAUDE_POOL_DIR.
+PROJECTS_DIR="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
 
 # When the shared credential last CHANGED on disk, i.e. the last moment a
 # running session could have been left holding the previous account. 0 when it
@@ -4884,10 +4889,50 @@ pane_pin_resolve() {
   return 0
 }
 
+# What a restarted pane is asked to resume: the SESSION ID behind its title, or
+# the title itself when nothing resolves. A title is only unique by luck
+# (sessions get renamed to their predecessor's title, the morning's and the
+# afternoon's "project x"), and `claude --resume "<title>"` on a non-unique
+# title parks the pane in a session picker nobody is watching: three of four
+# restarted panes stalled there on 2026-09-02. The id is exact.
+#
+# The pane's session is the NEWEST transcript whose CURRENT title (the last
+# custom-title line; an earlier one may be a title since renamed away) is
+# exactly the pane's. Only recently modified transcripts are candidates (a
+# live pane writes its file every turn), only top-level ones (subdirs are
+# sidecar data), and a cheap grep for the encoded title runs before any jq,
+# because the projects dir is gigabytes and a restart must not read all of
+# it. A malformed line is skipped, never fatal (fromjson?). Callers resolve
+# ONCE per pane, so the reported id is the sent one.
+pane_resume_target() {  # pane_resume_target <title> → <session-id>, or <title> when nothing resolves
+  local title="${1:-}" needle f cur id mt best="" best_mt=-1
+  local uuid_re='^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$'
+  if [[ -z "$title" || ! -d "$PROJECTS_DIR" ]]; then printf '%s' "$title"; return 0; fi
+  # the fragment as the transcript spells it: JSON-encoded, so a title holding
+  # a quote or a backslash is looked for as its escaped bytes, not its raw ones
+  needle="\"customTitle\":$(jq -cn --arg t "$title" '$t' 2>/dev/null)" || needle=""
+  if [[ -z "$needle" ]]; then printf '%s' "$title"; return 0; fi
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    id="${f##*/}"; id="${id%.jsonl}"
+    [[ "$id" =~ $uuid_re ]] || continue
+    cur="$(grep -aF '"custom-title"' "$f" 2>/dev/null \
+      | jq -Rr 'fromjson? | select(.type == "custom-title") | .customTitle // empty' 2>/dev/null \
+      | tail -1)" || cur=""
+    [[ "$cur" == "$title" ]] || continue
+    mt="$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null)" || mt=0
+    [[ "$mt" =~ ^[0-9]+$ ]] || mt=0
+    if (( mt > best_mt )); then best="$id"; best_mt="$mt"; fi
+  done < <(find "$PROJECTS_DIR" -mindepth 2 -maxdepth 2 -name '*.jsonl' -mtime -3 \
+             -exec grep -alF -- "$needle" {} + 2>/dev/null || true)
+  printf '%s' "${best:-$title}"
+}
+
 # The exact line a restarted pane is asked to type. ONE builder, shared by the
 # senders and every would-restart/restarted report line, so what is printed is
-# by construction what is sent.
-pane_resume_line() {  # pane_resume_line <resume-name>
+# by construction what is sent. The target is what pane_resume_target
+# resolved, never a raw pane title.
+pane_resume_line() {  # pane_resume_line <resume-target>
   pane_pin_resolve
   if [[ "$PANE_PIN_STATE" == "pin" ]]; then
     printf 'CLAUDE_CONFIG_DIR=%s claude --resume %s' \
@@ -4914,19 +4959,21 @@ pane_pin_refuse_reason() {
 
 # The one restart sequence, shared by restart_idle_panes and pane-converge so
 # the mechanism can never fork: /quit, wait for the shell (bounded, a pane
-# that never lets go is LEFT ALONE, never force-killed), then resume BY NAME,
-# explicitly pinned to the active account's pool dir (pane_pin_resolve above,
-# 2026-08-16). Returns 0 restarted · 1 the /quit send failed (pane gone?) ·
-# 2 still running claude after /quit · 3 /quit landed but the resume line did
-# not · 4 REFUSED before touching the pane: the active account's credential is
-# a husk/absent, so a restart could only produce a dead "/login" pane.
-pane_restart_one() {  # pane_restart_one <pane-id> <resume-name>
-  local pid="${1:-}" name="${2:-}"
+# that never lets go is LEFT ALONE, never force-killed), then resume the
+# TARGET the caller resolved through pane_resume_target (the session id, or
+# the title when nothing resolves), explicitly pinned to the active account's
+# pool dir (pane_pin_resolve above, 2026-08-16). Returns 0 restarted · 1 the
+# /quit send failed (pane gone?) · 2 still running claude after /quit · 3
+# /quit landed but the resume line did not · 4 REFUSED before touching the
+# pane: the active account's credential is a husk/absent, so a restart could
+# only produce a dead "/login" pane.
+pane_restart_one() {  # pane_restart_one <pane-id> <resume-target>
+  local pid="${1:-}" target="${2:-}"
   pane_pin_resolve
   [[ "$PANE_PIN_STATE" == "refuse" ]] && return 4
   tmuxc send-keys -t "$pid" '/quit' Enter </dev/null 2>/dev/null || return 1
   pane_await_shell "$pid" || return 2
-  tmuxc send-keys -t "$pid" "$(pane_resume_line "$name")" Enter </dev/null 2>/dev/null || return 3
+  tmuxc send-keys -t "$pid" "$(pane_resume_line "$target")" Enter </dev/null 2>/dev/null || return 3
   return 0
 }
 
@@ -4938,10 +4985,15 @@ pane_restart_one() {  # pane_restart_one <pane-id> <resume-name>
 #   • A pane that is mid-work is SKIPPED. Killing a pane during a tool call
 #     destroys that work; no amount of "it was probably fine" is worth it.
 #     (pane-converge picks those up once they go idle.)
-#   • `claude --resume "<name>"`, NEVER `claude --continue`. --continue resumes
-#     the most recent conversation FOR THE WORKING DIRECTORY, and every pane
-#     here sits in ~/code, so it loads some other pane's conversation. Done
-#     once, on 2026-08-06.
+#   • `claude --resume "<session-id>"`, the id resolved from the pane title
+#     (pane_resume_target), the bare title only when nothing resolves; NEVER
+#     `claude --continue`. --continue resumes the most recent conversation
+#     FOR THE WORKING DIRECTORY, and every pane here sits in ~/code, so it
+#     loads some other pane's conversation. Done once, on 2026-08-06. And a
+#     title is not an id: sessions get renamed to their predecessor's title,
+#     and resuming a non-unique title parks the pane in a session picker
+#     nobody is watching. Three of four restarted panes stalled there on
+#     2026-09-02.
 #   • A pane whose title reads back EMPTY is SKIPPED and reported, because
 #     `claude --resume ""` drops the pane to a bare shell. Also done once.
 #   • The pane running this command is never restarted (it would kill the
@@ -4966,14 +5018,14 @@ restart_idle_panes() {  # restart_idle_panes <dry-run 0|1> [<explicit 0|1>]
   printf '  %s%s\n' "$(paint "$CLR_BOLD" 'RESTART IDLE')" \
     "$(paint "$CLR_DIM" "$( (( dry )) \
         && printf ', dry run: listing what WOULD be restarted, sending nothing' \
-        || printf ', idle panes restarted (default; --new-only to skip): /quit, then claude --resume "<session>", per pane')")"
+        || printf ', idle panes restarted (default; --new-only to skip): /quit, then claude --resume "<session-id>", per pane')")"
   # The row's 4th field (may-be-on-the-previous-account) is read and DELIBERATELY
   # not used as a filter: right after a real switch the credential changed a
   # second ago, so every pane predates it and the flag would select all of them
   # anyway, while on a --dry-run it would select a different, smaller set, and a
   # dry run that lists fewer panes than the real run would then perform is worse
   # than useless. The rule stays the simple one: restart every idle pane.
-  local pid title working prev tty name
+  local pid title working prev tty name target
   # shellcheck disable=SC2034  # `prev`/`tty` are read positionally; see above
   while IFS="$PANES_US" read -r pid title working prev tty; do
     [[ -n "$pid" ]] || continue
@@ -4990,6 +5042,8 @@ restart_idle_panes() {  # restart_idle_panes <dry-run 0|1> [<explicit 0|1>]
       printf '         %-5s %s\n' "$pid" "skipped, empty pane title, so there is no session name to resume"
       continue
     fi
+    # resolved once: the plan, the sent line and the result line all show it
+    target="$(pane_resume_target "$name")"
     if (( dry )); then
       # The dry run must tell the truth about BOTH halves of the 2026-08-16
       # hardening: the pinned line it would send, and the refusal it would
@@ -4998,14 +5052,14 @@ restart_idle_panes() {  # restart_idle_panes <dry-run 0|1> [<explicit 0|1>]
       if [[ "$PANE_PIN_STATE" == "refuse" ]]; then
         printf '         %-5s %s\n' "$pid" "would skip, $(pane_pin_refuse_reason)"
       else
-        printf '         %-5s %s\n' "$pid" "would restart → $(pane_resume_line "$name")"
+        printf '         %-5s %s\n' "$pid" "would restart → $(pane_resume_line "$target")"
       fi
       continue
     fi
     local rrc=0
-    pane_restart_one "$pid" "$name" || rrc=$?
+    pane_restart_one "$pid" "$target" || rrc=$?
     case "$rrc" in
-      0) printf '         %-5s %s\n' "$pid" "restarted → $(pane_resume_line "$name")" ;;
+      0) printf '         %-5s %s\n' "$pid" "restarted → $(pane_resume_line "$target")" ;;
       1) printf '         %-5s %s\n' "$pid" "skipped, send-keys failed (pane gone?)" ;;
       2) printf '         %-5s %s\n' "$pid" "skipped, still running claude after /quit; left alone" ;;
       4) printf '         %-5s %s\n' "$pid" "skipped, $(pane_pin_refuse_reason)" ;;
@@ -5024,7 +5078,8 @@ restart_idle_panes() {  # restart_idle_panes <dry-run 0|1> [<explicit 0|1>]
 # process is pinned (CLAUDE_CONFIG_DIR, via the same `ps eww` walk the
 # `billing now:` header uses) to a POOL dir whose identity differs from the
 # active claim, and restarts the idle ones through the exact machinery
-# restart_idle_panes uses, same mid-work skip, same /quit + resume-by-name.
+# restart_idle_panes uses, same mid-work skip, same /quit + resume by the
+# session id pane_resume_target puts behind the title.
 # The keeper runs it every tick (step 4b), so "converges when idle" is
 # minutes, not "whenever someone remembers".
 #
@@ -5102,7 +5157,7 @@ cmd_pane_converge() {  # cmd_pane_converge [--dry-run]
     return 0
   fi
   local self="${TMUX_PANE:-}" restarted=0 busy=0 divergent=0
-  local pid title working prev tty dir id name rrc
+  local pid title working prev tty dir id name target rrc
   # shellcheck disable=SC2034  # `prev` is read positionally to reach `tty`
   while IFS="$PANES_US" read -r pid title working prev tty; do
     [[ -n "$pid" ]] || continue
@@ -5141,21 +5196,22 @@ cmd_pane_converge() {  # cmd_pane_converge [--dry-run]
       busy=$((busy + 1))
       continue
     fi
+    target="$(pane_resume_target "$name")"  # once: plan, sent line and result agree
     if (( dry )); then
       pane_pin_resolve
       if [[ "$PANE_PIN_STATE" == "refuse" ]]; then
         printf '%s on %s → would NOT restart, %s\n' "$pid" "$id" "$(pane_pin_refuse_reason)"
         busy=$((busy + 1))
       else
-        printf '%s on %s → would restart (%s)\n' "$pid" "$id" "$(pane_resume_line "$name")"
+        printf '%s on %s → would restart (%s)\n' "$pid" "$id" "$(pane_resume_line "$target")"
         restarted=$((restarted + 1))
       fi
       continue
     fi
     rrc=0
-    pane_restart_one "$pid" "$name" || rrc=$?
+    pane_restart_one "$pid" "$target" || rrc=$?
     if (( rrc == 0 )); then
-      printf '%s restarted onto %s (was %s) → %s\n' "$pid" "$claim" "$id" "$(pane_resume_line "$name")"
+      printf '%s restarted onto %s (was %s) → %s\n' "$pid" "$claim" "$id" "$(pane_resume_line "$target")"
       restarted=$((restarted + 1))
     elif (( rrc == 4 )); then
       # husk refusal (2026-08-16): a stale pane beats a guaranteed-dead one
