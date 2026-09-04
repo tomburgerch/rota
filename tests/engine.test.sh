@@ -2782,7 +2782,14 @@ EX_JSON_PATHS="$(jq -S -r 'paths | join(".")' <<<"$EX_JSON" | sed -E 's/\.[0-9]+
 #               for an audience of zero. THIS ASSERTION IS WHY THAT WAS SAFE: the
 #               rename could not land quietly, it reds here until the published
 #               contract is edited by hand and the diff is reviewed.
-EX_JSON_PATHS_WANT="accounts accounts.N accounts.N.active accounts.N.alias accounts.N.cached_at accounts.N.config_dir accounts.N.current accounts.N.data accounts.N.email accounts.N.five_hour accounts.N.five_hour.expired accounts.N.five_hour.fresh accounts.N.five_hour.remaining_pct accounts.N.five_hour.resets_at accounts.N.five_hour.used_pct accounts.N.label accounts.N.live accounts.N.loggedIn accounts.N.note accounts.N.quota_data accounts.N.quota_measured_at accounts.N.quota_source accounts.N.reason accounts.N.recommendable accounts.N.seat accounts.N.seat.ended accounts.N.seat.ends accounts.N.seat.status accounts.N.session accounts.N.session.expired accounts.N.session.fresh accounts.N.session.leftPct accounts.N.session.resetsAt accounts.N.session.resetsInSeconds accounts.N.session.usedPct accounts.N.stale accounts.N.stale_reason accounts.N.unmeasured accounts.N.weekly accounts.N.weekly.expired accounts.N.weekly.fresh accounts.N.weekly.kind accounts.N.weekly.leftPct accounts.N.weekly.remaining_pct accounts.N.weekly.resetsAt accounts.N.weekly.resetsInSeconds accounts.N.weekly.resets_at accounts.N.weekly.scope accounts.N.weekly.usedPct accounts.N.weekly.used_pct active active.auth_status active.auth_warning active.email active.fingerprint active.nested_config_warning active.source active.warning activeEmail floors floors.comfortable_pct floors.exhausted_pct floors.session_pct floors.weekly_pct peer recommendation recommendation.action recommendation.alias recommendation.best_alternative recommendation.best_alternative.email recommendation.best_alternative.weekly_left_pct recommendation.burn_down_hold recommendation.deadline_at recommendation.deadline_kind recommendation.email recommendation.from_cached_numbers recommendation.label recommendation.mode recommendation.mode_forced recommendation.reason recommendation.weekly_fresh "
+#   2026-09-04  `weekly.resets_at_projected` + `weekly.projected_from`, additive.
+#               resets_at is null for a weekly window nothing has spent in yet, and
+#               every consumer rendered that as "weekly reset unknown" and sorted the
+#               seat LAST, so the seat with a whole untouched week in it was the one
+#               the tool refused to recommend. The projection gets its OWN two keys
+#               rather than filling resets_at: a consumer has to be able to tell what
+#               the vendor reported from what this box worked out for itself.
+EX_JSON_PATHS_WANT="accounts accounts.N accounts.N.active accounts.N.alias accounts.N.cached_at accounts.N.config_dir accounts.N.current accounts.N.data accounts.N.email accounts.N.five_hour accounts.N.five_hour.expired accounts.N.five_hour.fresh accounts.N.five_hour.remaining_pct accounts.N.five_hour.resets_at accounts.N.five_hour.used_pct accounts.N.label accounts.N.live accounts.N.loggedIn accounts.N.note accounts.N.quota_data accounts.N.quota_measured_at accounts.N.quota_source accounts.N.reason accounts.N.recommendable accounts.N.seat accounts.N.seat.ended accounts.N.seat.ends accounts.N.seat.status accounts.N.session accounts.N.session.expired accounts.N.session.fresh accounts.N.session.leftPct accounts.N.session.resetsAt accounts.N.session.resetsInSeconds accounts.N.session.usedPct accounts.N.stale accounts.N.stale_reason accounts.N.unmeasured accounts.N.weekly accounts.N.weekly.expired accounts.N.weekly.fresh accounts.N.weekly.kind accounts.N.weekly.leftPct accounts.N.weekly.projected_from accounts.N.weekly.remaining_pct accounts.N.weekly.resetsAt accounts.N.weekly.resetsInSeconds accounts.N.weekly.resets_at accounts.N.weekly.resets_at_projected accounts.N.weekly.scope accounts.N.weekly.usedPct accounts.N.weekly.used_pct active active.auth_status active.auth_warning active.email active.fingerprint active.nested_config_warning active.source active.warning activeEmail floors floors.comfortable_pct floors.exhausted_pct floors.session_pct floors.weekly_pct peer recommendation recommendation.action recommendation.alias recommendation.best_alternative recommendation.best_alternative.email recommendation.best_alternative.weekly_left_pct recommendation.burn_down_hold recommendation.deadline_at recommendation.deadline_kind recommendation.email recommendation.from_cached_numbers recommendation.label recommendation.mode recommendation.mode_forced recommendation.reason recommendation.weekly_fresh "
 [ "$EX_JSON_PATHS" = "$EX_JSON_PATHS_WANT" ] \
   && ok "json byte-identity → every published key path is exactly what the dashboard was promised" \
   || bad "json byte-identity → key paths drifted:
@@ -4798,6 +4805,229 @@ ROTA_NUDGE_RESERVED=1 run_usage
 grep -q '^marked$' "$RUN/state/nudges" 2>/dev/null && grep -q '^listed$' "$RUN/state/nudges" 2>/dev/null \
   && ok "reserved seat → ROTA_NUDGE_RESERVED=1 overrides and both are nudged like any expired seat" \
   || bad "reserved seat → override must nudge (nudges: $(cat "$RUN/state/nudges" 2>/dev/null || echo none))"
+
+# --- 59. THE UNTOUCHED WEEKLY WINDOW STILL HAS A RESET, AND THIS BOX KNOWS IT ---
+# Measured 2026-09-04: the usage API answers `resets_at: null` for every window
+# whose utilization is exactly 0.0, i.e. for the seat with a whole untouched week
+# in it, while the reset instant itself is on a fixed 7-day cadence per seat. The
+# cache then OVERWROTE the last known instant with that empty value, so `cl
+# --list` printed "weekly reset unknown", sorted the healthiest seat LAST among
+# usable ones, and at 22:34 `cl` said USE NEXT: cs (resets Mon) while `cdt
+# accounts` said tommy (resets Sat 13:00) - two surfaces, one pool, two answers.
+#
+# The whole chain is pinned here: the cache REMEMBERS (wk_r_seen, never
+# overwritten by an empty, backfilled from an older row's wk_r), the engine
+# PROJECTS from it, the projection is published under its own key and never
+# blended into resets_at, it RANKS, and it renders with a `~` plus one legend.
+#
+# Instants are built from an epoch this scenario computes, not from iso_in, so
+# the expected projection is exact arithmetic rather than a second call to a
+# clock that has moved on.
+proj_fixture() {  # proj_fixture <name> <seen-iso-or-empty> [extra-cache-fields-json]
+  new_run "$1"
+  mkdir -p "$RUN/.claude-pool/fresh"
+  printf '{"claudeAiOauth":{"accessToken":"TOK-PROJ"}}' > "$RUN/.claude/.credentials.json"
+  cp "$RUN/.claude/.credentials.json" "$RUN/.claude-pool/fresh/.credentials.json"
+  printf '{"oauthAccount":{"emailAddress":"fresh@example.com"}}' > "$RUN/.claude-pool/fresh/.claude.json"
+  printf '{"oauthAccount":{"emailAddress":"fresh@example.com"}}' > "$RUN/.claude.json"
+  cat > "$RUN/cfg/accounts" <<EOF
+fresh@example.com|$RUN/.claude-pool/fresh
+EOF
+  # the row a PREVIOUS run left behind: a real weekly instant in wk_r and NO
+  # wk_r_seen, which is every row on disk the day this ships
+  jq -n --arg wr "${2:-}" \
+    '{"fresh@example.com":{wk_u:"12",wk_r:$wr,se_u:"5",se_r:"",ts:"Sep 01 09:00",ts_epoch:"1"}}' \
+    > "$RUN/cfg/usage-cache.json"
+  # the live answer for an untouched window, verbatim from the vendor
+  printf '{"five_hour":{"utilization":0.0,"resets_at":null},
+ "seven_day":{"utilization":0.0,"resets_at":null},
+ "seven_day_opus":null,"seven_day_sonnet":null,
+ "limits":[{"kind":"session","group":"session","percent":0,"resets_at":null,"scope":null},
+   {"kind":"weekly_all","group":"weekly","percent":0,"resets_at":null,"scope":null},
+   {"kind":"weekly_scoped","group":"weekly","percent":0,"resets_at":null,
+    "scope":{"model":{"id":null,"display_name":"Fable"}}}]}' \
+    > "$RUN/state/usage-TOK-PROJ.json"
+}
+
+# (a) a cache row that HAS an instant → project it forward a week at a time
+PROJ_SEEN_EPOCH=$(( $(date -u '+%s') - 3 * 86400 ))
+PROJ_SEEN="$(date -u -r "$PROJ_SEEN_EPOCH" '+%Y-%m-%dT%H:%M:%S.123456+00:00')"
+PROJ_WANT="$(date -u -r $(( PROJ_SEEN_EPOCH + 604800 )) '+%Y-%m-%dT%H:%M:%S+00:00')"
+proj_fixture projected "$PROJ_SEEN"
+set +e
+OUT="$(FAKE_NEW_EMAIL=fresh@example.com "$SCRIPT" usage --no-color 2>/dev/null)"
+VOUT="$(FAKE_NEW_EMAIL=fresh@example.com "$SCRIPT" usage --no-color --verbose 2>/dev/null)"
+JSON_OUT="$(FAKE_NEW_EMAIL=fresh@example.com "$SCRIPT" usage --json 2>/dev/null)"
+RC=$?
+set -e
+PJ_ROW="$(prow "fresh@example.com" "$JSON_OUT")"
+[ "$RC" -eq 0 ] && ok "projection → usage --json exits 0" || bad "projection → exits 0 (got $RC: $JSON_OUT)"
+[ "$(jq -r '.weekly.resets_at' <<<"$PJ_ROW")" = "null" ] \
+  && ok "projection → weekly.resets_at stays NULL: the vendor said nothing and the published field must not pretend otherwise" \
+  || bad "projection → resets_at must stay null (got: $(jq -c '.weekly' <<<"$PJ_ROW"))"
+[ "$(jq -r '.weekly.resets_at_projected' <<<"$PJ_ROW")" = "$PROJ_WANT" ] \
+  && ok "projection → resets_at_projected is the seen instant rolled forward whole weeks past now" \
+  || bad "projection → resets_at_projected (want $PROJ_WANT, got: $(jq -c '.weekly' <<<"$PJ_ROW"))"
+[ "$(jq -r '.weekly.projected_from' <<<"$PJ_ROW")" = "$PROJ_SEEN" ] \
+  && ok "projection → projected_from names the instant it was computed from, so the claim is checkable" \
+  || bad "projection → projected_from (want $PROJ_SEEN, got: $(jq -c '.weekly' <<<"$PJ_ROW"))"
+[ "$(jq -r '.weekly.fresh' <<<"$PJ_ROW")" = "true" ] \
+  && ok "projection → the window is still FRESH: a projection describes it, it does not change what it is" \
+  || bad "projection → the window stays fresh (got: $(jq -c '.weekly' <<<"$PJ_ROW"))"
+# ⚠️ THE MEMORY ITSELF. wk_r goes empty (that is what the API said) and wk_r_seen
+# keeps the instant, seeded from the pre-existing row: scenario (f) of the same fix.
+[ "$(jq -r '."fresh@example.com".wk_r_seen' "$RUN/cfg/usage-cache.json")" = "$PROJ_SEEN" ] \
+  && ok "projection → the cache KEEPS the last non-empty reset in wk_r_seen (backfilled from the old row's wk_r)" \
+  || bad "projection → wk_r_seen kept (got: $(cat "$RUN/cfg/usage-cache.json"))"
+[ "$(jq -r '."fresh@example.com".wk_r' "$RUN/cfg/usage-cache.json")" = "" ] \
+  && ok "projection → wk_r still records what THIS fetch said (empty), so the two fields cannot be confused" \
+  || bad "projection → wk_r holds this run's answer (got: $(cat "$RUN/cfg/usage-cache.json"))"
+grep -q 'resets ~in ' <<<"$OUT" \
+  && ok "projection → the ACTIVE weekly row prints the countdown with a leading ~" \
+  || bad "projection → the ~ countdown renders (got: $OUT)"
+grep -q "~ projected: window untouched since it rolled" <<<"$OUT" \
+  && ok "projection → ONE legend line under the table explains the ~" \
+  || bad "projection → the legend renders (got: $OUT)"
+grep -q 'resets  weekly resets ~' <<<"$VOUT" \
+  && ok "projection → --verbose names the projected instant, marked, instead of 'no active window yet'" \
+  || bad "projection → verbose detail (got: $VOUT)"
+
+# (b) nothing ever seen for this seat → NO projection, and no ~ anywhere
+proj_fixture noseen ""
+set +e
+OUT="$(FAKE_NEW_EMAIL=fresh@example.com "$SCRIPT" usage --no-color 2>/dev/null)"
+JSON_OUT="$(FAKE_NEW_EMAIL=fresh@example.com "$SCRIPT" usage --json 2>/dev/null)"
+set -e
+NS_ROW="$(prow "fresh@example.com" "$JSON_OUT")"
+[ "$(jq -r '[.weekly.resets_at, .weekly.resets_at_projected, .weekly.projected_from] | @csv' <<<"$NS_ROW")" = ',,' ] \
+  && ok "no seen instant → all three reset fields are null: an unknown cadence is not guessed" \
+  || bad "no seen instant → nothing is invented (got: $(jq -c '.weekly' <<<"$NS_ROW"))"
+grep -q 'no active window yet (starts on first use)' <<<"$OUT" \
+  && ok "no seen instant → the row keeps the honest FRESH phrase" \
+  || bad "no seen instant → keeps the fresh phrase (got: $OUT)"
+! grep -q '~ projected' <<<"$OUT" \
+  && ok "no seen instant → no legend for a mark that is not on the page" \
+  || bad "no seen instant → legend must be absent (got: $OUT)"
+
+# (c) an EXPIRED cached window is UNMEASURED, and must not be given a deadline.
+# Its number describes a window that no longer exists, so there is nothing to
+# project FROM: inventing a reset here would put a confident deadline on a row
+# whose whole point is "go and look, this may be full".
+proj_fixture expiredproj "$PROJ_SEEN"
+rm -f "$RUN/state/usage-TOK-PROJ.json"          # no live answer: the cache is all there is
+jq -n --arg wr "$(iso_in -2d)" \
+  '{"fresh@example.com":{wk_u:"40",wk_r:$wr,se_u:"5",se_r:"",ts:"Sep 01 09:00",ts_epoch:"1",wk_r_seen:$wr}}' \
+  > "$RUN/cfg/usage-cache.json"
+set +e
+JSON_OUT="$(FAKE_NEW_EMAIL=fresh@example.com "$SCRIPT" usage --json 2>/dev/null)"
+set -e
+EX_ROW="$(prow "fresh@example.com" "$JSON_OUT")"
+[ "$(jq -r '.weekly.expired' <<<"$EX_ROW")" = "true" ] \
+  && ok "expired window → still expired (the fixture is doing what it claims)" \
+  || bad "expired window → fixture (got: $(jq -c '.weekly' <<<"$EX_ROW"))"
+[ "$(jq -r '.weekly.resets_at_projected' <<<"$EX_ROW")" = "null" ] \
+  && ok "expired window → NO projection: an unmeasured row must not be handed a deadline" \
+  || bad "expired window → no projection (got: $(jq -c '.weekly' <<<"$EX_ROW"))"
+[ "$(jq -r '.unmeasured' <<<"$EX_ROW")" = "true" ] \
+  && ok "expired window → the row is still UNMEASURED, not quietly rescued by the projection" \
+  || bad "expired window → stays unmeasured (got: $EX_ROW)"
+
+# (d) THE RANKING. The projected seat loses its whole week on Saturday; the seat
+# with a real reset loses its on Thursday-week. Ranking the projected one as
+# "nothing expiring" (which is what an empty deadline does) sends the operator to
+# the wrong seat, which is the live defect this whole change exists to fix.
+new_run projrank
+mkdir -p "$RUN/.claude-pool/primary" "$RUN/.claude-pool/proj" "$RUN/.claude-pool/later"
+printf '{"claudeAiOauth":{"accessToken":"TOK-PR-PRIMARY"}}' > "$RUN/.claude/.credentials.json"
+cp "$RUN/.claude/.credentials.json" "$RUN/.claude-pool/primary/.credentials.json"
+printf '{"claudeAiOauth":{"accessToken":"TOK-PR-PROJ"}}'  > "$RUN/.claude-pool/proj/.credentials.json"
+printf '{"claudeAiOauth":{"accessToken":"TOK-PR-LATER"}}' > "$RUN/.claude-pool/later/.credentials.json"
+for a in primary proj later; do
+  printf '{"oauthAccount":{"emailAddress":"%s@example.com"}}' "$a" > "$RUN/.claude-pool/$a/.claude.json"
+done
+printf '{"oauthAccount":{"emailAddress":"primary@example.com"}}' > "$RUN/.claude.json"
+cat > "$RUN/cfg/accounts" <<EOF
+primary@example.com|$RUN/.claude-pool/primary
+proj@example.com|$RUN/.claude-pool/proj
+later@example.com|$RUN/.claude-pool/later
+EOF
+PR_SEEN_EPOCH=$(( $(date -u '+%s') - 5 * 86400 ))
+PR_SEEN="$(date -u -r "$PR_SEEN_EPOCH" '+%Y-%m-%dT%H:%M:%S.000000+00:00')"
+PR_WANT="$(date -u -r $(( PR_SEEN_EPOCH + 604800 )) '+%Y-%m-%dT%H:%M:%S+00:00')"   # ~2d out
+jq -n --arg wr "$PR_SEEN" \
+  '{"proj@example.com":{wk_u:"18",wk_r:$wr,se_u:"5",se_r:"",ts:"Sep 01 09:00",ts_epoch:"1",wk_r_seen:$wr}}' \
+  > "$RUN/cfg/usage-cache.json"
+printf '{"seven_day":{"utilization":0.0,"resets_at":null},"five_hour":{"utilization":0.0,"resets_at":null}}' \
+  > "$RUN/state/usage-TOK-PR-PROJ.json"
+printf '{"seven_day":{"utilization":30,"resets_at":"%s"},"five_hour":{"utilization":10,"resets_at":"%s"}}' \
+  "$(iso_in +5d)" "$(iso_in +2H)" > "$RUN/state/usage-TOK-PR-LATER.json"
+printf '{"seven_day":{"utilization":99,"resets_at":"%s"},"five_hour":{"utilization":15,"resets_at":"%s"}}' \
+  "$(iso_in +4d)" "$(iso_in +1H)" > "$RUN/state/usage-TOK-PR-PRIMARY.json"
+set +e
+JSON_OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --json 2>/dev/null)"
+set -e
+[ "$(jq -r '.recommendation.email' <<<"$JSON_OUT")" = "proj@example.com" ] \
+  && ok "projected ranking → the seat that loses its untouched week FIRST is the pick, not the one resetting later" \
+  || bad "projected ranking → picks proj (got: $(jq -c '.recommendation' <<<"$JSON_OUT"))"
+[ "$(jq -r '.recommendation.deadline_at' <<<"$JSON_OUT")" = "$PR_WANT" ] \
+  && ok "projected ranking → the published deadline IS the projected instant, so the sentence and the order agree" \
+  || bad "projected ranking → deadline_at (want $PR_WANT, got: $(jq -c '.recommendation' <<<"$JSON_OUT"))"
+[ "$(jq -r '.recommendation.deadline_kind' <<<"$JSON_OUT")" = "reset" ] \
+  && ok "projected ranking → the deadline is named a reset, which is what it is" \
+  || bad "projected ranking → deadline_kind (got: $(jq -c '.recommendation' <<<"$JSON_OUT"))"
+
+# (e) THE SECOND ROUTE TO THE SAME BLANK. weekly_binding picks the highest weekly
+# `limits` entry; the SCOPED one carries resets_at: null while its utilization is
+# 0 and weekly_all carries the instant. When the scoped entry binds, the row used
+# to publish no reset at all even with real weekly usage on the seat.
+new_run scopednullreset
+mkdir -p "$RUN/.claude-pool/solo"
+printf '{"claudeAiOauth":{"accessToken":"TOK-SCOPED-NULL"}}' > "$RUN/.claude/.credentials.json"
+cp "$RUN/.claude/.credentials.json" "$RUN/.claude-pool/solo/.credentials.json"
+printf '{"oauthAccount":{"emailAddress":"solo@example.com"}}' > "$RUN/.claude-pool/solo/.claude.json"
+printf '{"oauthAccount":{"emailAddress":"solo@example.com"}}' > "$RUN/.claude.json"
+cat > "$RUN/cfg/accounts" <<EOF
+solo@example.com|$RUN/.claude-pool/solo
+EOF
+SN_ALL_R="$(iso_in +3d)"; SN_FIVE_R="$(iso_in +2H)"
+printf '{"five_hour":{"utilization":10.0,"resets_at":"%s"},
+ "seven_day":{"utilization":21.0,"resets_at":"%s"},
+ "limits":[{"kind":"session","group":"session","percent":10,"resets_at":"%s","scope":null},
+   {"kind":"weekly_all","group":"weekly","percent":21,"resets_at":"%s","scope":null},
+   {"kind":"weekly_scoped","group":"weekly","percent":47,"resets_at":null,
+    "scope":{"model":{"id":null,"display_name":"Fable"}}}]}' \
+  "$SN_FIVE_R" "$SN_ALL_R" "$SN_FIVE_R" "$SN_ALL_R" > "$RUN/state/usage-TOK-SCOPED-NULL.json"
+set +e
+JSON_OUT="$(FAKE_NEW_EMAIL=solo@example.com "$SCRIPT" usage --json 2>/dev/null)"
+set -e
+SN_ROW="$(prow "solo@example.com" "$JSON_OUT")"
+[ "$(jq -r '[.weekly.kind, (.weekly.used_pct|tostring)] | join(" ")' <<<"$SN_ROW")" = "weekly_scoped 47" ] \
+  && ok "scoped null reset → the scoped entry BINDS and its 47% is the weekly figure (the fixture exercises the real path)" \
+  || bad "scoped null reset → scoped binds (got: $(jq -c '.weekly' <<<"$SN_ROW"))"
+[ "$(jq -r '.weekly.resets_at' <<<"$SN_ROW")" = "$SN_ALL_R" ] \
+  && ok "scoped null reset → weekly_all's instant fills in: a scoped cap shares the seat's weekly cadence" \
+  || bad "scoped null reset → weekly_all's instant is used (want $SN_ALL_R, got: $(jq -c '.weekly' <<<"$SN_ROW"))"
+[ "$(jq -r '.weekly.resets_at_projected' <<<"$SN_ROW")" = "null" ] \
+  && ok "scoped null reset → and it is a MEASURED instant, so nothing is projected" \
+  || bad "scoped null reset → no projection needed (got: $(jq -c '.weekly' <<<"$SN_ROW"))"
+
+# (f) the other half of the memory: a NON-EMPTY reading always updates wk_r_seen,
+# so the field tracks the seat's cadence forward instead of freezing on the first
+# instant this box ever saw.
+proj_fixture seenupdates "$PROJ_SEEN"
+SU_NEW_R="$(iso_in +4d)"
+printf '{"seven_day":{"utilization":30,"resets_at":"%s"},"five_hour":{"utilization":10,"resets_at":"%s"}}' \
+  "$SU_NEW_R" "$(iso_in +2H)" > "$RUN/state/usage-TOK-PROJ.json"
+set +e
+JSON_OUT="$(FAKE_NEW_EMAIL=fresh@example.com "$SCRIPT" usage --json 2>/dev/null)"
+set -e
+SU_ROW="$(prow "fresh@example.com" "$JSON_OUT")"
+[ "$(jq -r '."fresh@example.com".wk_r_seen' "$RUN/cfg/usage-cache.json")" = "$SU_NEW_R" ] \
+  && ok "seen updates → a non-empty reading overwrites wk_r_seen, so the remembered cadence follows the seat" \
+  || bad "seen updates → wk_r_seen follows the newest instant (got: $(cat "$RUN/cfg/usage-cache.json"))"
+[ "$(jq -r '.weekly.resets_at_projected' <<<"$SU_ROW")" = "null" ] \
+  && ok "seen updates → with a real reset in hand nothing is projected" \
+  || bad "seen updates → no projection alongside a real reset (got: $(jq -c '.weekly' <<<"$SU_ROW"))"
 
 restore_home
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
