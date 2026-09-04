@@ -179,3 +179,81 @@ seat_is_reserved() {  # seat_is_reserved <label> <dir>
   done < "$f"
   return 1
 }
+
+# ── THE WEEKLY CADENCE, ROLLED FORWARD ───────────────────────────────────────
+#
+# The usage API answers `resets_at: null` for any window whose utilization is
+# exactly 0.0, i.e. for a weekly window that has rolled and has not been spent
+# in since. That is not "unknown", it is "not reported while unused": the reset
+# instant sits on a FIXED 7-day cadence per seat (verified over three weeks on
+# this pool). So the last instant a box saw for a seat still names every future
+# reset that seat will have.
+#
+# HERE, not in either picker, for the same reason rota_seat_deadline is here:
+# rota-engine.sh's dashboard and rota-keeper.sh's unattended auto-switch both
+# have to answer "when does this untouched seat lose its week", and two copies
+# of a date calculation are two copies that can disagree about which seat is
+# most urgent. Each caller keeps its OWN guards (which windows may be projected
+# at all); this is only the arithmetic.
+#
+# ⚠️ MULTIPLICATION, NOT A LOOP: a seen instant from a mis-set clock or a
+# months-dead cache costs one division, never one iteration per week since.
+# Strictly after now, so an exact multiple of a week lands one week out rather
+# than on this instant.
+#
+# Prints the projected instant in the vendor's own shape (…+00:00) or NOTHING
+# when there is no instant to roll or date(1) cannot decode it: an empty answer
+# is a caller's cue to say "no window yet", never to print a guess.
+rota_roll_forward_weekly() {  # rota_roll_forward_weekly <seen-iso> [now-epoch] -> <iso>|""
+  local iso="${1:-}" now="${2:-}" base norm epoch k
+  local week=604800
+  [[ -n "$iso" ]] || return 0
+  # the API's stamps carry microseconds and an always-UTC offset
+  # (2026-09-05T10:59:59.760635+00:00); strip both before date(1) sees them.
+  base="${iso%%.*}"; norm="${base%%+*}"; norm="${norm%Z}"
+  epoch="$(date -j -u -f '%Y-%m-%dT%H:%M:%S' "$norm" '+%s' 2>/dev/null \
+           || date -u -d "$iso" '+%s' 2>/dev/null || true)"
+  [[ "$epoch" =~ ^[0-9]+$ ]] || return 0
+  [[ "$now" =~ ^[0-9]+$ ]] || now="$(date '+%s')"
+  k=0
+  (( epoch <= now )) && k=$(( (now - epoch) / week + 1 ))
+  date -u -r $(( epoch + k * week )) '+%Y-%m-%dT%H:%M:%S+00:00' 2>/dev/null \
+    || date -u -d "@$(( epoch + k * week ))" '+%Y-%m-%dT%H:%M:%S+00:00' 2>/dev/null || true
+}
+
+# ── THE USAGE-CACHE ROW, MERGED ──────────────────────────────────────────────
+#
+# ONE merge, because there are TWO writers: rota-engine.sh's cache_flush (once
+# per `rota usage` run) and rota-keeper.sh's fetch_usage (once per seat per
+# tick, every minute on the pool host). They wrote byte-identical jq, which is
+# exactly the arrangement rota_seat_deadline exists because of: the moment one
+# side learns something the other does not, the loser silently undoes it.
+#
+# ⚠️ wk_r_seen IS THE ONE FIELD AN EMPTY VALUE MAY NOT OVERWRITE. wk_r is what
+# the API said THIS fetch, and it is empty for an untouched window, so a plain
+# `.[$e] = {…}` erases the only record of the seat's cadence - with the keeper
+# writing every minute, faster than the dashboard could ever learn it. So:
+#   - a non-empty reading updates it
+#   - an empty one leaves whatever is there alone
+#   - a row written before this field existed SEEDS it from its own wk_r, so
+#     today's known instants survive the very next fresh read rather than the
+#     run after it
+#   - and when nothing has ever been seen there is no key at all, which every
+#     reader already maps to ""
+#
+# Prints the merged object on stdout. Prints NOTHING and returns non-zero when
+# jq refuses: a caller that quietly kept its input on failure would freeze every
+# field in the cache with nothing in the logs, so both callers say so out loud.
+rota_cache_merge_row() {  # rota_cache_merge_row <cache-json> <email> <wk_u> <wk_r> <se_u> <se_r> <ts> <ts-epoch> <fetched-at>
+  local out
+  out="$(jq --arg e "${2:-}" --arg wu "${3:-}" --arg wr "${4:-}" --arg su "${5:-}" \
+            --arg sr "${6:-}" --arg ts "${7:-}" --arg te "${8:-}" --arg fa "${9:-}" \
+            '.[$e] = ((.[$e] // {}) as $prev
+              | {wk_u:$wu,wk_r:$wr,se_u:$su,se_r:$sr,ts:$ts,ts_epoch:$te,fetched_at:$fa}
+              + (if   $wr != ""                       then {wk_r_seen:$wr}
+                 elif (($prev.wk_r_seen // "") != "") then {wk_r_seen:$prev.wk_r_seen}
+                 elif (($prev.wk_r // "") != "")      then {wk_r_seen:$prev.wk_r}
+                 else {} end))' <<<"${1:-\{\}}" 2>/dev/null)" || return 1
+  [[ -n "$out" ]] || return 1
+  printf '%s' "$out"
+}

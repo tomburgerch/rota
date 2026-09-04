@@ -2344,6 +2344,22 @@ cache_put() {  # cache_put <email> <wk_u> <wk_r> <se_u> <se_r>, queues; see cach
   CACHE_PEND_SEU+=("${4:-}"); CACHE_PEND_SER+=("${5:-}")
 }
 
+# ⚠️ A CACHE THAT STOPS UPDATING MUST NOT DO IT QUIETLY. The merge is one jq
+# invocation, and if a jq build ever rejects it EVERY field freezes, not just
+# the new one: the numbers would keep rendering, keep looking current, and keep
+# being last week's, which is the exact shape of confidently-wrong this whole
+# file argues against. So a failed merge says so on stderr, ONCE per run (the
+# same failure repeats per account and a wall of identical lines is its own way
+# of being ignored), and names the file so the next step is obvious.
+CACHE_MERGE_WARNED=0
+cache_merge_warn() {
+  (( CACHE_MERGE_WARNED )) && return 0
+  CACHE_MERGE_WARNED=1
+  printf 'rota: could NOT update the usage cache at %s (jq rejected the row merge). The numbers already on disk are being kept as they are; nothing new is being written, so every cached row will go on aging.\n' \
+    "$USAGE_CACHE" >&2
+  return 0
+}
+
 cache_flush() {
   (( ${#CACHE_PEND_EMAIL[@]} )) || return 0
   command -v jq >/dev/null 2>&1 || return 0
@@ -2358,28 +2374,20 @@ cache_flush() {
   # a corrupt cache (truncated write, disk hiccup) must SELF-HEAL: without
   # this every per-row jq below fails silently and the junk lives forever
   jq -e . <<<"$data" >/dev/null 2>&1 || data='{}'
-  # ⚠️ wk_r_seen IS THE ONE FIELD AN EMPTY VALUE MAY NOT OVERWRITE. wk_r is the
-  # weekly reset as the API answered it THIS run, and the API answers null for a
-  # window nothing has spent in yet (see window_fresh's FRESH state), so a fresh
-  # read used to erase the last instant this box ever saw for that seat. It was
-  # the only record of the seat's cadence, and losing it is why every surface
-  # printed "weekly reset unknown" for the healthiest seat in the pool.
-  # So: a non-empty reading updates it, an empty one leaves it alone, and a row
-  # written before this field existed SEEDS it from its own wk_r, so today's
-  # known instants survive the very next fresh read rather than the run after it.
-  # No key at all when nothing has ever been seen, which cache_get reads as "".
+  # The merge itself is rota_cache_merge_row (rota-ranking.sh), SHARED with the
+  # keeper's per-tick writer: see there for what wk_r_seen is and why an empty
+  # reading may not overwrite it. Two copies of this jq is how the two writers
+  # would come to disagree, and the keeper writes every minute.
+  local merged
   for (( idx = 0; idx < n; idx++ )); do
-    data="$(jq --arg e "${CACHE_PEND_EMAIL[$idx]}" --arg wu "${CACHE_PEND_WKU[$idx]}" \
-               --arg wr "${CACHE_PEND_WKR[$idx]}" --arg su "${CACHE_PEND_SEU[$idx]}" \
-               --arg sr "${CACHE_PEND_SER[$idx]}" --arg ts "$ts" --arg te "$te" \
-               --arg fa "$fa" \
-               '.[$e] = ((.[$e] // {}) as $prev
-                 | {wk_u:$wu,wk_r:$wr,se_u:$su,se_r:$sr,ts:$ts,ts_epoch:$te,fetched_at:$fa}
-                 + (if   $wr != ""                     then {wk_r_seen:$wr}
-                    elif (($prev.wk_r_seen // "") != "") then {wk_r_seen:$prev.wk_r_seen}
-                    elif (($prev.wk_r // "") != "")      then {wk_r_seen:$prev.wk_r}
-                    else {} end))' \
-               <<<"$data" 2>/dev/null || printf '%s' "$data")"
+    if merged="$(rota_cache_merge_row "$data" "${CACHE_PEND_EMAIL[$idx]}" \
+                   "${CACHE_PEND_WKU[$idx]}" "${CACHE_PEND_WKR[$idx]}" \
+                   "${CACHE_PEND_SEU[$idx]}" "${CACHE_PEND_SER[$idx]}" \
+                   "$ts" "$te" "$fa")"; then
+      data="$merged"
+    else
+      cache_merge_warn
+    fi
   done
   printf '%s' "$data" > "$USAGE_CACHE.tmp.$$" 2>/dev/null \
     && mv "$USAGE_CACHE.tmp.$$" "$USAGE_CACHE" || true
@@ -2423,9 +2431,10 @@ cache_get() {  # cache_get <email> → C_* globals
 # its own `resets_at_projected` key, and renders with a leading `~` everywhere,
 # so nothing can read it as something the vendor said.
 #
-# ⚠️ Multiplication, not a loop, the same rule rota-billing.sh's next_reset
-# spells out: a seen instant from a mis-set clock or a months-dead cache costs
-# one division, never one iteration per week since.
+# The arithmetic itself is rota_roll_forward_weekly (rota-ranking.sh), SHARED
+# with the keeper's unattended picker for the same reason rota_seat_deadline is
+# shared: two copies of "when does this untouched seat lose its week" is two
+# answers to the question that decides which seat gets used.
 #
 # SILENT (both values empty) wherever a projection would be a claim rather than
 # an inference: a real reset exists, the window is an EXPIRED cached one (its
@@ -2434,10 +2443,16 @@ cache_get() {  # cache_get <email> → C_* globals
 # or this box has never seen a reset for that email at all.
 U_WKP=(); U_WKPF=()
 project_weekly() {  # project_weekly <slot-index> → fills U_WKP/U_WKPF for that slot
-  local i="${1:-}" seen epoch now k proj week=604800
+  local i="${1:-}" seen proj
   [[ "$i" =~ ^[0-9]+$ ]] || return 0
   U_WKP[i]=""; U_WKPF[i]=""
   [[ -z "${U_WKR[$i]:-}" ]] || return 0
+  # ⚠️ DEFENSIVE, AND UNREACHABLE BY CONSTRUCTION TODAY: U_WKX==1 only ever comes
+  # from window_expired on the very stamp that would then be in U_WKR, so the
+  # guard above already caught it. It stays because the day some path sets an
+  # expired flag without a stamp, projecting there would put a confident deadline
+  # on a row whose whole point is "unmeasured, may be full". Exercised directly
+  # in tests/engine.test.sh (the projection unit case), not through a fixture.
   (( ${U_WKX[$i]:-0} == 0 )) || return 0
   [[ -n "$(remaining "${U_WKU[$i]:-}")" ]] || return 0
   [[ -n "${U_EMAIL[$i]:-}" ]] || return 0
@@ -2449,17 +2464,9 @@ project_weekly() {  # project_weekly <slot-index> → fills U_WKP/U_WKPF for tha
   # "unknown" for every seat, which is the exact state this exists to end.
   [[ -n "$seen" ]] || seen="$C_WKR"
   [[ -n "$seen" ]] || return 0
-  epoch="$(iso_epoch "$seen")"
-  [[ "$epoch" =~ ^[0-9]+$ ]] || return 0
-  now="$(date '+%s')"
-  # strictly after now: an exact multiple of a week lands one more week out, not on now
-  k=0
-  (( epoch <= now )) && k=$(( (now - epoch) / week + 1 ))
-  # epoch_iso answers the ...Z shape; the vendor's own resets_at ends +00:00, and
-  # this instant is read back by consumers already parsing the vendor's shape.
-  proj="$(epoch_iso $(( epoch + k * week )))"
+  proj="$(rota_roll_forward_weekly "$seen")"
   [[ -n "$proj" ]] || return 0
-  U_WKP[i]="${proj%Z}+00:00"
+  U_WKP[i]="$proj"
   U_WKPF[i]="$seen"
 }
 
@@ -3913,13 +3920,18 @@ active_burndown_hold() {   # 0 = hold the active account, 1 = let the ranking de
 # REC_BEST_USED is the incumbent's weekly USED %, carried only so the tie-break
 # (rule 3 in rota_deadline_beats) has something to compare against; it is never
 # printed.
+#
+# REC_PROJECTED says whether the instant in REC_RESET was MEASURED or inferred
+# from the seat's cadence (project_weekly). Every surface that prints it marks it
+# `~`, so a deadline this box worked out for itself can never be read as
+# something the vendor reported.
 REC_SLOT=-1; REC_EMAIL=""; REC_RESET=""; REC_FRESH=0; REC_CACHED=0
-REC_BEST_USED=""; REC_DEADLINE_KIND=""
+REC_BEST_USED=""; REC_DEADLINE_KIND=""; REC_PROJECTED=0
 REC_HOLD=0; REC_NEXT_EMAIL=""; REC_NEXT_ALIAS=""
 compute_recommendation() {  # compute_recommendation <exclude_active 0|1> <require_pool_dir 0|1> [allow_cached 0|1]
   local excl_active="${1:-0}" need_pool="${2:-0}" allow_cached="${3:-0}" i wkl sel cached_row
   REC_SLOT=-1; REC_EMAIL=""; REC_RESET=""; REC_FRESH=0; REC_CACHED=0
-  REC_BEST_USED=""; REC_DEADLINE_KIND=""
+  REC_BEST_USED=""; REC_DEADLINE_KIND=""; REC_PROJECTED=0
   REC_HOLD=0; REC_NEXT_EMAIL=""; REC_NEXT_ALIAS=""
   BURN_WKL=""; BURN_SEL=""; BURN_CACHED=0; BURN_BLOCKED=0
   resolve_mode
@@ -3978,11 +3990,21 @@ compute_recommendation() {  # compute_recommendation <exclude_active 0|1> <requi
        || rota_deadline_beats "$deadline" "$used_pct" "$REC_RESET" "$REC_BEST_USED"; then
       REC_SLOT="$i"; REC_RESET="$deadline"; REC_EMAIL="${U_EMAIL[$i]}"
       REC_BEST_USED="$used_pct"; REC_DEADLINE_KIND="$dl_kind"
-      # FRESH is "this row has no deadline at all", the empty-string sentinel,
-      # and it is what stops the sentences below naming an instant that does not
-      # exist. It is derived from the deadline rather than tracked separately, so
-      # the two can never say different things about the same pick.
-      REC_FRESH=0; [[ -n "$deadline" ]] || REC_FRESH=1
+      # ⚠️ FRESH IS A FACT ABOUT THE WINDOW, NOT ABOUT THE DEADLINE. It used to be
+      # "this row has no deadline at all" (the empty-string sentinel), which was
+      # the same thing right up until a PROJECTED reset gave an untouched window a
+      # deadline. Then the pick published weekly_fresh:false while its own
+      # accounts[].weekly.fresh stayed true - two published fields disagreeing
+      # about one window - and the honest "its weekly window has not started yet"
+      # sentence vanished exactly when it was still true. So it is window_fresh,
+      # the same predicate the row itself publishes, and the two cannot diverge.
+      REC_FRESH=0
+      window_fresh "${U_WKU[$i]}" "${U_WKR[$i]}" "${U_WKX[$i]}" && REC_FRESH=1
+      # Was the instant that ORDERED this pick measured or inferred? Only when the
+      # weekly reset bound it: a seat-end deadline is a date out of billing.json,
+      # which is nobody's projection.
+      REC_PROJECTED=0
+      [[ "$dl_kind" == "reset" && -z "${U_WKR[$i]}" && -n "${U_WKP[$i]:-}" ]] && REC_PROJECTED=1
       REC_CACHED="$cached_row"
     fi
   done
@@ -3999,7 +4021,17 @@ compute_recommendation() {  # compute_recommendation <exclude_active 0|1> <requi
     REC_HOLD=1
     REC_SLOT="$SHARED_SLOT"; REC_EMAIL="${U_EMAIL[$SHARED_SLOT]}"
     REC_RESET="${U_WKR[$SHARED_SLOT]}"
-    REC_FRESH=0; [[ -z "$REC_RESET" ]] && REC_FRESH=1
+    # A HOLD races the instant this window dies, and a projected one is still that
+    # instant: "nothing is expiring" was the sentence a known cadence disproves.
+    REC_PROJECTED=0
+    if [[ -z "$REC_RESET" && -n "${U_WKP[$SHARED_SLOT]:-}" ]]; then
+      REC_RESET="${U_WKP[$SHARED_SLOT]}"; REC_PROJECTED=1
+    fi
+    # window_fresh, not "REC_RESET is empty", for the reason spelled out above:
+    # the projection gives this window a deadline without making it any less
+    # unstarted, and this field has to agree with the row's own `weekly.fresh`.
+    REC_FRESH=0
+    window_fresh "${U_WKU[$SHARED_SLOT]}" "${U_WKR[$SHARED_SLOT]}" "${U_WKX[$SHARED_SLOT]}" && REC_FRESH=1
     # A HOLD is not a deadline pick: the hold sentence names the WEEKLY window it
     # is spending down, so the kind is stated rather than left over from whatever
     # the ranking had chosen before the override.
@@ -4399,6 +4431,19 @@ mode_note() {
   fi
 }
 
+# The PICK's own deadline, rendered, and marked `~` when it is a projection.
+#
+# ⚠️ ONE HELPER, BECAUSE THIS STRING IS PUBLISHED VERBATIM. recommendation_text's
+# output is `recommendation.reason` in `usage --json`, which `cl` and pocketmux
+# read, so an unmarked projected instant in this sentence is the same lie on the
+# machine surface as on the human one - and worse, because a parser cannot see
+# the table's legend. Every place that names REC_RESET goes through here.
+rec_reset_when() {
+  local mark=""
+  (( REC_PROJECTED )) && mark="~"
+  printf '%s%s' "$mark" "$(fmt_reset "$REC_RESET")"
+}
+
 recommendation_text() {
   local alias_of act_note="" awkl awku awkb
   # closing recommendation, it ALWAYS states the active account's standing, in
@@ -4415,10 +4460,13 @@ recommendation_text() {
       # bracket, so the sentence never ends in two adjacent parenthesised clauses
       awkb=""
       [[ -n "${U_WKS[$SHARED_SLOT]}" ]] && awkb="binding: ${U_WKS[$SHARED_SLOT]}, "
+      # weekly_reset_phrase, not reset_phrase: the active account's own window can
+      # be the untouched one, and this clause has to name its projected reset
+      # (marked) rather than claim nothing is expiring.
       if (( awkl < MIN_WEEKLY )); then
-        act_note=" The active account ${U_EMAIL[$SHARED_SLOT]} is nearly exhausted (weekly ${awku}% used · ${awkl}% left, ${awkb}$(reset_phrase "${U_WKR[$SHARED_SLOT]}"))."
+        act_note=" The active account ${U_EMAIL[$SHARED_SLOT]} is nearly exhausted (weekly ${awku}% used · ${awkl}% left, ${awkb}$(weekly_reset_phrase "$SHARED_SLOT"))."
       else
-        act_note=" The active account ${U_EMAIL[$SHARED_SLOT]} is at weekly ${awku}% used · ${awkl}% left (${awkb}$(reset_phrase "${U_WKR[$SHARED_SLOT]}"))."
+        act_note=" The active account ${U_EMAIL[$SHARED_SLOT]} is at weekly ${awku}% used · ${awkl}% left (${awkb}$(weekly_reset_phrase "$SHARED_SLOT"))."
       fi
     fi
   fi
@@ -4433,7 +4481,7 @@ recommendation_text() {
     [[ -n "${U_WKS[$SHARED_SLOT]}" ]] && bnote="binding: ${U_WKS[$SHARED_SLOT]}, "
     act_note="$(printf ' The active account %s still has weekly headroom (%s%% used · %s%% left, %s%s), but its 5h window is spent (%s%% used · %s%% left, %s), blocked right now, which is the one case where switching beats spending the week down.' \
       "${U_EMAIL[$SHARED_SLOT]}" "$(used "${U_WKU[$SHARED_SLOT]}")" "$BURN_WKL" \
-      "$bnote" "$(reset_phrase "${U_WKR[$SHARED_SLOT]}")" \
+      "$bnote" "$(weekly_reset_phrase "$SHARED_SLOT")" \
       "$(used "${U_SEU[$SHARED_SLOT]}")" "$BURN_SEL" "$(reset_phrase "${U_SER[$SHARED_SLOT]}")")"
   fi
   if (( REC_HOLD )); then
@@ -4443,6 +4491,11 @@ recommendation_text() {
     local when_clause next_note="" cache_note="" sess_note=""
     if [[ -n "${U_WKR[$SHARED_SLOT]}" ]]; then
       when_clause="spend it down before it $(reset_phrase "${U_WKR[$SHARED_SLOT]}")"
+    elif [[ -n "${U_WKP[$SHARED_SLOT]:-}" ]]; then
+      # "nothing is expiring" is what a KNOWN cadence disproves: the window has
+      # not started, and it still dies at the projected instant, which is exactly
+      # the date a burn-down hold is racing.
+      when_clause="its weekly window has not started yet, and on this seat's own cadence it is lost ~$(fmt_reset "${U_WKP[$SHARED_SLOT]}")"
     else
       when_clause="its weekly window has not started yet, so nothing is expiring"
     fi
@@ -4470,7 +4523,16 @@ recommendation_text() {
   elif (( REC_SLOT == SHARED_SLOT )); then
     # A FRESH pick has no reset time, so "no healthier account resets sooner" would be
     # naming an instant that does not exist. Say what is actually true of it instead.
-    if (( REC_FRESH )); then
+    if (( REC_FRESH )) && (( REC_PROJECTED )); then
+      # BOTH facts, because both are true and each one alone misleads: the window
+      # really has not started (so "resets in 2d" would overstate what is known),
+      # and it really does die on the seat's own cadence (so "nothing is expiring"
+      # would understate what is at stake).
+      printf '→ stay on %s: it is already active, its weekly window has not started yet (weekly %s%% used · %s%% left; 5h %s%% used · %s%% left); on this seat'"'"'s own cadence that untouched week is lost %s, and no healthier account has headroom expiring sooner.%s\n' \
+        "$REC_EMAIL" "$(used "${U_WKU[$REC_SLOT]}")" "$(remaining "${U_WKU[$REC_SLOT]}")" \
+        "$(used "${U_SEU[$REC_SLOT]}")" "$(remaining "${U_SEU[$REC_SLOT]}")" \
+        "$(rec_reset_when)" "$act_note"
+    elif (( REC_FRESH )); then
       printf '→ stay on %s: it is already active, its weekly window has not started yet (weekly %s%% used · %s%% left; 5h %s%% used · %s%% left) and no healthier account has headroom expiring sooner.%s\n' \
         "$REC_EMAIL" "$(used "${U_WKU[$REC_SLOT]}")" "$(remaining "${U_WKU[$REC_SLOT]}")" \
         "$(used "${U_SEU[$REC_SLOT]}")" "$(remaining "${U_SEU[$REC_SLOT]}")" "$act_note"
@@ -4483,11 +4545,12 @@ recommendation_text() {
     alias_of="$(basename "${DIRS[$REC_SLOT]}")"
     # shellcheck disable=SC2016  # literal backticks around the command to run
     printf '→ switch to %s: `rota switch %s`\n' "$REC_EMAIL" "$alias_of"
-    if (( REC_FRESH )); then
-      printf '  a fully unspent account: its weekly window has not started yet (weekly %s%% used · %s%% left; 5h %s%% used · %s%% left), and no account clearing the health floor has headroom expiring sooner.%s\n' \
-        "$(used "${U_WKU[$REC_SLOT]}")" "$(remaining "${U_WKU[$REC_SLOT]}")" \
-        "$(used "${U_SEU[$REC_SLOT]}")" "$(remaining "${U_SEU[$REC_SLOT]}")" "$act_note"
-    elif [[ "$REC_DEADLINE_KIND" == "seat-end" ]]; then
+    # ⚠️ SEAT-END IS TESTED FIRST, and that order is load-bearing since REC_FRESH
+    # became a fact about the WINDOW. A fresh window on a seat whose END DATE bound
+    # the pick used to fall through here because REC_FRESH was derived from the
+    # deadline; now both can be true at once, and the sentence that must win is the
+    # one naming the date that actually chose this seat.
+    if [[ "$REC_DEADLINE_KIND" == "seat-end" ]]; then
       # ⚠️ NAME THE DATE THAT ACTUALLY BOUND THE CHOICE. The ranking is
       # min(weekly reset, seat end), so on a cancelled seat's FINAL partial week
       # the winner is chosen by its END DATE - and this sentence used to call
@@ -4500,11 +4563,23 @@ recommendation_text() {
         "$(seat_ends_on "$REC_SLOT")" \
         "$(used "${U_WKU[$REC_SLOT]}")" "$(remaining "${U_WKU[$REC_SLOT]}")" \
         "$(used "${U_SEU[$REC_SLOT]}")" "$(remaining "${U_SEU[$REC_SLOT]}")" "$act_note"
+    elif (( REC_FRESH )) && (( REC_PROJECTED )); then
+      # A fully unspent account that nonetheless has the soonest deadline, which
+      # is the whole point of projecting: both facts, one sentence, and the
+      # instant marked because this box computed it rather than read it.
+      printf '  a fully unspent account whose untouched week dies first: its weekly window has not started yet (weekly %s%% used · %s%% left; 5h %s%% used · %s%% left) and on this seat'"'"'s own cadence it is lost %s, sooner than any other account clearing the health floor.%s\n' \
+        "$(used "${U_WKU[$REC_SLOT]}")" "$(remaining "${U_WKU[$REC_SLOT]}")" \
+        "$(used "${U_SEU[$REC_SLOT]}")" "$(remaining "${U_SEU[$REC_SLOT]}")" \
+        "$(rec_reset_when)" "$act_note"
+    elif (( REC_FRESH )); then
+      printf '  a fully unspent account: its weekly window has not started yet (weekly %s%% used · %s%% left; 5h %s%% used · %s%% left), and no account clearing the health floor has headroom expiring sooner.%s\n' \
+        "$(used "${U_WKU[$REC_SLOT]}")" "$(remaining "${U_WKU[$REC_SLOT]}")" \
+        "$(used "${U_SEU[$REC_SLOT]}")" "$(remaining "${U_SEU[$REC_SLOT]}")" "$act_note"
     else
       printf '  soonest weekly reset among the accounts clearing the health floor (weekly %s%% used · %s%% left; 5h %s%% used · %s%% left, resets %s), so that headroom gets spent before it expires.%s\n' \
         "$(used "${U_WKU[$REC_SLOT]}")" "$(remaining "${U_WKU[$REC_SLOT]}")" \
         "$(used "${U_SEU[$REC_SLOT]}")" "$(remaining "${U_SEU[$REC_SLOT]}")" \
-        "$(fmt_reset "$REC_RESET")" "$act_note"
+        "$(rec_reset_when)" "$act_note"
     fi
   fi
   mode_note
@@ -4652,19 +4727,36 @@ render_usage_table() {
   return 0
 }
 
-# ONE line explaining the `~`, and only when a `~` is actually on the page: a
-# legend for a mark nothing rendered is noise on every ordinary run, and noise is
-# what stops a legend being read on the run that needs it. Gated on the same
-# condition the mark itself is (no measured reset, a projection to show), so the
-# two can never disagree about whether the page has one.
+# Does THIS slot's weekly reset print as a projection? One predicate, so the mark
+# and the legend that explains it are decided by the same test.
+slot_projected() {  # slot_projected <slot-index>
+  [[ -z "${U_WKR[$1]:-}" && -n "${U_WKP[$1]:-}" ]]
+}
+
+# ONE line explaining the `~`, and only when a `~` is actually ON THE PAGE.
+#
+# ⚠️ THE GATE IS WHAT WAS RENDERED, NOT WHAT THE POOL CONTAINS. The default table
+# prints a weekly reset for the ACTIVE row only: render_alt_row and
+# render_unavail_row print no reset at all, so scanning every slot announced a
+# legend for a mark nowhere on the page whenever an idle seat projected and the
+# active one had a real instant. --verbose is the case where every slot can show
+# one, because render_verbose_detail prints a `resets` line per row.
 render_projection_legend() {
   local i
-  for i in "${!DIRS[@]}"; do
-    [[ -z "${U_WKR[$i]:-}" && -n "${U_WKP[$i]:-}" ]] || continue
-    printf '  %s\n\n' "$(paint "$CLR_DIM" "~ projected: window untouched since it rolled, so the vendor reports no reset yet; date = the seat's last known reset rolled forward a week at a time")"
+  if (( VERBOSE )); then
+    for i in "${!DIRS[@]}"; do
+      slot_projected "$i" || continue
+      print_projection_legend; return 0
+    done
     return 0
-  done
-  return 0
+  fi
+  (( SHARED_SLOT >= 0 )) || return 0
+  slot_projected "$SHARED_SLOT" || return 0
+  print_projection_legend
+}
+
+print_projection_legend() {
+  printf '  %s\n\n' "$(paint "$CLR_DIM" "~ projected: window untouched since it rolled, so the vendor reports no reset yet; date = the seat's last known reset rolled forward a week at a time")"
 }
 
 # recommendation_text is left byte-for-byte alone on purpose: `usage --json`
@@ -5540,6 +5632,11 @@ json_usage() {
   # by hand. Do NOT extend this rename to `weekly_resets_at` elsewhere - on
   # `cdt billing --json`'s per-account rows, and on this file's own
   # `accounts[].weekly.resets_at`, that name is correct and load-bearing.
+  #
+  # ⚠️ AND `deadline_projected` BESIDE THEM, for the same reason the kind is
+  # there: a bare instant cannot say whether the vendor reported it or this box
+  # inferred it from the seat's cadence, and `deadline_at` can now be either.
+  # The human surfaces mark the difference with `~`; a parser gets the boolean.
   local action="none" rec_email="null" rec_alias="null" rec_label="null"
   local rec_deadline="null" rec_deadline_kind="null"
   local rec_fresh=false
@@ -5581,6 +5678,7 @@ json_usage() {
     --argjson rec_email "$rec_email" --argjson rec_alias "$rec_alias" \
     --argjson rec_label "$rec_label" --argjson rec_deadline "$rec_deadline" \
     --argjson rec_deadline_kind "$rec_deadline_kind" \
+    --argjson rec_projected "$( (( REC_PROJECTED )) && echo true || echo false )" \
     --argjson rec_fresh "$rec_fresh" \
     --argjson rec_cached "$( (( REC_CACHED )) && echo true || echo false )" \
     --argjson rec_hold "$( (( REC_HOLD )) && echo true || echo false )" \
@@ -5609,6 +5707,7 @@ json_usage() {
       recommendation:{action:$action, email:$rec_email, label:$rec_label,
                       alias:$rec_alias,
                       deadline_at:$rec_deadline, deadline_kind:$rec_deadline_kind,
+                      deadline_projected:$rec_projected,
                       weekly_fresh:$rec_fresh,
                       from_cached_numbers:$rec_cached,
                       mode:$mode, mode_forced:$mode_forced,
@@ -5873,7 +5972,14 @@ main() {
       # a FRESH pick has no reset instant; printing "weekly resets " with nothing after
       # it would read as a lost timestamp rather than as an unstarted window
       local pick_when="weekly window not started yet"
-      [[ -n "$REC_RESET" ]] && pick_when="weekly resets $REC_RESET"
+      # `~` when the instant is a projection, the same mark the tables and the
+      # rationale sentence use: this line is the only record of why an unattended
+      # switch chose this seat, and an unmarked inference in it reads as a
+      # measurement forever after.
+      if [[ -n "$REC_RESET" ]]; then
+        if (( REC_PROJECTED )); then pick_when="weekly resets ~$REC_RESET"
+        else pick_when="weekly resets $REC_RESET"; fi
+      fi
       # the cached-fallback marker is a SUFFIX, so the live-numbers line, the one
       # the operator sees every day, is byte-for-byte what it has always been
       local pick_src=""

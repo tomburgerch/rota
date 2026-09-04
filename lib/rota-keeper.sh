@@ -956,7 +956,10 @@ nudge_account() {  # nudge_account <label> <dir> <why>
 
 # ── usage fetch (one per account per tick), cache_flush's row shape ──────────
 # Per-label results for this tick, consumed by auto-switch + warming.
-U_LBL=(); U_WK=(); U_WKR=(); U_SE=(); U_SER=()
+# U_WKP is the PROJECTED weekly reset (weekly_projection), empty unless the API
+# named none for a window that still parses. It is a separate array, never mixed
+# into U_WKR, so nothing downstream can lose track of which of the two it holds.
+U_LBL=(); U_WK=(); U_WKR=(); U_SE=(); U_SER=(); U_WKP=()
 FETCHED=0
 usage_for() {  # usage_for <label> → index into U_* or empty
   local i
@@ -1012,32 +1015,69 @@ fetch_usage() {  # fetch_usage <label> <dir>
   IFS=$'\x1f' read -r wk wk_r se se_r <<<"$row"
   U_LBL+=("$label"); U_WK+=("$wk"); U_WKR+=("$wk_r"); U_SE+=("$se"); U_SER+=("$se_r")
   FETCHED=$((FETCHED + 1))
+  # ⚠️ THE PROJECTION IS TAKEN BEFORE THE WRITE BELOW, deliberately: the row
+  # still on disk holds the PREVIOUS reading, and on an untouched window that is
+  # the only instant there is to project from (this fetch answered null). Same
+  # ordering, same reason, as rota-engine.sh's live path.
+  U_WKP+=("$(weekly_projection "$label" "$wk" "$wk_r")")
   # cache row, cache_flush's exact shape + fetched_at
-  local data ts te fa
+  local data ts te fa merged
   ts="$(date '+%b %d %H:%M')"; te="$(date '+%s')"; fa="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   mkdir -p "$CFG_DIR"
   data="$(cat "$USAGE_CACHE" 2>/dev/null || echo '{}')"
   # a corrupt cache (truncated write, disk hiccup) must SELF-HEAL: without
   # this the jq below fails and the junk file lives forever (stage-2 review)
   jq -e . <<<"$data" >/dev/null 2>&1 || data='{}'
-  # ⚠️ wk_r_seen SURVIVES THIS WRITE, exactly as it does in cache_flush, and the
-  # jq is deliberately identical. This runs every minute on the pool host, so a
-  # `.[$e]=` that dropped the field would erase the seat's remembered weekly
-  # cadence within a tick of the dashboard learning it, and `rota usage` would go
-  # back to "weekly reset unknown" for every untouched window with nothing in the
-  # logs to say why. See rota-engine.sh's cache_flush for what the field is for.
-  data="$(jq --arg e "$label" --arg wu "$wk" --arg wr "$wk_r" --arg su "$se" \
-             --arg sr "$se_r" --arg ts "$ts" --arg te "$te" --arg fa "$fa" \
-             '.[$e] = ((.[$e] // {}) as $prev
-               | {wk_u:$wu,wk_r:$wr,se_u:$su,se_r:$sr,ts:$ts,ts_epoch:$te,fetched_at:$fa}
-               + (if   $wr != ""                       then {wk_r_seen:$wr}
-                  elif (($prev.wk_r_seen // "") != "") then {wk_r_seen:$prev.wk_r_seen}
-                  elif (($prev.wk_r // "") != "")      then {wk_r_seen:$prev.wk_r}
-                  else {} end))' \
-             <<<"$data" 2>/dev/null || printf '%s' "$data")"
+  # The merge is rota_cache_merge_row (rota-ranking.sh), the SAME function
+  # rota-engine.sh's cache_flush calls. It used to be a copy of that jq here, and
+  # a copy is how the two writers come to disagree about a field - which matters
+  # more for this writer than any other, because it runs every minute on the pool
+  # host and would win every race. See there for what wk_r_seen is.
+  if merged="$(rota_cache_merge_row "$data" "$label" "$wk" "$wk_r" "$se" "$se_r" "$ts" "$te" "$fa")"; then
+    data="$merged"
+    log_state_clear "cache-merge"
+  else
+    # ⚠️ NEVER SILENTLY. A rejected merge freezes EVERY field in the cache, not
+    # just the new one, and this process has no terminal to complain to, so it
+    # goes in the log - once per state, so a persistent failure is one line and
+    # not a minute-by-minute wall.
+    log_once "cache-merge" "fail" "usage cache at $USAGE_CACHE could NOT be updated (jq rejected the row merge); cached numbers are being kept as they are and will go on aging"
+  fi
   printf '%s' "$data" > "$USAGE_CACHE.tmp.$$" 2>/dev/null \
     && mv "$USAGE_CACHE.tmp.$$" "$USAGE_CACHE" || rm -f "$USAGE_CACHE.tmp.$$"
   return 0
+}
+
+# ── the untouched window's reset, for the UNATTENDED picker ──────────────────
+#
+# ⚠️ THE KEEPER HAS TO ANSWER THIS TOO, OR IT DISAGREES WITH EVERY OTHER SURFACE.
+# It fetches /api/oauth/usage itself rather than reading `rota usage --json`, so
+# when the API answers `resets_at: null` for a window nothing has spent in yet,
+# its `jreset` is empty, rota_seat_deadline gets nothing, and rota_deadline_beats
+# ranks that seat LAST ("nothing expiring") - while `rota usage`, `rota billing`
+# and `cl` now rank it by its projected reset. The 90%-wall auto-switch would
+# then send him somewhere the dashboard says is wrong, unattended, at 03:00.
+#
+# Same guards as the engine's project_weekly, minus the ones that cannot arise
+# here: this only ever runs on a LIVE fetch, so there is no expired-cache case.
+# Empty answer for anything unknown; nothing is ever guessed.
+weekly_projection() {  # weekly_projection <label> <weekly-used> <weekly-reset> -> <iso>|""
+  local label="${1:-}" wk="${2:-}" wk_r="${3:-}" seen
+  [[ -z "$wk_r" ]] || return 0                    # a measured instant needs no projection
+  [[ -n "$(pct_int "$wk")" ]] || return 0         # no usable number → nothing to describe
+  [[ -n "$label" && -f "$USAGE_CACHE" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  # wk_r_seen first, then the row's own wk_r for a row written before the field
+  # existed: the same read-side backfill project_weekly does, so the first tick
+  # after an upgrade is already right rather than the one after it.
+  # ⚠️ NOT `.wk_r_seen // .wk_r`: in jq only null and false are falsy, so an
+  # empty-STRING wk_r_seen (a hand-edited row, a row from another writer) would
+  # win the `//` and silently answer "". The test is explicit for that reason.
+  seen="$(jq -r --arg e "$label" '(.[$e] // {})
+            | (if (.wk_r_seen // "") != "" then .wk_r_seen else (.wk_r // "") end)' \
+          "$USAGE_CACHE" 2>/dev/null || true)"
+  [[ -n "$seen" ]] || return 0
+  rota_roll_forward_weekly "$seen"
 }
 
 pct_int() {  # "91.5" → 91, "" → empty
@@ -1294,8 +1334,8 @@ main() {
       # exact tie on the deadline keeps the old rule as the tie-break (lowest
       # utilization wins), so the pick stays deterministic where the newer
       # policy is silent.
-      local best=-1 best_wk="" best_reset="" best_deadline="" best_kind=""
-      local j jwk jreset jends jpair jdeadline jkind
+      local best=-1 best_wk="" best_reset="" best_deadline="" best_kind="" best_proj=0
+      local j jwk jreset jends jpair jdeadline jkind jproj
       for j in "${!DIRS[@]}"; do
         [[ "${LABELS[$j]}" == "$claim" ]] && continue
         cred="${DIRS[$j]}/.credentials.json"
@@ -1308,6 +1348,16 @@ main() {
         (( jwk > AUTO_SWITCH_TARGET_MAX_PCT )) && continue          # ceiling
         (( 100 - jwk < AUTO_SWITCH_TARGET_MIN_LEFT_PCT )) && continue  # headroom floor
         jreset="${U_WKR[$ui]}"
+        # ⚠️ A PROJECTED RESET IS FED IN AS A REAL ONE, and it has to be: an
+        # untouched weekly window loses its whole allowance on the seat's own
+        # fixed cadence, so leaving jreset empty here tells rota_deadline_beats
+        # "nothing is expiring" and ranks the seat LAST - which is how this
+        # picker came to disagree with `rota usage` about which seat is urgent.
+        # The flag rides along so the log line can mark what it printed.
+        jproj=0
+        if [[ -z "$jreset" && -n "${U_WKP[$ui]:-}" ]]; then
+          jreset="${U_WKP[$ui]}"; jproj=1
+        fi
         # The seat's own end date, keyed by the label, which IS the login email
         # and is what billing.json keys its accounts by.
         jends="$(rota_seat_field "$BILLING_JSON" "${LABELS[$j]}" 2)"
@@ -1317,6 +1367,10 @@ main() {
            || rota_deadline_beats "$jdeadline" "$jwk" "$best_deadline" "$best_wk"; then
           best="$j"; best_wk="$jwk"; best_reset="$jreset"
           best_deadline="$jdeadline"; best_kind="$jkind"
+          # only a RESET deadline can be the projected one; a seat-end is a date
+          # out of billing.json, which is nobody's inference
+          best_proj=0
+          (( jproj )) && [[ "$jkind" == "reset" ]] && best_proj=1
         fi
       done
       # hysteresis: don't bounce back to the account we switched OFF within
@@ -1339,7 +1393,14 @@ main() {
         # the wrong noun, and this line is the only record of why an unattended
         # switch happened at 03:00. best_kind comes out of the same
         # rota_seat_deadline call that produced the ordering.
+        #
+        # ⚠️ AND IT MARKS AN INFERENCE AS ONE. `~` means this box computed the
+        # instant from the seat's cadence because the vendor reported none for an
+        # untouched window (weekly_projection); the same mark `rota usage` and
+        # `rota billing` print. Reading this line back weeks later, a date that
+        # was never measured must not look like one that was.
         local why_clause="resets ${best_reset:-a fresh window}"
+        (( best_proj )) && why_clause="resets ~${best_reset} (projected from this seat's own cadence, the window is untouched so the API reports none)"
         [[ "$best_kind" == "seat-end" ]] \
           && why_clause="seat ENDS ${best_deadline%%T*}, before its weekly reset (${best_reset:-none}), so this is its LAST window"
         log "auto-switch: $claim at weekly ${wk:-?}% / 5h ${se:-?}% (threshold $AUTO_SWITCH_PCT%) → ${LABELS[$best]} (weekly ${best_wk}%, $why_clause, soonest-deadline pick above the ${AUTO_SWITCH_TARGET_MIN_LEFT_PCT}%-left floor)"
