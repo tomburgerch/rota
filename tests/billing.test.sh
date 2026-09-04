@@ -477,5 +477,86 @@ check "cancelled with no end date: the row says so with a '?' instead" \
   'grep "team@example.com" <<<"$OUT" | grep -q "CANCELLED, ends ?"'
 unset CLAUDE_BILLING_JSON
 
+# --- A PROJECTED WEEKLY RESET IS STILL A DEADLINE -----------------------------
+# The engine answers resets_at: null for a weekly window nothing has spent in yet
+# (the vendor does not report a reset it has no usage to measure against) and now
+# publishes the instant that window will actually hit as resets_at_projected. This
+# table used to inherit the null: the seat with a whole untouched week in it got a
+# `-` in QUOTA RESETS, no countdown, and sank to the bottom of USE NEXT. Measured
+# 2026-09-04 at 22:34: `cl --list` said cs (resets Monday) while `cdt accounts`
+# said tommy (resets Saturday 13:00), one pool, two answers.
+#
+# So weekly_resets_at is filled from the projection when the API named none, every
+# derived column simply works on it, and every printed instant carries a `~` with
+# one legend under the table saying what the mark means.
+PROJ_ISO="$(date -u -v+2d '+%Y-%m-%dT%H:%M:%S+00:00')"
+REAL_ISO="$(date -u -v+3d '+%Y-%m-%dT%H:%M:%S+00:00')"
+# the same strftime the table uses, so the expected cell is derived rather than typed
+cell_for() { python3 -c 'import sys
+from datetime import datetime
+print(datetime.fromisoformat(sys.argv[1]).astimezone().strftime("%a %d %b %H:%M"))' "$1"; }
+cat > "$LIB/rota-engine.sh" <<STUB
+#!/usr/bin/env bash
+[ "\${1:-}" = "usage" ] && [ "\${2:-}" = "--json" ] || { echo "stub: unexpected args: \$*" >&2; exit 9; }
+cat <<J
+{"generated_at":"$(date -u '+%Y-%m-%dT%H:%M:%SZ')","activeEmail":"work@example.com",
+ "floors":{"weekly_pct":20},"peer":null,
+ "accounts":[
+  {"label":"work@example.com","email":"work@example.com","alias":"work","active":true,
+   "data":"live","quota_data":"live","quota_source":null,
+   "quota_measured_at":"$(date -u '+%Y-%m-%dT%H:%M:%SZ')","unmeasured":false,
+   "seat":{"status":"active","ends":null,"ended":false},
+   "weekly":{"remaining_pct":55,"resets_at":"$REAL_ISO","expired":false,"fresh":false,
+             "resets_at_projected":null,"projected_from":null},
+   "five_hour":{"remaining_pct":80}},
+  {"label":"personal@example.com","email":"personal@example.com","alias":"personal","active":false,
+   "data":"live","quota_data":"live","quota_source":null,
+   "quota_measured_at":"$(date -u '+%Y-%m-%dT%H:%M:%SZ')","unmeasured":false,
+   "seat":{"status":"active","ends":null,"ended":false},
+   "weekly":{"remaining_pct":100,"resets_at":null,"expired":false,"fresh":true,
+             "resets_at_projected":"$PROJ_ISO","projected_from":"$(date -u -v-5d '+%Y-%m-%dT%H:%M:%S+00:00')"},
+   "five_hour":{"remaining_pct":100}}
+ ]}
+J
+STUB
+chmod +x "$LIB/rota-engine.sh"
+OUT="$("$LIB/rota-billing.sh" 2>"$TMP/err")"; RC=$?
+JOUT="$("$LIB/rota-billing.sh" --json 2>/dev/null)"
+check "projected: exit 0, no traceback" \
+  '[ "$RC" -eq 0 ] && ! grep -q "Traceback" "$TMP/err"'
+check "projected: QUOTA RESETS names the instant, marked with a ~" \
+  'grep "personal@example.com" <<<"$OUT" | grep -qF "~$(cell_for "$PROJ_ISO")"'
+check "projected: GONE IN counts down to it instead of showing a dash" \
+  'grep "personal@example.com" <<<"$OUT" | grep -qE " [0-9]+d [0-9]{2}h +~"'
+check "projected: the legend under the table explains the ~, once" \
+  '[ "$(grep -c "~ projected: window untouched since it rolled" <<<"$OUT")" = 1 ]'
+check "projected: json fills weekly_resets_at with the projected instant, under the published name" \
+  '[ "$(jrow "$JOUT" personal@example.com weekly_resets_at)" = "$PROJ_ISO" ]'
+check "projected: json flags it, so a consumer can tell an inference from a measurement" \
+  '[ "$(jrow "$JOUT" personal@example.com weekly_resets_projected)" = True ]'
+check "projected: next_weekly_reset is derived from it too" \
+  '[ "$(jrow "$JOUT" personal@example.com next_weekly_reset)" = "$PROJ_ISO" ]'
+check "projected: USE NEXT ranks on it, so the untouched seat is no longer sorted last" \
+  'grep -A1 "USE NEXT" <<<"$OUT" | grep -q "rota switch personal"'
+check "projected: and the sentence naming the instant marks it too" \
+  'grep -q "its weekly window resets first (~" <<<"$OUT"'
+check "projected: a MEASURED row carries no ~ anywhere on it" \
+  '! grep "work@example.com" <<<"$OUT" | grep -q "~"'
+check "projected: and its json flag is false" \
+  '[ "$(jrow "$JOUT" work@example.com weekly_resets_projected)" = False ]'
+check "projected: the wider cell does not push any column out of line" \
+  '[ "$(columns_line_up "$OUT")" = True ]'
+
+# With every reset measured there is no mark to explain, and the legend must not
+# appear: a legend for a mark nothing printed is noise on every ordinary run.
+sed -i.bak 's/"resets_at":null,"expired":false,"fresh":true/"resets_at":"'"$PROJ_ISO"'","expired":false,"fresh":false/' "$LIB/rota-engine.sh"
+sed -i.bak2 's/"resets_at_projected":"[^"]*"/"resets_at_projected":null/' "$LIB/rota-engine.sh"
+OUT="$("$LIB/rota-billing.sh" 2>/dev/null)"
+JOUT="$("$LIB/rota-billing.sh" --json 2>/dev/null)"
+check "measured: no ~ anywhere in the table" '! grep -q "~" <<<"$OUT"'
+check "measured: no legend line either"      '! grep -q "~ projected" <<<"$OUT"'
+check "measured: the flag is false for every row" \
+  '[ "$(python3 -c "import json,sys;print(any(a[\"weekly_resets_projected\"] for a in json.loads(sys.argv[1])[\"accounts\"]))" "$JOUT")" = False ]'
+
 printf 'billing.test.sh: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -194,6 +194,15 @@ def fmt(ts):
     dt = parse_ts(ts)
     return dt.astimezone().strftime('%a %d %b %H:%M') if dt else '-'
 
+# ⚠️ ONE MARK, EVERY PLACE THE INSTANT IS PRINTED. A projected reset is an
+# inference from the seat's cadence, not something the vendor said, and an
+# unmarked one in the USE NEXT sentence reads exactly like a measured one - the
+# same confidently-wrong shape the provenance markers and the UNMEASURED bucket
+# already exist to retire. So the mark is a function, not a `~` typed at one
+# call site, and the legend under the table explains it once.
+def reset_mark(r):
+    return '~' if r.get('weekly_resets_projected') else ''
+
 def fmt_date(d):
     """'1 Sep'. A '?' rather than a traceback when billing.json says cancelled and names no end date."""
     dt = parse_ts(d)
@@ -314,7 +323,21 @@ for a in usage.get('accounts', []):
         'alias': alias,
         'active_now': bool(a.get('active')),
         'weekly_left_pct': w.get('remaining_pct'),
-        'weekly_resets_at': w.get('resets_at'),
+        # ── THE RESET, MEASURED OR PROJECTED ─────────────────────────────────
+        # The engine answers resets_at: null for a weekly window nothing has
+        # spent in yet - the vendor does not report a reset it has no usage to
+        # measure against - and publishes the instant that window will actually
+        # hit as resets_at_projected (its own cadence, rolled forward). Under the
+        # PUBLISHED name, so `loses_at`, `next_reset`, `last_window`, the GONE IN
+        # column and the USE NEXT ranking all keep reading one field and simply
+        # stop treating an untouched seat as having no deadline: that is what had
+        # `cl --list` and `cdt accounts` naming two different seats at 22:34 on
+        # 2026-09-04. The flag beside it is how a reader (and the `cl` launcher)
+        # tells the two apart, and it is why every rendering of it carries a `~`.
+        # An older engine publishes neither key: `or None` → exactly today's
+        # behaviour, flag false.
+        'weekly_resets_at': w.get('resets_at') or w.get('resets_at_projected'),
+        'weekly_resets_projected': bool(not w.get('resets_at') and w.get('resets_at_projected')),
         'five_hour_left_pct': f.get('remaining_pct'),
         'five_hour_resets_at': f.get('resets_at'),
         # ── WHERE DID THIS NUMBER COME FROM, AND WHEN ────────────────────────
@@ -552,11 +575,25 @@ for r in rows:
     # actually see. On a last window the reset is dimmed: the seat will not live
     # to see it, and the column must not contradict the note beside it.
     gone = loses_at(r)
-    reset_plain = fmt(next_reset(r))
+    # The mark goes on the PLAIN string, before pad(), so the 17-wide column
+    # still counts the character it is actually printing: "~Sat 05 Sep 13:00" is
+    # 17 and fits exactly, and nothing to the right of it moves.
+    reset_plain = reset_mark(r) + fmt(next_reset(r))
     print(f"  {name} {pad(wk_plain, 21, wk_code)}  {fh_plain:>4}  "
           f"{countdown(gone):>8}  "
           f"{pad(reset_plain, 17, '90' if r['last_window'] else None)} {nc} "
           f"{r['amount']:>11}  {'  '.join(notes)}")
+
+# ── WHAT THE `~` IN THE QUOTA RESETS COLUMN MEANS ───────────────────────────
+# One line, and only when a row actually printed one: a legend for a mark that
+# is not on the page is noise on every ordinary run, and noise is what stops a
+# legend being read on the run that needs it. Same sentence, word for word, as
+# rota-engine.sh's own table prints, so the two surfaces explain the mark
+# identically rather than in two paraphrases that drift.
+PROJECTED_LEGEND = ("~ projected: window untouched since it rolled, so the vendor reports "
+                    "no reset yet; date = the seat's last known reset rolled forward a week at a time")
+if any(r['weekly_resets_projected'] for r in rows):
+    print("\n  " + c(PROJECTED_LEGEND, '2'))
 
 # ── WHAT TO DO ABOUT AN UNMEASURED ROW ──────────────────────────────────────
 # The MARKER belongs in the row (the ????????? cell). The INSTRUCTION does not:
@@ -634,7 +671,7 @@ if usable:
         why = (f"the seat ends {fmt_date(p['ends'])}, before its next "
                f"reset: this is its LAST window")
     else:
-        why = f"its weekly window resets first ({fmt(next_reset(p))}), so this is the quota closest to being lost"
+        why = f"its weekly window resets first ({reset_mark(p)}{fmt(next_reset(p))}), so this is the quota closest to being lost"
     print(f"\n  {c('USE NEXT', '1;32')}   {c(cmd, '1')}")
     print(f"     {p['account']} · {p['weekly_left_pct']}% weekly left · {why}")
     if p['active_now']:
@@ -646,7 +683,7 @@ if usable:
         # entire job is naming the weekday.
         def _resets(r):
             d = next_reset(r)
-            return d.astimezone().strftime('%a %-d %b') if d else '?'
+            return (reset_mark(r) + d.astimezone().strftime('%a %-d %b')) if d else '?'
         tail = '  ·  '.join(
             f"{r['alias'] or r['account']} ({r['weekly_left_pct']}%, resets {_resets(r)})"
             for r in rest)
@@ -660,7 +697,7 @@ else:
     soonest = min(cands, key=next_reset, default=None)
     msg = f"nothing clears the {floor}%-weekly floor"
     if soonest:
-        msg += f"; earliest back is {soonest['alias'] or soonest['account']} at {fmt(next_reset(soonest))}"
+        msg += f"; earliest back is {soonest['alias'] or soonest['account']} at {reset_mark(soonest)}{fmt(next_reset(soonest))}"
     print(f"\n  {c('USE NEXT', '1;31')}   {c(msg, '33')}")
 
 if held:

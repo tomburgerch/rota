@@ -1020,9 +1020,20 @@ fetch_usage() {  # fetch_usage <label> <dir>
   # a corrupt cache (truncated write, disk hiccup) must SELF-HEAL: without
   # this the jq below fails and the junk file lives forever (stage-2 review)
   jq -e . <<<"$data" >/dev/null 2>&1 || data='{}'
+  # ⚠️ wk_r_seen SURVIVES THIS WRITE, exactly as it does in cache_flush, and the
+  # jq is deliberately identical. This runs every minute on the pool host, so a
+  # `.[$e]=` that dropped the field would erase the seat's remembered weekly
+  # cadence within a tick of the dashboard learning it, and `rota usage` would go
+  # back to "weekly reset unknown" for every untouched window with nothing in the
+  # logs to say why. See rota-engine.sh's cache_flush for what the field is for.
   data="$(jq --arg e "$label" --arg wu "$wk" --arg wr "$wk_r" --arg su "$se" \
              --arg sr "$se_r" --arg ts "$ts" --arg te "$te" --arg fa "$fa" \
-             '.[$e]={wk_u:$wu,wk_r:$wr,se_u:$su,se_r:$sr,ts:$ts,ts_epoch:$te,fetched_at:$fa}' \
+             '.[$e] = ((.[$e] // {}) as $prev
+               | {wk_u:$wu,wk_r:$wr,se_u:$su,se_r:$sr,ts:$ts,ts_epoch:$te,fetched_at:$fa}
+               + (if   $wr != ""                       then {wk_r_seen:$wr}
+                  elif (($prev.wk_r_seen // "") != "") then {wk_r_seen:$prev.wk_r_seen}
+                  elif (($prev.wk_r // "") != "")      then {wk_r_seen:$prev.wk_r}
+                  else {} end))' \
              <<<"$data" 2>/dev/null || printf '%s' "$data")"
   printf '%s' "$data" > "$USAGE_CACHE.tmp.$$" 2>/dev/null \
     && mv "$USAGE_CACHE.tmp.$$" "$USAGE_CACHE" || rm -f "$USAGE_CACHE.tmp.$$"
