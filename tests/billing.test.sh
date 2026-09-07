@@ -477,5 +477,130 @@ check "cancelled with no end date: the row says so with a '?' instead" \
   'grep "team@example.com" <<<"$OUT" | grep -q "CANCELLED, ends ?"'
 unset CLAUDE_BILLING_JSON
 
+# --- A SEAT THAT HAS ALREADY ENDED IS NEVER A RECOMMENDATION -------------------
+# ⚠️ THE FAILURE THIS PREVENTS, measured on ballito the evening of 2026-09-07.
+# `rota billing` printed `USE NEXT rota switch thea` for a subscription that had
+# ended on the 6th, one line under a row reading `CANCELLED, ends 6 Sep`: the
+# table and the recommendation contradicting each other about the same seat. A
+# session launched onto it does not get 60% of a week, it gets an auth failure.
+#
+# loses_at() is min(next reset, seat end), so a seat whose end date is in the PAST
+# is keyed on a moment that has already gone by, and that sorts it FIRST - the
+# most-about-to-be-lost seat in the pool. The key was never wrong; the dead seat
+# had no business being in the ranked list.
+#
+# ⚠️ THE FIXTURE CARRIES A CANCELLED-BUT-LIVE SEAT ON PURPOSE (`soon`, ending
+# before its next reset), and it is what USE NEXT must pick. Cancellation is NOT
+# the exclusion - a cancelled seat's final window is the most use-it-or-lose-it
+# quota there is - and a "fix" that widened this to `status == cancelled` would
+# pass every other check below while quietly throwing that away.
+ED_BILL="$TMP/billing-ended.json"
+ED_PAST="$(date -v-1d '+%Y-%m-%d')"          # yesterday: this seat is over
+ED_PAST_H="$(date -v-1d '+%-d %b')"
+ED_SOON="$(date -v+2d '+%Y-%m-%d')"          # still alive, and dies before its reset
+cat > "$ED_BILL" <<J
+{"accounts":{
+  "work@example.com":{"plan":"Max 20x","renews_day":12,"amount_display":"\$200.00","usd_approx":200,"status":"active"},
+  "dead@example.com":{"plan":"Max 20x","renews_day":6,"amount_display":"\$200.00","usd_approx":200,"status":"cancelled","ends":"$ED_PAST"},
+  "soon@example.com":{"plan":"Max 5x","renews_day":9,"amount_display":"\$100.00","usd_approx":100,"status":"cancelled","ends":"$ED_SOON"}
+}}
+J
+
+write_ended_stub() {  # write_ended_stub <floor>
+  cat > "$LIB/rota-engine.sh" <<STUB
+#!/usr/bin/env bash
+[ "\${1:-}" = "usage" ] && [ "\${2:-}" = "--json" ] || { echo "stub: unexpected args: \$*" >&2; exit 9; }
+cat <<J
+{"generated_at":"$(date -u '+%Y-%m-%dT%H:%M:%SZ')","activeEmail":"work@example.com",
+ "floors":{"weekly_pct":$1},"peer":null,
+ "accounts":[
+  {"label":"work@example.com","email":"work@example.com","alias":"work","active":true,
+   "data":"live","quota_data":"live","quota_source":null,
+   "quota_measured_at":"$(date -u '+%Y-%m-%dT%H:%M:%SZ')","unmeasured":false,
+   "seat":{"status":"active","ends":null,"ended":false},
+   "weekly":{"remaining_pct":43,"resets_at":"$(date -u -v+5d '+%Y-%m-%dT%H:%M:%S+00:00')","expired":false},
+   "five_hour":{"remaining_pct":88}},
+  {"label":"dead@example.com","email":"dead@example.com","alias":"dead","active":false,
+   "config_dir":"$TMP/pool/dead",
+   "data":"cached","quota_data":"cached","quota_source":null,
+   "quota_measured_at":"$(date -u -v-1d '+%Y-%m-%dT%H:%M:%SZ')","unmeasured":false,
+   "seat":{"status":"cancelled","ends":"$ED_PAST","ended":true},
+   "weekly":{"remaining_pct":60,"resets_at":"$(date -u -v+4d '+%Y-%m-%dT%H:%M:%S+00:00')","expired":false},
+   "five_hour":{"remaining_pct":100}},
+  {"label":"soon@example.com","email":"soon@example.com","alias":"soon","active":false,
+   "data":"live","quota_data":"live","quota_source":null,
+   "quota_measured_at":"$(date -u '+%Y-%m-%dT%H:%M:%SZ')","unmeasured":false,
+   "seat":{"status":"cancelled","ends":"$ED_SOON","ended":false},
+   "weekly":{"remaining_pct":30,"resets_at":"$(date -u -v+6d '+%Y-%m-%dT%H:%M:%S+00:00')","expired":false},
+   "five_hour":{"remaining_pct":90}}
+ ]}
+J
+STUB
+  chmod +x "$LIB/rota-engine.sh"
+}
+
+export CLAUDE_BILLING_JSON="$ED_BILL"
+write_ended_stub 20
+OUT="$("$LIB/rota-billing.sh" 2>/dev/null)"
+JOUT="$("$LIB/rota-billing.sh" --json 2>/dev/null)"
+
+check "ended: USE NEXT does NOT name the seat that ended yesterday" \
+  '! grep -A2 "USE NEXT" <<<"$OUT" | grep -q "rota switch dead"'
+check "ended: and it is not smuggled into the 'then' tail either" \
+  '! grep -A2 "USE NEXT" <<<"$OUT" | grep -q "dead ("'
+check "ended: the cancelled-but-LIVE seat still wins, because its last window dies first" \
+  'grep -A1 "USE NEXT" <<<"$OUT" | grep -q "rota switch soon"'
+check "ended: and it is still called that seat's LAST window" \
+  'grep -A2 "USE NEXT" <<<"$OUT" | grep -q "LAST window"'
+check "ended: the withheld dead seat is named out loud, with the date the row shows" \
+  "grep -A1 '^  ENDED' <<<\"\$OUT\" | grep -q 'dead (60% left, ended $ED_PAST_H)'"
+check "ended: the block says the omission is permanent, not a flag away" \
+  'grep -A2 "^  ENDED" <<<"$OUT" | grep -q "no flag that ranks it"'
+check "ended: a cancelled seat that is still alive is NOT in that block" \
+  '! grep -A1 "^  ENDED" <<<"$OUT" | grep -q "soon"'
+check "ended: the row itself is unchanged - the table still shows its 60%" \
+  'grep "dead@example.com" <<<"$OUT" | grep -q " 60%"'
+
+# ⚠️ NOT EVEN WITH THE OVERRIDE. --include-reserved buys a reserved seat back
+# into the ranking because that seat's quota is real and somebody could decide to
+# spend it. A dead seat's is not real, so there is deliberately no twin flag, and
+# the one that exists must not resurrect it as a side effect.
+OUT2="$("$LIB/rota-billing.sh" --include-reserved 2>/dev/null)"
+check "ended: --include-reserved does not bring a dead seat back either" \
+  '! grep -A2 "USE NEXT" <<<"$OUT2" | grep -q "rota switch dead"'
+
+# ⚠️ ONE SEAT, ONE REASON, AND THE TERMINAL ONE WINS. A seat that is both
+# reserved and ended used to be listed under NOT OFFERED as "60% left → someone",
+# which promises its owner quota that no longer exists.
+mkdir -p "$TMP/pool/dead"
+printf 'owner=airmond-runner\nwhy=pushed to the runners\n' > "$TMP/pool/dead/RESERVED"
+OUT3="$("$LIB/rota-billing.sh" 2>/dev/null)"
+check "ended: a reserved AND ended seat is reported as ENDED" \
+  'grep -A1 "^  ENDED" <<<"$OUT3" | grep -q "dead ("'
+check "ended: and not offered to its owner as quota that is still there" \
+  '! grep -A1 "NOT OFFERED" <<<"$OUT3" | grep -q "dead ("'
+rm -rf "$TMP/pool/dead"
+
+# ⚠️ AN ENDED SEAT IS NOT AN "EARLIEST BACK": it is not coming back. next_reset()
+# names a real instant on a real calendar for an account that will not exist to
+# see it, and this line would send him to wait for it.
+write_ended_stub 99
+OUT="$("$LIB/rota-billing.sh" 2>/dev/null)"
+check "ended: with nothing over the floor, the dead seat is not the 'earliest back'" \
+  'grep -A1 "USE NEXT" <<<"$OUT" | grep -q "earliest back" && ! grep -A1 "USE NEXT" <<<"$OUT" | grep -q "earliest back is dead"'
+check "ended: a live seat is named as the earliest back instead" \
+  'grep -A1 "USE NEXT" <<<"$OUT" | grep -qE "earliest back is (work|soon)"'
+
+# The machine surface has to carry the fact the ranking used, or a --json consumer
+# re-deriving the pick inherits exactly the bug the table just stopped having -
+# which is what happened to the RESERVED exclusion on 2026-08-25.
+check "ended: json marks the dead seat under the engine's own field name" \
+  '[ "$(jrow "$JOUT" dead@example.com seat_ended)" = True ]'
+check "ended: json leaves a live seat alone" \
+  '[ "$(jrow "$JOUT" soon@example.com seat_ended)" = False ]'
+check "ended: json still publishes its weekly number, so nothing is hidden, only unranked" \
+  '[ "$(jrow "$JOUT" dead@example.com weekly_left_pct)" = 60 ]'
+unset CLAUDE_BILLING_JSON
+
 printf 'billing.test.sh: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
