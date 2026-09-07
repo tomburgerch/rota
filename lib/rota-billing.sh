@@ -611,16 +611,50 @@ floor = (usage.get('floors') or {}).get('weekly_pct', 20)
 # rank on, so the exclusion is spelled out rather than left to depend on a None
 # happening to fall under the floor: the day something hands these rows a
 # placeholder percentage, that accident would start recommending a guess.
+#
+# ⚠️ AND A SEAT THAT HAS ALREADY ENDED IS NEVER A RECOMMENDATION. On the evening
+# of 2026-09-07 this printed `rota switch thea` for a subscription that ended on
+# the 6th, with the row one line above it reading `CANCELLED, ends 6 Sep`: the
+# table and the recommendation contradicting each other on the same seat. A
+# session launched onto it does not get 60% of a week, it gets an auth failure.
+#
+# THE EXCLUSION IS NOT CANCELLATION - see the block above, and do not widen it
+# to `status == cancelled`: a cancelled seat with a FUTURE end date is a fine
+# pick, often the best one in the pool. It is the narrower fact that there is no
+# window left at all. loses_at() is min(next reset, seat end), so for an ended
+# seat the key is a moment that has already gone by, and that sorts it FIRST -
+# the most-about-to-be-lost seat in the list. The key is right; the seat had no
+# business being in the list. Fixing this by touching loses_at() or the sort
+# order would break the cancelled-but-live case that key exists for.
+#
+# `seat_ended`, not a date comparison written out again here: it is the field
+# this file already calls the only one that means the account is actually done,
+# and last_window() reads that same field, so a row's NOTES and the ranking
+# cannot disagree about whether a seat is over.
 usable = [r for r in rows if (r['weekly_left_pct'] or 0) >= floor
           and not is_unmeasured(r)
+          and not r['seat_ended']
           and (INCLUDE_RESERVED or not r['reserved'])]
 usable.sort(key=lambda r: (loses_at(r), -(r['weekly_left_pct'] or 0)))
 
 # Say what was withheld and why. A seat that silently vanishes from the ranking
 # is indistinguishable from one that is simply spent, which is how a reservation
 # gets quietly forgotten and then quietly violated.
+#
+# ⚠️ AN ENDED SEAT IS NOT "WITHHELD", IT IS OVER, so it is named below in its own
+# block and struck from this one. A seat that is both reserved and ended would
+# otherwise be advertised here as "95% left → airmond-runner", which promises its
+# owner quota that no longer exists. One seat, one reason, and the terminal one
+# wins.
 held = [r for r in rows if r['reserved'] and (r['weekly_left_pct'] or 0) >= floor
-        and not INCLUDE_RESERVED]
+        and not r['seat_ended'] and not INCLUDE_RESERVED]
+
+# The same sentence for the same reason, about the dead ones: these rows still
+# show a fat green bar, so an omission nobody explains reads as a bug in the
+# table rather than as a fact about the seat. --include-reserved has no twin
+# here on purpose; there is nothing left to include.
+ended_out = [r for r in rows if r['seat_ended'] and not is_unmeasured(r)
+             and (r['weekly_left_pct'] or 0) >= floor]
 
 print(f"\n  {c('monthly total (approx, seats that still charge):', '2')} ${total:,.2f}")
 
@@ -656,7 +690,14 @@ else:
     # and naming its next reset would tell you to wait for quota you might
     # already be holding, which is the same inversion the UNMEASURED bucket
     # exists to undo. The block above the total is its answer instead.
-    cands = [r for r in rows if not is_unmeasured(r) and next_reset(r)]
+    #
+    # ⚠️ AND AN ENDED SEAT IS NOT AN "EARLIEST BACK" EITHER: it is not coming
+    # back. next_reset() happily names the next weekly reset of a subscription
+    # that expired last week - a real instant, on a calendar, for an account that
+    # will not exist to see it - and this line would then tell him to sit and wait
+    # for it. Same field as the ranking above, for the same reason.
+    cands = [r for r in rows if not is_unmeasured(r) and not r['seat_ended']
+             and next_reset(r)]
     soonest = min(cands, key=next_reset, default=None)
     msg = f"nothing clears the {floor}%-weekly floor"
     if soonest:
@@ -677,6 +718,17 @@ if held:
     # wrong for most of the ways a reader got here - it would send them to a
     # command they did not type.
     print(f"     {c('reserved seats are excluded from the ranking; pass --include-reserved to rank them too', '2')}")
+
+if ended_out:
+    # The end date, not just the word: "ended" beside a 60% bar is a claim the
+    # reader will want to check against the row, and the row says `ends 6 Sep`.
+    # Alias, never account.split('@')[0], for the reason spelled out above NOT
+    # OFFERED - two seats can share a local-part.
+    detail = '  ·  '.join(
+        f"{r['alias'] or r['account']} ({r['weekly_left_pct']}% left, ended {fmt_date(r['ends'])})"
+        for r in ended_out)
+    print(f"\n  {c('ENDED', '1;31')}   {c(detail, '2')}")
+    print(f"     {c('the subscription is over, so that quota cannot be spent by anyone; there is no flag that ranks it', '2')}")
 
 missing = [r['account'] for r in rows if r['status'] == 'unknown']
 if missing:
