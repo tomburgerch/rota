@@ -2882,13 +2882,15 @@ seat_field() { rota_seat_field "$BILLING_JSON" "${1:-}" "${2:-}"; }
 # Has the seat itself ENDED? This is the ONLY one of the three states that means
 # "this account is finished", and it is a date comparison, never an inference
 # from a stale number.
+#
+# ⚠️ THE COMPARISON IS NOT WRITTEN HERE ANY MORE. rota_seat_ended
+# (rota-ranking.sh) owns it, for the same reason rota_seat_deadline owns the
+# ordering: rota-keeper.sh's unattended picker has to refuse exactly the seats
+# this surface refuses. It did not, and on 2026-09-07 that cost the box a day -
+# see the comment on rota_seat_ended. Do not re-inline the date compare.
 seat_ended() {  # seat_ended <slot-index>
   load_seats
-  local e="${U_EMAIL[$1]:-}" ends
-  [[ -n "$e" ]] || return 1
-  ends="$(seat_field "$e" 2)"
-  [[ -n "$ends" ]] || return 1
-  [[ "$ends" < "$(date '+%Y-%m-%d')" ]]
+  rota_seat_ended "$BILLING_JSON" "${U_EMAIL[$1]:-}"
 }
 
 # Temporary limit changes the vendor announces on its own site and no API
@@ -3819,6 +3821,15 @@ compute_recommendation() {  # compute_recommendation <exclude_active 0|1> <requi
     fi
     if (( need_pool )) && [[ "${DIRS[$i]}" -ef "$HOME/.claude" ]]; then
       U_REASON[i]="its home IS the shared ~/.claude, nothing to swap in"; continue
+    fi
+    # ⚠️ BEFORE THE NUMBERS, because an ended seat is not a measurement problem.
+    # Every filter below this line asks how much quota a row has left; this one
+    # asks whether the account still exists, and the answer outranks any number
+    # attached to it. Put it after the live/cached gate instead and a CACHED row
+    # for a dead seat is recommended on 19-hour-old numbers, which is precisely
+    # what "USE NEXT rota switch thea" was on 2026-09-07 (rota_seat_ended).
+    if seat_ended "$i"; then
+      U_REASON[i]="the seat itself ended $(seat_ends_on "$i"); quota it still reports cannot be spent"; continue
     fi
     if [[ "${U_STATE[$i]}" != "live" ]]; then
       # `peer` rides with `cached`, in BOTH directions: it is admitted only on the
