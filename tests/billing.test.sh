@@ -85,6 +85,30 @@ ERR="$(CLAUDE_FAILOVER_HOME="$TMP/empty" "$LIB/rota-billing.sh" 2>&1 >/dev/null)
 check "missing billing.json: exit 2"          '[ "$RC" -eq 2 ]'
 check "missing billing.json: tells how to create it from the example" 'grep -q "billing.example.json" <<<"$ERR"'
 
+# --- the pool host can live in a FILE, not only the environment ---------------
+# A laptop's pool host is a property of the machine; an env var only reaches the
+# shell that exported it, so the same command answered differently in a terminal
+# and under launchd. The file sits beside `accounts` and `peers`.
+printf '# the always-on box\nballito\n' > "$CFG/pool-host"
+# The reachability probe silences its own stderr, so the evidence that routing
+# happened is the fall-through warning, which names the host it could not reach.
+ERR="$("$LIB/rota-billing.sh" 2>&1 >/dev/null)"; RC=$?
+check "pool-host file: routes to the named box" 'grep -q "ballito unreachable" <<<"$ERR"'
+OUT="$("$LIB/rota-billing.sh" --local 2>"$TMP/err")"; RC=$?
+check "pool-host file: --local still reads this box"  '[ "$RC" -eq 0 ]'
+check "pool-host file: --local attempts no ssh"       '! grep -q "ssh must not be called" "$TMP/err"'
+ERR="$(ROTA_POOL_HOST=testbox "$LIB/rota-billing.sh" 2>&1 >/dev/null)"; RC=$?
+check "pool-host file: the environment wins over it"  '! grep -q "ssh must not be called" <<<"$ERR"'
+printf '  ballito  \nextra-host\n' > "$CFG/pool-host"
+ERR="$("$LIB/rota-billing.sh" 2>&1 >/dev/null)"
+check "pool-host file: first host only, whitespace stripped" 'grep -q "ballito unreachable" <<<"$ERR"'
+check "pool-host file: a second line is ignored, never dialled" '! grep -q "extra-host" <<<"$ERR"'
+printf '# only a comment\n\n' > "$CFG/pool-host"
+OUT="$("$LIB/rota-billing.sh" 2>"$TMP/err")"; RC=$?
+check "pool-host file: comments-only reads as unset"  '[ "$RC" -eq 0 ]'
+check "pool-host file: comments-only attempts no ssh" '! grep -q "ssh must not be called" "$TMP/err"'
+rm -f "$CFG/pool-host"
+
 # --- --local with a POOL_HOST set must not ssh --------------------------------
 OUT="$(ROTA_POOL_HOST=some-other-box "$LIB/rota-billing.sh" --local 2>"$TMP/err")"; RC=$?
 check "--local: exit 0 with POOL_HOST set"    '[ "$RC" -eq 0 ]'

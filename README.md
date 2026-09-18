@@ -99,6 +99,8 @@ State lives in `~/.config/claude-failover/` (the accounts map, `usage-cache.json
 
 A box that holds only some of the pool's credentials shows blank quota columns for the rest, because there is no token to measure them with. Copying the credentials over is the wrong fix: an OAuth refresh token is single-use, so the second copy husks the first. Instead list the box that does hold them in `~/.config/claude-failover/peers`, one ssh destination per line. `rota accounts` then reads those numbers over ssh, read-only, and marks the rows `[via <host>]` (with their age when the peer's own number is not fresh). See `config/peers.example`.
 
+A box that holds **no** seat at all is a different case: there are no rows to fill, so `peers` has nothing to work with and the table is empty. Name the box whose pool is THE pool in `~/.config/claude-failover/pool-host`, one ssh destination, and `rota billing` reads its table over ssh and says so above the output. `ROTA_POOL_HOST` does the same from the environment and wins over the file; the file exists because which box holds the pool is a property of the machine, and an env var never reaches launchd, an agent's shell or a cron. `--local` ignores both. See `config/pool-host.example`.
+
 Upgrade the peer to the same rota, or newer, in the same pass. Against an older peer it still works, but a borrowed row loses its age (freshness falls back to when the peer built its report, not when it measured the seat, so a days-old number can render as a bare `[via <host>]`) and loses its 5h reset instant. Both fields are new here.
 
 ## For Claude Code agents
