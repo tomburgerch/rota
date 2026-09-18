@@ -1,0 +1,25 @@
+# rota: the box whose ~/.claude-pool is THE pool, when it is not this one.
+#
+# Copy to $CLAUDE_FAILOVER_HOME/pool-host (default ~/.config/claude-failover/
+# pool-host). Machine-local, like `accounts` and `peers` - it names your
+# machines, so it never belongs in the repo. Absent (the default) means: this
+# box IS the pool host, read locally.
+#
+# WHY A FILE AND NOT JUST ROTA_POOL_HOST. The env var only reaches a shell that
+# exported it. On a laptop that means editing a dotfile and reloading, and it
+# still leaves every non-interactive caller - launchd, an agent's Bash tool, a
+# cron - reading the laptop's own near-empty pool and answering confidently for
+# the wrong machine. Which box holds the pool is a property of the MACHINE, so
+# it belongs beside the machine's other state. The environment still wins, so
+# `ROTA_POOL_HOST=other-box rota billing` overrides this for one run.
+#
+# FORMAT: one ssh destination. Blank lines and anything after a # are ignored;
+# the first host wins and the rest of the file is ignored, because "the pool"
+# is one place by definition (for BORROWING numbers from several boxes, that is
+# `peers`, which is a different thing and can list many).
+#
+# `rota billing --local` ignores this entirely and reads this box, which is how
+# the pool host's own copy answers when something routes to it.
+#
+# Example:
+# always-on-box

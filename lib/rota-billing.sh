@@ -38,14 +38,25 @@
 # stub. Measured once: the laptop held credentials for ONE of five seats, so
 # running this there answered "one usable seat", confidently, and wrong. A quota
 # table that silently describes the wrong machine is worse than no table, so
-# when ROTA_POOL_HOST is set and names another box, this ssh's to it and says
-# so. Unset (the default) means: this box IS the pool host, read locally.
+# when a pool host is set and names another box, this ssh's to it and says
+# so. Unset (the default) means: this box IS the pool host, read locally. It is
+# set either in the environment (ROTA_POOL_HOST) or, for a box where it is
+# simply true, in $CLAUDE_FAILOVER_HOME/pool-host — one line, like `peers`.
 
 set -euo pipefail
 ROTA_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CFG_DIR="${CLAUDE_FAILOVER_HOME:-$HOME/.config/claude-failover}"
 BILLING_JSON="${CLAUDE_BILLING_JSON:-$CFG_DIR/billing.json}"
 POOL_HOST="${ROTA_POOL_HOST:-${CLAUDE_POOL_HOST:-}}"
+# An env var only reaches a shell that exported it: on a laptop that means an
+# edit to a dotfile, a reload, and a table that is right in the terminal and
+# wrong in anything launchd or an agent starts. The pool host is a property of
+# the MACHINE, so it is also read from a one-line file beside the other
+# machine-local state (accounts, peers, billing.json) — env still wins, so a
+# one-off `ROTA_POOL_HOST=… rota billing` overrides it.
+if [ -z "$POOL_HOST" ] && [ -r "$CFG_DIR/pool-host" ]; then
+  POOL_HOST="$(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$CFG_DIR/pool-host" | grep -v '^$' | head -1 || true)"
+fi
 
 WANT_JSON=0
 FORCE_LOCAL=0
