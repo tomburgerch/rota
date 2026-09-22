@@ -1229,16 +1229,27 @@ main() {
     fetch_usage "${LABELS[$i]}" "${DIRS[$i]}" || true
   done
 
-  # 4. AUTO-SWITCH, the claim's binding weekly OR 5h utilization ≥ threshold
-  local claim="" ui="" wk="" se=""
+  # 4. AUTO-SWITCH, the claim's binding weekly OR 5h utilization ≥ threshold,
+  #    OR the claim's SEAT HAS ENDED (a wall no percentage can express)
+  local claim="" ui="" wk="" se="" claim_ended=0
   claim="$(jq -r '.oauthAccount.emailAddress // empty' "$HOME/.claude.json" 2>/dev/null || true)"
   if [[ -n "$claim" ]]; then
     ui="$(usage_for "$claim")"
     if [[ -n "$ui" ]]; then
       wk="$(pct_int "${U_WK[$ui]}")"; se="$(pct_int "${U_SE[$ui]}")"
     fi
-    if [[ -n "$wk" || -n "$se" ]] && { { [[ -n "$wk" ]] && (( wk >= AUTO_SWITCH_PCT )); } \
-                                        || { [[ -n "$se" ]] && (( se >= AUTO_SWITCH_PCT )); }; }; then
+    # ⚠️ THE THRESHOLD CANNOT SEE THIS ONE, AND THE POOL SAT ON IT FOR A DAY.
+    # A seat that has ended does not report 100% used; it reports NOTHING, so
+    # `wk`/`se` come back empty, the whole condition below is skipped, and the
+    # keeper holds the claim on a dead account tick after tick while every pane
+    # pinned to it fails. That is exactly what 2026-09-07 looked like on this
+    # pool (thea.hawk@, ended 6 Sep, still the claim on the 7th). Refusing to
+    # PICK an ended seat, the guard in the loop below, does not cover it: the
+    # seat was picked while it was alive and ended underneath the claim.
+    rota_seat_ended "$BILLING_JSON" "$claim" && claim_ended=1
+    if (( claim_ended )) \
+       || { [[ -n "$wk" || -n "$se" ]] && { { [[ -n "$wk" ]] && (( wk >= AUTO_SWITCH_PCT )); } \
+                                        || { [[ -n "$se" ]] && (( se >= AUTO_SWITCH_PCT )); }; }; }; then
       # THE KEEPER'S PICKER. NB a SECOND picker exists: the engine's
       # compute_recommendation (floor/burn-down modes) drives the interactive
       # `rota switch`/`rota usage` surfaces.
@@ -1290,6 +1301,15 @@ main() {
         cred="${DIRS[$j]}/.credentials.json"
         cred_is_complete "$cred" || continue
         refresh_known_dead "${LABELS[$j]}" "$cred" && continue
+        # ⚠️ AN ENDED SEAT IS RANKED FIRST BY THE SHARED ORDERING AND MUST NOT BE
+        # PICKED AT ALL. rota_seat_deadline is min(weekly reset, seat end), so a
+        # seat whose end date has passed carries the soonest deadline in the pool
+        # and wins every comparison below - the use-it-or-lose-it rule pointed at
+        # a seat that can no longer be used. Live on this pool 2026-09-07; the
+        # whole story is on rota_seat_ended (rota-ranking.sh). A credential can be
+        # perfectly complete and refresh cleanly on such a seat, so neither guard
+        # above catches it: the account authenticates and then refuses the work.
+        rota_seat_ended "$BILLING_JSON" "${LABELS[$j]}" && continue
         ui="$(usage_for "${LABELS[$j]}")"
         [[ -n "$ui" ]] || continue
         jwk="$(pct_int "${U_WK[$ui]}")"
@@ -1331,7 +1351,14 @@ main() {
         local why_clause="resets ${best_reset:-a fresh window}"
         [[ "$best_kind" == "seat-end" ]] \
           && why_clause="seat ENDS ${best_deadline%%T*}, before its weekly reset (${best_reset:-none}), so this is its LAST window"
-        log "auto-switch: $claim at weekly ${wk:-?}% / 5h ${se:-?}% (threshold $AUTO_SWITCH_PCT%) → ${LABELS[$best]} (weekly ${best_wk}%, $why_clause, soonest-deadline pick above the ${AUTO_SWITCH_TARGET_MIN_LEFT_PCT}%-left floor)"
+        # ⚠️ NAME THE TRIGGER THAT ACTUALLY FIRED. An ended claim reports no
+        # percentages at all, so the threshold sentence would render as
+        # "weekly ?% / 5h ?% (threshold 90%)" - a switch attributed to a wall it
+        # never hit, in the one log line that explains an unattended 03:00 move.
+        local trigger="at weekly ${wk:-?}% / 5h ${se:-?}% (threshold $AUTO_SWITCH_PCT%)"
+        (( claim_ended )) \
+          && trigger="ENDED $(rota_seat_field "$BILLING_JSON" "$claim" 2), the seat is over whatever quota it still reports"
+        log "auto-switch: $claim $trigger → ${LABELS[$best]} (weekly ${best_wk}%, $why_clause, soonest-deadline pick above the ${AUTO_SWITCH_TARGET_MIN_LEFT_PCT}%-left floor)"
         set +e
         sw_out="$(bash "$FAILOVER" "${sw_args[@]}" 2>&1)"
         sw_rc=$?
@@ -1339,7 +1366,11 @@ main() {
         if (( sw_rc == 0 )); then
           st_switch="to:${LABELS[$best]}"
           printf '%s %s %s\n' "$(date +%s)" "${LABELS[$best]}" "$claim" > "$LAST_SWITCH_FILE"
-          notify_once "auto-switch" "Switched to ${LABELS[$best]}: $claim hit ${wk:-?}% weekly / ${se:-?}% 5h."
+          if (( claim_ended )); then
+            notify_once "auto-switch" "Switched to ${LABELS[$best]}: $claim's seat ended $(rota_seat_field "$BILLING_JSON" "$claim" 2)."
+          else
+            notify_once "auto-switch" "Switched to ${LABELS[$best]}: $claim hit ${wk:-?}% weekly / ${se:-?}% 5h."
+          fi
           log "auto-switch: done, $sw_out"
           log_state_clear no-target
         else
@@ -1348,7 +1379,7 @@ main() {
         fi
       elif [[ "$st_switch" == "none" ]]; then
         # persists tick after tick while the wall stands, log ONCE per state
-        log_once no-target "$claim:$wk:$se" "auto-switch: $claim at weekly ${wk:-?}% / 5h ${se:-?}% ≥ $AUTO_SWITCH_PCT% but no eligible target (all above ${AUTO_SWITCH_TARGET_MAX_PCT}%, under the ${AUTO_SWITCH_TARGET_MIN_LEFT_PCT}%-left floor, dead, or unmeasured)"
+        log_once no-target "$claim:$wk:$se:$claim_ended" "auto-switch: $claim $( (( claim_ended )) && printf 'has ENDED' || printf "at weekly ${wk:-?}%% / 5h ${se:-?}%% ≥ $AUTO_SWITCH_PCT%%" ) but no eligible target (all above ${AUTO_SWITCH_TARGET_MAX_PCT}%, under the ${AUTO_SWITCH_TARGET_MIN_LEFT_PCT}%-left floor, ended, dead, or unmeasured)"
         st_switch="no-target"
       fi
     fi
