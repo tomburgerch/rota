@@ -1412,6 +1412,38 @@ set -e
   && ok "pool-init → second run is a byte-for-byte no-op" \
   || bad "pool-init → idempotence (got $RC: $OUT)"
 
+# first-run state (t_wvsjwh): every seat's .claude.json gets exactly the keys that
+# keep claude off its theme picker / onboarding / trust / what's-new screens, a
+# seat that already has them is not rewritten, and oauthAccount is never touched
+mk_fresh poolinitfirstrun
+mkdir -p "$RUN/code" "$RUN/.claude-pool/alpha"
+printf '{"oauthAccount":{"emailAddress":"%s"},"hasCompletedOnboarding":true,"lastOnboardingVersion":"1.0.0","lastReleaseNotesSeen":"1.0.0","projects":{"%s":{"hasTrustDialogAccepted":true}}}' \
+  "$(email_of alpha)" "$RUN/code" > "$RUN/.claude-pool/alpha/.claude.json"
+ALPHA_BEFORE="$(cat "$RUN/.claude-pool/alpha/.claude.json")"
+set +e
+OUT="$(ROTA_CLAUDE_VERSION=9.8.7 bash "$FAILOVER" pool-init 2>&1)"; RC=$?
+set -e
+FR_OK=1
+for a in "${ALIASES[@]}"; do
+  [ "$a" = alpha ] && continue
+  jq -e --arg d "$RUN/code" '.hasCompletedOnboarding == true
+      and .lastOnboardingVersion == "9.8.7" and .lastReleaseNotesSeen == "9.8.7"
+      and .projects[$d].hasTrustDialogAccepted == true' \
+    "$RUN/.claude-pool/$a/.claude.json" >/dev/null 2>&1 || FR_OK=0
+done
+[ "$RC" -eq 0 ] && [ "$FR_OK" -eq 1 ] \
+  && ok "pool-init → every new seat gets onboarding done, release notes seen and ~/code trusted" \
+  || bad "pool-init → first-run state (rc=$RC: $OUT)"
+[ "$(cat "$RUN/.claude-pool/alpha/.claude.json")" = "$ALPHA_BEFORE" ] \
+  && ok "pool-init → a seat that already starts clean is not rewritten (its login and older versions kept)" \
+  || bad "pool-init → rewrote a complete seat (got: $(cat "$RUN/.claude-pool/alpha/.claude.json"))"
+set +e
+OUT="$(ROTA_CLAUDE_VERSION=9.8.7 bash "$FAILOVER" pool-init 2>&1)"; RC=$?
+set -e
+[ "$RC" -eq 0 ] && grep -q 'already initialized' <<<"$OUT" \
+  && ok "pool-init → first-run seeding is idempotent" \
+  || bad "pool-init → first-run idempotence (got $RC: $OUT)"
+
 # a leading ~/ in the accounts file (what the README and the example use) means $HOME,
 # never a literal directory named "~" under the cwd
 mk_fresh poolinittilde

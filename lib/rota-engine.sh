@@ -529,7 +529,10 @@
 #                                     accounts). With NO accounts file it prints how to
 #                                     create one (config/accounts.example is the
 #                                     template) and exits 2. Creates and touches NO
-#                                     credential.
+#                                     credential. Also adds Claude Code's first-run
+#                                     state to each seat's .claude.json (onboarding
+#                                     done, release notes seen, ~/code trusted) when
+#                                     missing, so a seat opens straight on the prompt.
 #   rota failover roster              Print the roster (the accounts file), one
 #                                     "email|dir" per line. Read-only; the pool
 #                                     keeper's displaced-login detection consumes it.
@@ -1851,6 +1854,92 @@ then re-run: rota pool-init
 EOF
 }
 
+# ── first-run state: a seat must start straight into the prompt (t_wvsjwh) ──
+# A pool dir that was only ever logged in (never started interactively) makes
+# the next `claude` open on Claude Code's first-run screens: the theme picker,
+# the onboarding, "do you trust this folder", "what's new". Harmless at a desk,
+# a dead end from Dazzle on a phone. Measured on durban 2026-09-25: all three
+# seats opened on the theme picker until exactly these keys were added (copied
+# from ballito's seats, which start clean), and nothing else was needed:
+#   hasCompletedOnboarding = true
+#   lastOnboardingVersion, lastReleaseNotesSeen = the installed claude version
+#   projects[<dir>].hasTrustDialogAccepted = true  for each ROTA_TRUST_DIRS dir
+# Only MISSING keys are added, so a seat that already starts clean is not
+# rewritten at all, and oauthAccount / credentials are never read or touched.
+# The theme itself lives in the shared settings.json, not here.
+# ROTA_TRUST_DIRS: colon-separated dirs to pre-trust (default ~/code, when it
+# exists). ROTA_CLAUDE_VERSION overrides the version lookup (tests).
+# The version is READ off the install, never by running claude: pool-init must
+# not start a claude process (the keeper suite pins "no claude call on an empty
+# pool"). Native installs keep one dir per version; npm/Homebrew installs carry
+# it in package.json. Unknown → the version keys are skipped, the rest is set.
+first_run_claude_version() {
+  local v="${ROTA_CLAUDE_VERSION:-}" pkg p
+  if [[ -z "$v" && -d "$HOME/.local/share/claude/versions" ]]; then
+    v="$(find "$HOME/.local/share/claude/versions" -mindepth 1 -maxdepth 1 -exec basename {} \; 2>/dev/null \
+      | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)" || v=""
+  fi
+  if [[ -z "$v" ]]; then
+    for p in /opt/homebrew /usr/local; do
+      pkg="$p/lib/node_modules/@anthropic-ai/claude-code/package.json"
+      [[ -f "$pkg" ]] || continue
+      v="$(sed -n 's/^[[:space:]]*"version":[[:space:]]*"\([0-9.]*\)".*/\1/p' "$pkg" | head -1)"
+      [[ -n "$v" ]] && break
+    done
+  fi
+  [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && printf '%s' "$v"
+  return 0
+}
+
+# seed_first_run <pool dir> <version or ""> → prints what it set, or nothing.
+seed_first_run() {
+  local dir="$1" version="$2"
+  command -v python3 >/dev/null 2>&1 || return 0
+  python3 - "$dir/.claude.json" "$version" "${ROTA_TRUST_DIRS-$HOME/code}" <<'PY'
+import json, os, sys, tempfile
+path, version, trust = sys.argv[1], sys.argv[2], sys.argv[3]
+data = {}
+if os.path.exists(path):
+    with open(path) as f:
+        text = f.read()
+    try:
+        data = json.loads(text) if text.strip() else {}
+    except ValueError:
+        print(f"note: {path} is not valid JSON, left alone", file=sys.stderr)
+        sys.exit(0)
+changed = []
+def put(key, value):
+    if data.get(key) in (None, False, ""):
+        data[key] = value
+        changed.append(key)
+put("hasCompletedOnboarding", True)
+if version:
+    put("lastOnboardingVersion", version)
+    put("lastReleaseNotesSeen", version)
+projects = data.setdefault("projects", {})
+for d in [d for d in trust.split(":") if d and os.path.isdir(d)]:
+    entry = projects.setdefault(d, {})
+    if entry.get("hasTrustDialogAccepted") is not True:
+        entry["hasTrustDialogAccepted"] = True
+        changed.append(f"trust {d}")
+if not changed:
+    sys.exit(0)
+mode = os.stat(path).st_mode & 0o777 if os.path.exists(path) else 0o600
+fd, tmp = tempfile.mkstemp(prefix=".claude.json.seed.", dir=os.path.dirname(path))
+try:
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+except BaseException:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+    raise
+print(", ".join(changed))
+PY
+}
+
 cmd_pool_init() {
   [[ $# -eq 0 ]] || die "usage: rota failover pool-init"
   if [[ ! -f "$ACCOUNTS_FILE" ]]; then
@@ -1858,10 +1947,12 @@ cmd_pool_init() {
     exit 2
   fi
   load_accounts
-  local made=0 linked=0 seats=0
+  local made=0 linked=0 seats=0 seeded=0
   mkdir -p "$CFG_DIR" "$POOL_ROOT" "$HOME/.claude"
+  local version
+  version="$(first_run_claude_version)"
 
-  local i dir label t src dst
+  local i dir label t src dst set_keys
   for i in "${!DIRS[@]}"; do
     dir="${DIRS[$i]}"; label="${LABELS[$i]}"
     # the shared ~/.claude is the pointer slot, not a seat: a row that maps an
@@ -1896,14 +1987,19 @@ cmd_pool_init() {
         linked=$((linked + 1))
       fi
     done
+    set_keys="$(seed_first_run "$dir" "$version")"
+    if [[ -n "$set_keys" ]]; then
+      seeded=$((seeded + 1))
+      printf 'first-run state for %s: %s\n' "$label" "$set_keys"
+    fi
   done
 
-  if (( made + linked == 0 )); then
-    printf 'pool-init: already initialized: %d pool dir(s) from %s, links healthy. Nothing changed.\n' \
+  if (( made + linked + seeded == 0 )); then
+    printf 'pool-init: already initialized: %d pool dir(s) from %s, links healthy, first-run state set. Nothing changed.\n' \
       "$seats" "$(tilde "$ACCOUNTS_FILE")"
   else
-    printf 'pool-init: %d dir(s) created, %d link(s) made for %d seat(s) in %s. No credentials were created or touched.\n' \
-      "$made" "$linked" "$seats" "$(tilde "$ACCOUNTS_FILE")"
+    printf 'pool-init: %d dir(s) created, %d link(s) made, %d seat(s) given first-run state, for %d seat(s) in %s. No credentials were created or touched.\n' \
+      "$made" "$linked" "$seeded" "$seats" "$(tilde "$ACCOUNTS_FILE")"
     printf 'Next: `rota adopt-shared` moves this box'"'"'s shared login into its pool dir; every OTHER seat needs one browser login: rota login <seat>\n'
   fi
   return 0
