@@ -1860,6 +1860,82 @@ BF_PROSE="$(left_first_prose <<<"$OUT")"
   && ok "binding floor → no SENTENCE in a multi-account report leads with left either" \
   || bad "binding floor → a sentence leads with left (got: $BF_PROSE)"
 
+# --- 24b. a SCOPED cap spent is not a spent SEAT: weekly_all travels too -------
+# Fable's per-model weekly at 100% binds (and must keep excluding the seat from the
+# pick), but weekly_all at 60% used means the seat still runs every other model. The
+# engine publishes that all-model figure as weekly_all{used_pct,remaining_pct,
+# resets_at} and the short reason says so. Two controls: a limits array with no
+# scoped entry, and no limits key at all (weekly_all then IS seven_day).
+new_run scopedspent
+mkdir -p "$RUN/.claude-pool/alpha" "$RUN/.claude-pool/fable" "$RUN/.claude-pool/nosc" "$RUN/.claude-pool/plain"
+printf '{"claudeAiOauth":{"accessToken":"TOK-SS-ALPHA"}}' > "$RUN/.claude/.credentials.json"
+cp "$RUN/.claude/.credentials.json" "$RUN/.claude-pool/alpha/.credentials.json"
+printf '{"oauthAccount":{"emailAddress":"alpha@example.com"}}' > "$RUN/.claude-pool/alpha/.claude.json"
+printf '{"oauthAccount":{"emailAddress":"alpha@example.com"}}' > "$RUN/.claude.json"
+for n in fable nosc plain; do
+  printf '{"claudeAiOauth":{"accessToken":"TOK-SS-%s"}}' "$n" > "$RUN/.claude-pool/$n/.credentials.json"
+  printf '{"oauthAccount":{"emailAddress":"%s@example.com"}}' "$n" > "$RUN/.claude-pool/$n/.claude.json"
+done
+cat > "$RUN/cfg/accounts" <<EOF
+alpha@example.com|$RUN/.claude-pool/alpha
+fable@example.com|$RUN/.claude-pool/fable
+nosc@example.com|$RUN/.claude-pool/nosc
+plain@example.com|$RUN/.claude-pool/plain
+EOF
+SS_ALL_R="$(iso_in +6d)"; SS_SCOPED_R="$(iso_in +2d)"; SS_SE_R="$(iso_in +2H)"
+printf '{"seven_day":{"utilization":18,"resets_at":"%s"},"five_hour":{"utilization":23,"resets_at":"%s"}}' \
+  "$(iso_in +3d)" "$SS_SE_R" > "$RUN/state/usage-TOK-SS-ALPHA.json"
+printf '{"five_hour":{"utilization":16,"resets_at":"%s"},"seven_day":{"utilization":60,"resets_at":"%s"},
+ "limits":[{"kind":"session","group":"session","percent":16,"resets_at":"%s","scope":null},
+   {"kind":"weekly_all","group":"weekly","percent":60,"resets_at":"%s","scope":null},
+   {"kind":"weekly_scoped","group":"weekly","percent":100,"resets_at":"%s",
+    "scope":{"model":{"id":null,"display_name":"Fable"}}}]}' \
+  "$SS_SE_R" "$SS_ALL_R" "$SS_SE_R" "$SS_ALL_R" "$SS_SCOPED_R" \
+  > "$RUN/state/usage-TOK-SS-fable.json"
+printf '{"five_hour":{"utilization":5,"resets_at":"%s"},"seven_day":{"utilization":30,"resets_at":"%s"},
+ "limits":[{"kind":"weekly_all","group":"weekly","percent":30,"resets_at":"%s","scope":null}]}' \
+  "$SS_SE_R" "$SS_ALL_R" "$SS_ALL_R" > "$RUN/state/usage-TOK-SS-nosc.json"
+printf '{"five_hour":{"utilization":5,"resets_at":"%s"},"seven_day":{"utilization":45,"resets_at":"%s"}}' \
+  "$SS_SE_R" "$SS_ALL_R" > "$RUN/state/usage-TOK-SS-plain.json"
+set +e
+OUT="$(FAKE_NEW_EMAIL=alpha@example.com "$SCRIPT" usage 2>/dev/null)"
+VOUT="$(FAKE_NEW_EMAIL=alpha@example.com "$SCRIPT" usage --verbose 2>/dev/null)"
+JSON_OUT="$(FAKE_NEW_EMAIL=alpha@example.com "$SCRIPT" usage --json 2>/dev/null)"
+RC=$?
+set -e
+[ "$RC" -eq 0 ] && ok "scoped spent → usage exits 0" || bad "scoped spent → usage exits 0 (got $RC: $OUT)"
+ss_row="$(jq -c '.accounts[] | select(.email=="fable@example.com")' <<<"$JSON_OUT" 2>/dev/null)"
+[ "$(jq -r '.weekly | [.used_pct,.remaining_pct,.kind,.scope] | @csv' <<<"$ss_row" 2>/dev/null)" = '100,0,"weekly_scoped","Fable"' ] \
+  && ok "scoped spent (json) → weekly is still the binding Fable cap, unchanged" \
+  || bad "scoped spent (json) → weekly unchanged (got: $(jq -c '.weekly' <<<"$ss_row" 2>/dev/null))"
+[ "$(jq -r '.weekly_all | [.used_pct,.remaining_pct,.resets_at] | @csv' <<<"$ss_row" 2>/dev/null)" = "60,40,\"$SS_ALL_R\"" ] \
+  && ok "scoped spent (json) → weekly_all carries the all-model 60 used / 40 left and its own reset" \
+  || bad "scoped spent (json) → weekly_all (got: $(jq -c '.weekly_all' <<<"$ss_row" 2>/dev/null))"
+[ "$(jq -r '.recommendable' <<<"$ss_row" 2>/dev/null)" = "false" ] \
+  && ok "scoped spent (json) → the ranking still excludes the seat (display-only change)" \
+  || bad "scoped spent (json) → still excluded (got: $ss_row)"
+grep -qE '^  ✗ fable@example\.com +weekly spent \(Fable\) · all models 40% left' <<<"$(unavail_block <<<"$OUT")" \
+  && ok "scoped spent → the short reason names the spent Fable cap AND the all-model headroom" \
+  || bad "scoped spent → short reason with all-model figure (got: $(unavail_block <<<"$OUT"))"
+grep -qE 'resets  weekly .* · all models .* · 5h ' <<<"$VOUT" \
+  && ok "scoped spent → --verbose reset line carries the all-model reset too" \
+  || bad "scoped spent → --verbose all-model reset (got: $VOUT)"
+[ "$(jq -r '.accounts[] | select(.email=="nosc@example.com") | .weekly_all | [.used_pct,.remaining_pct] | @csv' <<<"$JSON_OUT" 2>/dev/null)" = '30,70' ] \
+  && ok "no scoped entry (json) → weekly_all is the weekly_all entry" \
+  || bad "no scoped entry (json) → weekly_all (got: $(jq -c '.accounts[] | select(.email=="nosc@example.com") | .weekly_all' <<<"$JSON_OUT" 2>/dev/null))"
+[ "$(jq -r '.accounts[] | select(.email=="plain@example.com") | [.weekly.kind, .weekly_all.used_pct, .weekly_all.remaining_pct] | @csv' <<<"$JSON_OUT" 2>/dev/null)" = ',45,55' ] \
+  && ok "no limits key (json) → weekly_all falls back to seven_day, kind stays null" \
+  || bad "no limits key (json) → weekly_all from seven_day (got: $(jq -c '.accounts[] | select(.email=="plain@example.com")' <<<"$JSON_OUT" 2>/dev/null))"
+! grep -qE '(nosc|plain)@example\.com.*all models' <<<"$OUT" \
+  && ok "unscoped rows → no all-models note where nothing is scoped" \
+  || bad "unscoped rows → no all-models note (got: $OUT)"
+set +e
+SS_CACHED_JSON="$("$SCRIPT" usage --no-refresh --json 2>/dev/null)"
+set -e
+[ "$(jq -r '.accounts[] | select(.email=="fable@example.com") | .weekly_all' <<<"$SS_CACHED_JSON" 2>/dev/null)" = "null" ] \
+  && ok "scoped spent (json) → a cached row leaves weekly_all null, never invented" \
+  || bad "scoped spent (json) → cached weekly_all null (got: $(jq -c '.accounts[] | select(.email=="fable@example.com")' <<<"$SS_CACHED_JSON" 2>/dev/null))"
+
 # --- 25. switch-auto must never dead-end merely because the data was old -------
 # The 2026-08-05 defect. `rota switch` with no argument exists so the operator never has to
 # name an account, yet with every stored token stale (curl answers 000 here, the
@@ -2782,7 +2858,10 @@ EX_JSON_PATHS="$(jq -S -r 'paths | join(".")' <<<"$EX_JSON" | sed -E 's/\.[0-9]+
 #               for an audience of zero. THIS ASSERTION IS WHY THAT WAS SAFE: the
 #               rename could not land quietly, it reds here until the published
 #               contract is edited by hand and the diff is reviewed.
-EX_JSON_PATHS_WANT="accounts accounts.N accounts.N.active accounts.N.alias accounts.N.cached_at accounts.N.config_dir accounts.N.current accounts.N.data accounts.N.email accounts.N.five_hour accounts.N.five_hour.expired accounts.N.five_hour.fresh accounts.N.five_hour.remaining_pct accounts.N.five_hour.resets_at accounts.N.five_hour.used_pct accounts.N.label accounts.N.live accounts.N.loggedIn accounts.N.note accounts.N.quota_data accounts.N.quota_measured_at accounts.N.quota_source accounts.N.reason accounts.N.recommendable accounts.N.seat accounts.N.seat.ended accounts.N.seat.ends accounts.N.seat.status accounts.N.session accounts.N.session.expired accounts.N.session.fresh accounts.N.session.leftPct accounts.N.session.resetsAt accounts.N.session.resetsInSeconds accounts.N.session.usedPct accounts.N.stale accounts.N.stale_reason accounts.N.unmeasured accounts.N.weekly accounts.N.weekly.expired accounts.N.weekly.fresh accounts.N.weekly.kind accounts.N.weekly.leftPct accounts.N.weekly.remaining_pct accounts.N.weekly.resetsAt accounts.N.weekly.resetsInSeconds accounts.N.weekly.resets_at accounts.N.weekly.scope accounts.N.weekly.usedPct accounts.N.weekly.used_pct active active.auth_status active.auth_warning active.email active.fingerprint active.nested_config_warning active.source active.warning activeEmail floors floors.comfortable_pct floors.exhausted_pct floors.session_pct floors.weekly_pct peer recommendation recommendation.action recommendation.alias recommendation.best_alternative recommendation.best_alternative.email recommendation.best_alternative.weekly_left_pct recommendation.burn_down_hold recommendation.deadline_at recommendation.deadline_kind recommendation.email recommendation.from_cached_numbers recommendation.label recommendation.mode recommendation.mode_forced recommendation.reason recommendation.weekly_fresh "
+#   2026-09-26  ADDITIVE: `accounts.N.weekly_all{used_pct,remaining_pct,resets_at}`,
+#               the all-model weekly, null when the row never measured it. A spent
+#               SCOPED cap (Fable) binds `weekly` but the seat still runs Opus.
+EX_JSON_PATHS_WANT="accounts accounts.N accounts.N.active accounts.N.alias accounts.N.cached_at accounts.N.config_dir accounts.N.current accounts.N.data accounts.N.email accounts.N.five_hour accounts.N.five_hour.expired accounts.N.five_hour.fresh accounts.N.five_hour.remaining_pct accounts.N.five_hour.resets_at accounts.N.five_hour.used_pct accounts.N.label accounts.N.live accounts.N.loggedIn accounts.N.note accounts.N.quota_data accounts.N.quota_measured_at accounts.N.quota_source accounts.N.reason accounts.N.recommendable accounts.N.seat accounts.N.seat.ended accounts.N.seat.ends accounts.N.seat.status accounts.N.session accounts.N.session.expired accounts.N.session.fresh accounts.N.session.leftPct accounts.N.session.resetsAt accounts.N.session.resetsInSeconds accounts.N.session.usedPct accounts.N.stale accounts.N.stale_reason accounts.N.unmeasured accounts.N.weekly accounts.N.weekly.expired accounts.N.weekly.fresh accounts.N.weekly.kind accounts.N.weekly.leftPct accounts.N.weekly.remaining_pct accounts.N.weekly.resetsAt accounts.N.weekly.resetsInSeconds accounts.N.weekly.resets_at accounts.N.weekly.scope accounts.N.weekly.usedPct accounts.N.weekly.used_pct accounts.N.weekly_all accounts.N.weekly_all.remaining_pct accounts.N.weekly_all.resets_at accounts.N.weekly_all.used_pct active active.auth_status active.auth_warning active.email active.fingerprint active.nested_config_warning active.source active.warning activeEmail floors floors.comfortable_pct floors.exhausted_pct floors.session_pct floors.weekly_pct peer recommendation recommendation.action recommendation.alias recommendation.best_alternative recommendation.best_alternative.email recommendation.best_alternative.weekly_left_pct recommendation.burn_down_hold recommendation.deadline_at recommendation.deadline_kind recommendation.email recommendation.from_cached_numbers recommendation.label recommendation.mode recommendation.mode_forced recommendation.reason recommendation.weekly_fresh "
 [ "$EX_JSON_PATHS" = "$EX_JSON_PATHS_WANT" ] \
   && ok "json byte-identity → every published key path is exactly what the dashboard was promised" \
   || bad "json byte-identity → key paths drifted:

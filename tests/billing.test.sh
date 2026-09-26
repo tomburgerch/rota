@@ -626,5 +626,68 @@ check "ended: json still publishes its weekly number, so nothing is hidden, only
   '[ "$(jrow "$JOUT" dead@example.com weekly_left_pct)" = 60 ]'
 unset CLAUDE_BILLING_JSON
 
+# --- a SCOPED weekly cap spent is not a spent SEAT (2026-09-26) ---------------
+# cedric.waldburger@ showed `WEEKLY LEFT 0%` with an EMPTY 5H column: its Fable cap
+# was spent (the binding weekly), but weekly_all sat at 60% used and the seat still
+# ran Opus. With a scoped binding and weekly_all known, the cell shows the all-model
+# figure, NOTES names the Fable cap, and 5h is not blanked. `nosc` is the control:
+# its ALL-MODEL weekly is spent, so 5h must still blank exactly as before. `plain`
+# carries no kind and no weekly_all at all (the pre-limits shape).
+SW_BILL="$TMP/scoped-billing.json"
+cat > "$SW_BILL" <<'J'
+{"accounts":{
+  "fable@example.com":{"plan":"Max 20x","renews_day":7,"amount_display":"$200.00","usd_approx":200,"status":"active"},
+  "nosc@example.com":{"plan":"Max 20x","renews_day":8,"amount_display":"$200.00","usd_approx":200,"status":"active"},
+  "plain@example.com":{"plan":"Max 20x","renews_day":9,"amount_display":"$200.00","usd_approx":200,"status":"active"}
+}}
+J
+cat > "$LIB/rota-engine.sh" <<'STUB'
+#!/usr/bin/env bash
+cat <<'J'
+{"generated_at":"2026-09-26T10:00:00+02:00","activeEmail":"plain@example.com","floors":{"weekly_pct":20},
+ "accounts":[
+  {"label":"fable@example.com","email":"fable@example.com","alias":"fable","active":false,"data":"live",
+   "weekly":{"remaining_pct":0,"used_pct":100,"resets_at":"2099-09-28T15:59:00+00:00","kind":"weekly_scoped","scope":"Fable"},
+   "weekly_all":{"used_pct":60,"remaining_pct":40,"resets_at":"2099-10-01T09:00:00+00:00"},
+   "five_hour":{"remaining_pct":84}},
+  {"label":"nosc@example.com","email":"nosc@example.com","alias":"nosc","active":false,"data":"live",
+   "weekly":{"remaining_pct":0,"used_pct":100,"resets_at":"2099-09-29T09:00:00+00:00","kind":"weekly_all","scope":null},
+   "weekly_all":{"used_pct":100,"remaining_pct":0,"resets_at":"2099-09-29T09:00:00+00:00"},
+   "five_hour":{"remaining_pct":97}},
+  {"label":"plain@example.com","email":"plain@example.com","alias":"plain","active":true,"data":"live",
+   "weekly":{"remaining_pct":70,"resets_at":"2099-09-30T09:00:00+00:00"},
+   "five_hour":{"remaining_pct":91}}
+ ]}
+J
+STUB
+chmod +x "$LIB/rota-engine.sh"
+export CLAUDE_BILLING_JSON="$SW_BILL"
+OUT="$("$LIB/rota-billing.sh" 2>/dev/null)"
+JOUT="$("$LIB/rota-billing.sh" --json 2>/dev/null)"
+check "scoped weekly: the cell shows the ALL-MODEL 40%, not the Fable cap's 0%" \
+  'grep "fable@example.com" <<<"$OUT" | grep -qE " 40% " && ! grep "fable@example.com" <<<"$OUT" | grep -qE "   0% "'
+check "scoped weekly: the 5h column is NOT blanked by a spent scoped cap" \
+  'grep "fable@example.com" <<<"$OUT" | grep -q " 84% "'
+check "scoped weekly: NOTES names the spent Fable cap and when it is back" \
+  'grep "fable@example.com" <<<"$OUT" | grep -qE "Fable spent · back [A-Z][a-z]{2} [0-9]{2} [A-Z][a-z]{2}"'
+check "all-model spent: behaviour unchanged, 0% and 5h still blanked" \
+  'grep "nosc@example.com" <<<"$OUT" | grep -q "   0% " && ! grep "nosc@example.com" <<<"$OUT" | grep -q "97%"'
+check "all-model spent: no scoped note on an unscoped binding" \
+  '! grep "nosc@example.com" <<<"$OUT" | grep -qE "spent · back|% left"'
+check "no weekly_all: the row renders exactly as before" \
+  'grep "plain@example.com" <<<"$OUT" | grep -q " 70% " && grep "plain@example.com" <<<"$OUT" | grep -q " 91% "'
+check "scoped weekly (json): weekly_left_pct stays the BINDING 0 the ranking reads" \
+  '[ "$(jrow "$JOUT" fable@example.com weekly_left_pct)" = 0 ]'
+check "scoped weekly (json): weekly_kind / weekly_scope are published" \
+  '[ "$(jrow "$JOUT" fable@example.com weekly_kind)/$(jrow "$JOUT" fable@example.com weekly_scope)" = weekly_scoped/Fable ]'
+check "scoped weekly (json): weekly_all is passed through" \
+  '[ "$(python3 -c "import json,sys;print([a[\"weekly_all\"][\"remaining_pct\"] for a in json.loads(sys.argv[1])[\"accounts\"] if a[\"account\"]==\"fable@example.com\"][0])" "$JOUT")" = 40 ]'
+check "no weekly_all (json): null, never invented" \
+  '[ "$(jrow "$JOUT" plain@example.com weekly_all)" = None ]'
+check "scoped weekly: the recommendation still ranks on the binding cap (fable is not USE NEXT)" \
+  '! grep -A1 "USE NEXT" <<<"$OUT" | grep -q "rota switch fable"'
+unset CLAUDE_BILLING_JSON
+cp "$TMP/engine.good" "$LIB/rota-engine.sh"; chmod +x "$LIB/rota-engine.sh"
+
 printf 'billing.test.sh: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

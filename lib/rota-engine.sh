@@ -2200,10 +2200,15 @@ usage_field() { printf '%s' "$1" | jq -r "$2 // empty" 2>/dev/null || true; }
 # WB_ALL_RESET is separate on purpose: the identity fingerprint compares weekly reset
 # MINUTES across accounts, which is only meaningful between the same kind of window, so
 # it keeps using seven_day/weekly_all rather than whatever kind happens to bind.
-WB_PCT=""; WB_RESET=""; WB_KIND=""; WB_SCOPE=""; WB_ALL_RESET=""
+#
+# WB_ALL_PCT is the weekly_all entry's own percent (2026-09-26). The binding stays the
+# max, which is right for the ranking, but a SCOPED binding at 100% (the Fable cap
+# spent) says nothing about the all-model allowance: the seat still runs Opus. Display
+# surfaces need that second number to say so instead of calling the seat spent.
+WB_PCT=""; WB_RESET=""; WB_KIND=""; WB_SCOPE=""; WB_ALL_RESET=""; WB_ALL_PCT=""
 weekly_binding() {  # weekly_binding <usage-json>
   local json="${1:-}" row
-  WB_PCT=""; WB_RESET=""; WB_KIND=""; WB_SCOPE=""; WB_ALL_RESET=""
+  WB_PCT=""; WB_RESET=""; WB_KIND=""; WB_SCOPE=""; WB_ALL_RESET=""; WB_ALL_PCT=""
   [[ -n "$json" ]] || return 0
   command -v jq >/dev/null 2>&1 || return 0
   # `try … catch null` guards a scope that is present but not the expected object shape
@@ -2221,10 +2226,11 @@ weekly_binding() {  # weekly_binding <usage-json>
         (if $b == null then "" else
            (((try $b.scope.model.display_name catch null)
              // (try $b.scope.name catch null)) // "") end),
-        (($all.resets_at) // "") ]
+        (($all.resets_at) // ""),
+        (if $all == null then "" else ($all.percent|tostring) end) ]
     | join("\u001f")' 2>/dev/null || true)"
   [[ -n "$row" ]] || return 0
-  IFS=$'\x1f' read -r WB_PCT WB_RESET WB_KIND WB_SCOPE WB_ALL_RESET <<<"$row"
+  IFS=$'\x1f' read -r WB_PCT WB_RESET WB_KIND WB_SCOPE WB_ALL_RESET WB_ALL_PCT <<<"$row"
 }
 
 # "  (binding: Opus)" for a SCOPED binding limit, "" otherwise, so a weekly number that
@@ -2917,7 +2923,7 @@ peer_fill() {
       U_WKR[i]="$p_wkr"; U_SER[i]="$p_ser"; U_SDR[i]="$p_wkr"
       # the peer publishes the binding NUMBER but not which limit produced it, so
       # the row carries no scope annotation rather than a borrowed or invented one
-      U_WKK[i]=""; U_WKS[i]=""
+      U_WKK[i]=""; U_WKS[i]=""; U_WAU[i]=""; U_WAR[i]=""
       U_WKX[i]=0; U_SEX[i]=0
       window_expired "$p_wkr" && U_WKX[i]=1
       window_expired "$p_ser" && U_SEX[i]=1
@@ -2948,6 +2954,10 @@ peer_fill() {
 #               seven_day when the response carries no usable `limits` array.
 #   U_WKK/U_WKS[i]               the binding weekly limit's kind and scope name, both
 #               empty on the seven_day fallback and on an unscoped binding limit
+#   U_WAU/U_WAR[i]               the ALL-MODEL weekly (weekly_all, else seven_day)
+#               utilization + resets_at, LIVE rows only; empty on cached/peer rows,
+#               which never carried it. Display-only: when the binding is a scoped
+#               per-model cap it says what the seat can still run on other models
 #   U_SDR[i]    seven_day/weekly_all resets_at, kept RAW for the identity fingerprint,
 #               that comparison is only meaningful between the same kind of window, so
 #               it must not follow whichever kind happens to bind
@@ -3172,7 +3182,7 @@ COLLECTED=0
 COLLECTED_NET=0            # was the completed collection allowed to use the network?
 SHARED_TWIN_SLOT=-1        # slot whose credential bytes are identical to the shared one
 S_JSON=""; S_HTTP=""; S_WKU=""; S_WKR=""; S_SEU=""; S_SER=""
-S_WKK=""; S_WKS=""; S_SDR=""
+S_WKK=""; S_WKS=""; S_SDR=""; S_WAU=""; S_WAR=""
 collect_usage() {
   (( COLLECTED )) && return 0
   COLLECTED=1
@@ -3190,11 +3200,12 @@ collect_usage() {
   PEER_HOST=""; PEER_GENERATED=""
   U_EMAIL=(); U_STATE=(); U_WKU=(); U_WKR=(); U_SEU=(); U_SER=()
   U_WKX=(); U_SEX=(); U_WHY=(); U_TS=(); U_VIA=(); U_DUP=()
-  U_WKK=(); U_WKS=(); U_SDR=(); U_SRC=(); U_MEAS=()
+  U_WKK=(); U_WKS=(); U_SDR=(); U_SRC=(); U_MEAS=(); U_WAU=(); U_WAR=()
   for i in "${!DIRS[@]}"; do
     U_EMAIL[i]=""; U_STATE[i]="none"; U_WKU[i]=""; U_WKR[i]=""; U_SEU[i]=""; U_SER[i]=""
     U_WKX[i]=0; U_SEX[i]=0; U_WHY[i]=""; U_TS[i]=""; U_VIA[i]=""; U_DUP[i]=-1
     U_WKK[i]=""; U_WKS[i]=""; U_SDR[i]=""; U_AGE[i]=""; U_SRC[i]=""; U_MEAS[i]=""
+    U_WAU[i]=""; U_WAR[i]=""
   done
 
   # the shared credential FIRST: it is both the identity fingerprint and the row
@@ -3208,11 +3219,13 @@ collect_usage() {
       S_SEU="$(usage_field "$S_JSON" '.five_hour.utilization')"
       S_SER="$(usage_field "$S_JSON" '.five_hour.resets_at')"
       S_SDR="$S_WKR"
+      S_WAU="$S_WKU"; S_WAR="$S_WKR"
       weekly_binding "$S_JSON"
       if [[ -n "$WB_PCT" ]]; then
         S_WKU="$WB_PCT"; S_WKR="$WB_RESET"; S_WKK="$WB_KIND"; S_WKS="$WB_SCOPE"
         [[ -n "$S_SDR" ]] || S_SDR="$WB_ALL_RESET"
       fi
+      [[ -n "$WB_ALL_PCT" ]] && { S_WAU="$WB_ALL_PCT"; S_WAR="$WB_ALL_RESET"; }
     fi
   fi
 
@@ -3320,6 +3333,8 @@ collect_usage() {
       U_SEU[i]="$(usage_field "$json" '.five_hour.utilization')"
       U_SER[i]="$(usage_field "$json" '.five_hour.resets_at')"
       U_SDR[i]="${U_WKR[$i]}"
+      # seven_day IS the all-model weekly; a weekly_all entry in `limits` overrides it
+      U_WAU[i]="${U_WKU[$i]}"; U_WAR[i]="${U_WKR[$i]}"
       # the BINDING weekly limit wins over seven_day whenever `limits` yields one, a
       # scoped per-model cap above weekly_all is the wall you actually hit
       weekly_binding "$json"
@@ -3328,6 +3343,7 @@ collect_usage() {
         U_WKK[i]="$WB_KIND"; U_WKS[i]="$WB_SCOPE"
         [[ -n "${U_SDR[$i]}" ]] || U_SDR[i]="$WB_ALL_RESET"
       fi
+      [[ -n "$WB_ALL_PCT" ]] && { U_WAU[i]="$WB_ALL_PCT"; U_WAR[i]="$WB_ALL_RESET"; }
       if [[ -z "${U_WKU[$i]}${U_SEU[$i]}" ]]; then
         # schema differs from expectation, surface the real keys (usage data is not secret)
         echo "  [$alabel] unexpected usage schema; top-level keys: $(printf '%s' "$json" | jq -r 'keys|join(",")' 2>/dev/null)" >&2
@@ -3394,7 +3410,7 @@ collect_usage() {
       U_WKU[i]="$C_WKU"; U_WKR[i]="$C_WKR"; U_SEU[i]="$C_SEU"; U_SER[i]="$C_SER"
       # the cache stores the binding NUMBER but not which limit produced it, so a cached
       # row carries no scope annotation rather than a stale or invented one
-      U_WKK[i]=""; U_WKS[i]=""; U_SDR[i]="$C_WKR"
+      U_WKK[i]=""; U_WKS[i]=""; U_SDR[i]="$C_WKR"; U_WAU[i]=""; U_WAR[i]=""
       U_TS[i]="$C_TS$(cache_age "$C_TE")"
       U_AGE[i]="$C_TE"
       # ts_epoch is when the number was MEASURED, which is the only honest answer
@@ -3683,6 +3699,7 @@ adopt_shared_numbers() {
   # the binding limit's identity travels with its number, or the row would annotate the
   # shared credential's scoped figure with the slot's own (now discarded) provenance
   U_WKK[SHARED_SLOT]="$S_WKK"; U_WKS[SHARED_SLOT]="$S_WKS"; U_SDR[SHARED_SLOT]="$S_SDR"
+  U_WAU[SHARED_SLOT]="$S_WAU"; U_WAR[SHARED_SLOT]="$S_WAR"
   U_WKX[SHARED_SLOT]=0; U_SEX[SHARED_SLOT]=0
   U_STATE[SHARED_SLOT]="live"
   # a LIVE local fetch outranks anything borrowed, so a peer row for this slot is
@@ -4218,6 +4235,16 @@ render_unavail_row() {  # render_unavail_row <slot-index> <email-width>
 # U_WHY behind it) rather than re-judged here, so the short form can never say
 # something the full sentence under --verbose contradicts.
 scope_short() { [[ -n "${1:-}" ]] && printf ' (%s)' "$1"; return 0; }
+# " · all models 40% left" when slot <i>'s binding weekly is a SCOPED cap and the
+# all-model weekly is known, "" otherwise. A spent Fable cap does not stop Opus, so a
+# row that says "weekly spent (Fable)" must also say what the seat can still run.
+all_models_note() {  # all_models_note <slot-index>
+  local i="$1" al
+  [[ "${U_WKK[$i]:-}" == "weekly_scoped" && -n "${U_WKS[$i]:-}" ]] || return 0
+  al="$(remaining "${U_WAU[$i]:-}")"
+  [[ -n "$al" ]] || return 0
+  printf ' · all models %s%% left' "$al"
+}
 short_reason() {  # short_reason <slot-index>
   # two `local` statements, not one: an index assigned in the SAME `local` is not
   # reliably visible to a later subscript in that statement (shellcheck SC2318)
@@ -4229,8 +4256,8 @@ short_reason() {  # short_reason <slot-index>
   wkl="$(remaining "${U_WKU[$i]}")"; sel="$(remaining "${U_SEU[$i]}")"
   case "$r" in
     weekly*)
-      if [[ "$wkl" == "0" ]]; then printf 'weekly spent%s' "$(scope_short "${U_WKS[$i]}")"
-      else printf 'weekly %s%% left%s' "$wkl" "$(scope_short "${U_WKS[$i]}")"; fi ;;
+      if [[ "$wkl" == "0" ]]; then printf 'weekly spent%s%s' "$(scope_short "${U_WKS[$i]}")" "$(all_models_note "$i")"
+      else printf 'weekly %s%% left%s%s' "$wkl" "$(scope_short "${U_WKS[$i]}")" "$(all_models_note "$i")"; fi ;;
     5h*)
       if [[ "$sel" == "0" ]]; then printf '5h window spent'
       else printf '5h %s%% left' "$sel"; fi ;;
@@ -4312,7 +4339,10 @@ render_verbose_detail() {  # render_verbose_detail <slot-index>
   local i="$1" pfx='      '
   printf '%s\n' "$(paint "$CLR_DIM" "${pfx}slot    ${LABELS[$i]} · $(tilde "${DIRS[$i]}")")"
   if [[ "${U_STATE[$i]}" != "dup" ]]; then
-    printf '%s\n' "$(paint "$CLR_DIM" "${pfx}resets  weekly $(reset_phrase "${U_WKR[$i]}") · 5h $(reset_phrase "${U_SER[$i]}")")"
+    local all_reset=""
+    [[ -n "$(all_models_note "$i")" && -n "${U_WAR[$i]:-}" ]] \
+      && all_reset=" · all models $(reset_phrase "${U_WAR[$i]}")"
+    printf '%s\n' "$(paint "$CLR_DIM" "${pfx}resets  weekly $(reset_phrase "${U_WKR[$i]}")${all_reset} · 5h $(reset_phrase "${U_SER[$i]}")")"
   fi
   [[ -n "${U_VIA[$i]}" ]] && printf '%s\n' "$(paint "$CLR_DIM" "${pfx}note    ${U_VIA[$i]}")"
   [[ "${U_STATE[$i]}" != "live" && -n "${U_WHY[$i]}" ]] \
@@ -5332,9 +5362,9 @@ render_usage() {
 # Same data, machine-readable, so a future consumer never has to parse columns.
 json_usage() {
   local i rows="" wk se wk_used se_used wk_fresh se_fresh
-  local wk_in se_in logged_in is_live is_stale
+  local wk_in se_in logged_in is_live is_stale wa wa_used
   for i in "${!DIRS[@]}"; do
-    wk="null"; se="null"; wk_used="null"; se_used="null"
+    wk="null"; se="null"; wk_used="null"; se_used="null"; wa="null"; wa_used="null"
     # `fresh` is what lets a consumer tell the two null-resets_at cases apart without
     # guessing: fresh=true is "100% left, the window has not started" (remaining_pct
     # is 100, used_pct 0), fresh=false with a null resets_at and null percentages is
@@ -5356,6 +5386,12 @@ json_usage() {
       && { wk="$(remaining "${U_WKU[$i]}")"; wk_used="$(used "${U_WKU[$i]}")"; }
     [[ -n "$(remaining "${U_SEU[$i]}")" ]] && (( U_SEX[i] == 0 )) \
       && { se="$(remaining "${U_SEU[$i]}")"; se_used="$(used "${U_SEU[$i]}")"; }
+    # weekly_all (2026-09-26), ADDITIVE: the all-model weekly, whatever binds. Null
+    # (the whole object) when this row never measured it: cached, peer, recorded.
+    # Same expiry gate as weekly, a lapsed window's percentage is not a fact.
+    if [[ -n "$(remaining "${U_WAU[$i]:-}")" ]] && ! window_expired "${U_WAR[$i]:-}"; then
+      wa="$(remaining "${U_WAU[$i]}")"; wa_used="$(used "${U_WAU[$i]}")"
+    fi
     # ── the camelCase view, ADDITIVE (2026-08-06) ────────────────────────────
     # A phone renderer needs three things this object did not carry: whether the
     # account can be switched to at all (loggedIn, the same rule `status` prints,
@@ -5412,6 +5448,8 @@ json_usage() {
       --arg se_reset "${U_SER[$i]}" \
       --arg wk_kind "${U_WKK[$i]}" \
       --arg wk_scope "${U_WKS[$i]}" \
+      --arg wa_reset "${U_WAR[$i]:-}" \
+      --argjson wa "$wa" --argjson wa_used "$wa_used" \
       --arg cached_at "${U_TS[$i]}" \
       --arg src "${U_SRC[$i]:-}" \
       --arg meas "${U_MEAS[$i]:-}" \
@@ -5439,6 +5477,9 @@ json_usage() {
                 leftPct:$wk, usedPct:$wk_used,
                 resetsAt:(if $wk_reset=="" then null else $wk_reset end),
                 resetsInSeconds:$wk_in},
+        weekly_all:(if $wa == null then null else
+                    {used_pct:$wa_used, remaining_pct:$wa,
+                     resets_at:(if $wa_reset=="" then null else $wa_reset end)} end),
         five_hour:{remaining_pct:$se, used_pct:$se_used, resets_at:(if $se_reset=="" then null else $se_reset end), expired:($se_exp==1), fresh:$se_fresh},
         session:{leftPct:$se, usedPct:$se_used,
                  resetsAt:(if $se_reset=="" then null else $se_reset end),
