@@ -328,6 +328,16 @@ for a in usage.get('accounts', []):
         'weekly_resets_at': w.get('resets_at'),
         'five_hour_left_pct': f.get('remaining_pct'),
         'five_hour_resets_at': f.get('resets_at'),
+        # ── WHICH WEEKLY, AND THE ALL-MODEL ONE (2026-09-26) ─────────────────
+        # weekly_left_pct stays the BINDING (highest) weekly cap, which is what the
+        # recommendation below ranks on and must keep ranking on. When that cap is a
+        # per-model one (kind weekly_scoped, e.g. Fable) the seat can still run
+        # every other model against weekly_all, so the table shows that number and
+        # names the scoped cap in NOTES. weekly_all is null when the engine never
+        # measured it (cached, peer, recorded rows): no number is invented.
+        'weekly_kind': w.get('kind'),
+        'weekly_scope': w.get('scope'),
+        'weekly_all': a.get('weekly_all'),
         # ── WHERE DID THIS NUMBER COME FROM, AND WHEN ────────────────────────
         # quota_data is live | cached | peer | none. quota_source names the peer
         # box when the engine had to read the seat's numbers over ssh (this box
@@ -490,8 +500,23 @@ for _i, _r in enumerate(rows):
     _r['_ord'] = _i
 rows.sort(key=lambda r: (bool(r['reserved']), r['_ord']))
 
+def scoped_view(r):
+    """(all-model left %, scope name) when the binding weekly is a scoped cap and the
+    all-model weekly is known, else None: the row then renders exactly as before."""
+    wa = r.get('weekly_all') or {}
+    left = wa.get('remaining_pct') if isinstance(wa, dict) else None
+    if r.get('weekly_kind') == 'weekly_scoped' and r.get('weekly_scope') and left is not None:
+        return left, r['weekly_scope']
+    return None
+
 for r in rows:
     wk = r['weekly_left_pct']
+    sv = scoped_view(r)
+    # A spent SCOPED cap (Fable) is not a spent seat: the cell shows the all-model
+    # weekly and the scoped cap moves to NOTES. The ranking still reads
+    # weekly_left_pct, untouched.
+    if sv is not None:
+        wk = sv[0]
     # ⚠️ THIS CELL IS THE WHOLE POINT OF THE UNMEASURED WORK. `0%` (spent) and
     # `-` (unknown) were both visually EMPTY, and on 2026-08-21 that cost two
     # cancelled-but-live seats' worth of already-paid-for quota: the operator
@@ -511,6 +536,8 @@ for r in rows:
     # A spent weekly makes the 5h window meaningless: it reads ~100% precisely
     # because nothing can run against it. Printing that invites reading a dead
     # seat as available, so blank it rather than show a number that means nothing.
+    # `wk` is the ALL-MODEL figure on a scoped row, so a spent Fable cap alone no
+    # longer blanks a 5h window other models are still running against.
     fh = r['five_hour_left_pct']
     fh_plain = '' if wk == 0 else (f"{fh}%" if fh is not None else '-')
 
@@ -531,6 +558,13 @@ for r in rows:
         notes.append(c(f"CANCELLED, ends {fmt_date(r['ends'])}{tail}", '31'))
     elif r['status'] == 'unknown':
         notes.append(c('billing unknown, add it to billing.json', '33'))
+    if sv is not None:
+        sleft = r['weekly_left_pct']
+        if sleft == 0:
+            back = parse_ts(r.get('weekly_resets_at'))
+            notes.append(c(f"{sv[1]} spent \u00b7 back {fmt(back)}" if back else f"{sv[1]} spent", '33'))
+        elif sleft is not None:
+            notes.append(c(f"{sv[1]} {sleft}% left", '2'))
     # ⚠️ PROVENANCE AND AGE ON EVERY NUMBER THIS BOX DID NOT MEASURE LIVE. The
     # marker answers "whose measurement is this", the age answers "from when",
     # and a row missing either one reads as current when it may be days old.
