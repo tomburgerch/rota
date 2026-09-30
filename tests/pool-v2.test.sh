@@ -559,6 +559,69 @@ grep -q 'switch=no-target' "$RUN/cfg/keeper-status" \
   && ok "keeper → never switches ONTO an account above 80% (hysteresis ceiling)" \
   || bad "keeper → >80% targets refused (status: $(cat "$RUN/cfg/keeper-status"))"
 
+# ── 5a2. AN UNTOUCHED WINDOW STILL HAS A DEADLINE, AND THIS PICKER SEES IT ───
+#
+# The usage API answers `resets_at: null` for any weekly window whose
+# utilization is 0.0 - i.e. for the seat with a whole untouched week in it. This
+# picker fetches the API itself rather than reading `rota usage --json`, so that
+# null left `jreset` empty, rota_seat_deadline returned the no-deadline sentinel
+# and rota_deadline_beats ranked the seat LAST ("nothing expiring"). Meanwhile
+# `rota usage`, `rota billing` and `cl` had learned to rank it by the reset
+# projected from the seat's own 7-day cadence, so the unattended 90%-wall switch
+# would send him somewhere every interactive surface says is wrong - at 03:00,
+# with only the log to explain it afterwards.
+#
+# primary is untouched (0% used, no reset reported) with a remembered cadence
+# putting its next reset ~2 days out; wk has a REAL reset 4 days out. The pick
+# must be primary, and the log line must MARK the instant as projected.
+proj_cache() {  # proj_cache <alias> <seen-iso>, the row that remembers a seat's cadence
+  jq -n --arg e "$(email_of "$1")" --arg wr "$2" \
+    '{($e):{wk_u:"12",wk_r:"",se_u:"5",se_r:"",ts:"Sep 04 09:00",ts_epoch:"1",wk_r_seen:$wr}}' \
+    > "$RUN/cfg/usage-cache.json"
+}
+untouched_fixture() {  # untouched_fixture <alias>, the vendor's answer for an unused window
+  printf '{"seven_day":{"utilization":0.0,"resets_at":null},"five_hour":{"utilization":0.0,"resets_at":null}}' \
+    > "$FAKE_STATE/usage-$(email_of "$1").json"
+}
+KP_SEEN_EPOCH=$(( $(date -u '+%s') - 5 * 86400 ))
+KP_SEEN="$(date -u -r "$KP_SEEN_EPOCH" '+%Y-%m-%dT%H:%M:%S.000000+00:00')"
+KP_WANT="$(date -u -r $(( KP_SEEN_EPOCH + 604800 )) '+%Y-%m-%dT%H:%M:%S+00:00')"   # ~2d out
+mk_pool kproj
+usage_fixture alpha 91 50 "$(iso_in +2H)" "$(iso_in +6d)"   # the claim, over the wall
+untouched_fixture primary                                    # 0% used, NO reset reported
+usage_fixture wk    40 10 "$(iso_in +2H)" "$(iso_in +4d)"    # a real reset, LATER
+usage_fixture team  45 10 "$(iso_in +2H)" "$(iso_in +5d)"
+proj_cache primary "$KP_SEEN"
+run_keeper "${keeper_env[@]}"
+grep -q "switch=to:$(email_of primary)" "$RUN/cfg/keeper-status" \
+  && ok "keeper projection → the untouched seat whose week dies FIRST is the pick, not the one with the later real reset" \
+  || bad "keeper projection → picks the projected-soonest seat (status: $(cat "$RUN/cfg/keeper-status"), log: $OUT)"
+grep -q "resets ~$KP_WANT" <<<"$OUT" \
+  && ok "keeper projection → the log line names the projected instant and MARKS it with ~" \
+  || bad "keeper projection → log marks the projection (want ~$KP_WANT, got: $OUT)"
+grep -q "projected from this seat's own cadence" <<<"$OUT" \
+  && ok "keeper projection → and says in words why the API reported none, for whoever reads the log weeks later" \
+  || bad "keeper projection → log explains the projection (got: $OUT)"
+[ "$(jq -r --arg e "$(email_of primary)" '.[$e].wk_r_seen' "$RUN/cfg/usage-cache.json")" = "$KP_SEEN" ] \
+  && ok "keeper projection → the tick's own cache write KEEPS wk_r_seen (it runs every minute; dropping it would erase the memory)" \
+  || bad "keeper projection → wk_r_seen survives the keeper's write (got: $(cat "$RUN/cfg/usage-cache.json"))"
+
+# ...and with NOTHING ever seen for that seat the old behaviour is unchanged: no
+# cadence to project from, so the untouched seat ranks last and the seat with a
+# real reset wins. Nothing is invented.
+mk_pool kprojnoseen
+usage_fixture alpha 91 50 "$(iso_in +2H)" "$(iso_in +6d)"
+untouched_fixture primary
+usage_fixture wk    40 10 "$(iso_in +2H)" "$(iso_in +4d)"
+usage_fixture team  45 10 "$(iso_in +2H)" "$(iso_in +5d)"
+run_keeper "${keeper_env[@]}"
+grep -q "switch=to:$(email_of wk)" "$RUN/cfg/keeper-status" \
+  && ok "keeper projection → with no remembered cadence the untouched seat still ranks last, exactly as before" \
+  || bad "keeper projection → no seen instant means no projection (status: $(cat "$RUN/cfg/keeper-status"), log: $OUT)"
+! grep -q 'resets ~' <<<"$OUT" \
+  && ok "keeper projection → and no ~ is printed for an instant nobody has" \
+  || bad "keeper projection → nothing to mark (got: $OUT)"
+
 # ── 5b. the headroom FLOOR (AUTO_SWITCH_TARGET_MIN_LEFT_PCT, 2026-08-16) ─────
 # The soonest reset only wins if the account still has headroom worth burning:
 # primary resets first but is 75% spent (25% left, under the 30%-left floor),

@@ -2864,10 +2864,22 @@ EX_JSON_PATHS="$(jq -S -r 'paths | join(".")' <<<"$EX_JSON" | sed -E 's/\.[0-9]+
 #               for an audience of zero. THIS ASSERTION IS WHY THAT WAS SAFE: the
 #               rename could not land quietly, it reds here until the published
 #               contract is edited by hand and the diff is reviewed.
+#   2026-09-04  `weekly.resets_at_projected` + `weekly.projected_from`, additive.
+#               resets_at is null for a weekly window nothing has spent in yet, and
+#               every consumer rendered that as "weekly reset unknown" and sorted the
+#               seat LAST, so the seat with a whole untouched week in it was the one
+#               the tool refused to recommend. The projection gets its OWN two keys
+#               rather than filling resets_at: a consumer has to be able to tell what
+#               the vendor reported from what this box worked out for itself.
+#               `recommendation.deadline_projected` lands with them, for the reason
+#               `deadline_kind` exists: `deadline_at` can now be a projection, and a
+#               bare instant cannot say whether the vendor reported it or this box
+#               inferred it. The human surfaces mark that with `~`; a parser gets
+#               the boolean.
 #   2026-09-26  ADDITIVE: `accounts.N.weekly_all{used_pct,remaining_pct,resets_at}`,
 #               the all-model weekly, null when the row never measured it. A spent
 #               SCOPED cap (Fable) binds `weekly` but the seat still runs Opus.
-EX_JSON_PATHS_WANT="accounts accounts.N accounts.N.active accounts.N.alias accounts.N.cached_at accounts.N.config_dir accounts.N.current accounts.N.data accounts.N.email accounts.N.five_hour accounts.N.five_hour.expired accounts.N.five_hour.fresh accounts.N.five_hour.remaining_pct accounts.N.five_hour.resets_at accounts.N.five_hour.used_pct accounts.N.label accounts.N.live accounts.N.loggedIn accounts.N.note accounts.N.quota_data accounts.N.quota_measured_at accounts.N.quota_source accounts.N.reason accounts.N.recommendable accounts.N.seat accounts.N.seat.ended accounts.N.seat.ends accounts.N.seat.status accounts.N.session accounts.N.session.expired accounts.N.session.fresh accounts.N.session.leftPct accounts.N.session.resetsAt accounts.N.session.resetsInSeconds accounts.N.session.usedPct accounts.N.stale accounts.N.stale_reason accounts.N.unmeasured accounts.N.weekly accounts.N.weekly.expired accounts.N.weekly.fresh accounts.N.weekly.kind accounts.N.weekly.leftPct accounts.N.weekly.remaining_pct accounts.N.weekly.resetsAt accounts.N.weekly.resetsInSeconds accounts.N.weekly.resets_at accounts.N.weekly.scope accounts.N.weekly.usedPct accounts.N.weekly.used_pct accounts.N.weekly_all accounts.N.weekly_all.remaining_pct accounts.N.weekly_all.resets_at accounts.N.weekly_all.used_pct active active.auth_status active.auth_warning active.email active.fingerprint active.nested_config_warning active.source active.warning activeEmail floors floors.comfortable_pct floors.exhausted_pct floors.session_pct floors.weekly_pct peer recommendation recommendation.action recommendation.alias recommendation.best_alternative recommendation.best_alternative.email recommendation.best_alternative.weekly_left_pct recommendation.burn_down_hold recommendation.deadline_at recommendation.deadline_kind recommendation.email recommendation.from_cached_numbers recommendation.label recommendation.mode recommendation.mode_forced recommendation.reason recommendation.weekly_fresh "
+EX_JSON_PATHS_WANT="accounts accounts.N accounts.N.active accounts.N.alias accounts.N.cached_at accounts.N.config_dir accounts.N.current accounts.N.data accounts.N.email accounts.N.five_hour accounts.N.five_hour.expired accounts.N.five_hour.fresh accounts.N.five_hour.remaining_pct accounts.N.five_hour.resets_at accounts.N.five_hour.used_pct accounts.N.label accounts.N.live accounts.N.loggedIn accounts.N.note accounts.N.quota_data accounts.N.quota_measured_at accounts.N.quota_source accounts.N.reason accounts.N.recommendable accounts.N.seat accounts.N.seat.ended accounts.N.seat.ends accounts.N.seat.status accounts.N.session accounts.N.session.expired accounts.N.session.fresh accounts.N.session.leftPct accounts.N.session.resetsAt accounts.N.session.resetsInSeconds accounts.N.session.usedPct accounts.N.stale accounts.N.stale_reason accounts.N.unmeasured accounts.N.weekly accounts.N.weekly.expired accounts.N.weekly.fresh accounts.N.weekly.kind accounts.N.weekly.leftPct accounts.N.weekly.projected_from accounts.N.weekly.remaining_pct accounts.N.weekly.resetsAt accounts.N.weekly.resetsInSeconds accounts.N.weekly.resets_at accounts.N.weekly.resets_at_projected accounts.N.weekly.scope accounts.N.weekly.usedPct accounts.N.weekly.used_pct accounts.N.weekly_all accounts.N.weekly_all.remaining_pct accounts.N.weekly_all.resets_at accounts.N.weekly_all.used_pct active active.auth_status active.auth_warning active.email active.fingerprint active.nested_config_warning active.source active.warning activeEmail floors floors.comfortable_pct floors.exhausted_pct floors.session_pct floors.weekly_pct peer recommendation recommendation.action recommendation.alias recommendation.best_alternative recommendation.best_alternative.email recommendation.best_alternative.weekly_left_pct recommendation.burn_down_hold recommendation.deadline_at recommendation.deadline_kind recommendation.deadline_projected recommendation.email recommendation.from_cached_numbers recommendation.label recommendation.mode recommendation.mode_forced recommendation.reason recommendation.weekly_fresh "
 [ "$EX_JSON_PATHS" = "$EX_JSON_PATHS_WANT" ] \
   && ok "json byte-identity → every published key path is exactly what the dashboard was promised" \
   || bad "json byte-identity → key paths drifted:
@@ -4888,7 +4900,433 @@ grep -q '^marked$' "$RUN/state/nudges" 2>/dev/null && grep -q '^listed$' "$RUN/s
   && ok "reserved seat → ROTA_NUDGE_RESERVED=1 overrides and both are nudged like any expired seat" \
   || bad "reserved seat → override must nudge (nudges: $(cat "$RUN/state/nudges" 2>/dev/null || echo none))"
 
-# --- 59. dormant seat × 429: the wake the operator used to have to remember -----
+# --- 59. THE UNTOUCHED WEEKLY WINDOW STILL HAS A RESET, AND THIS BOX KNOWS IT ---
+# Measured 2026-09-04: the usage API answers `resets_at: null` for every window
+# whose utilization is exactly 0.0, i.e. for the seat with a whole untouched week
+# in it, while the reset instant itself is on a fixed 7-day cadence per seat. The
+# cache then OVERWROTE the last known instant with that empty value, so `cl
+# --list` printed "weekly reset unknown", sorted the healthiest seat LAST among
+# usable ones, and at 22:34 `cl` said USE NEXT: cs (resets Mon) while `cdt
+# accounts` said tommy (resets Sat 13:00) - two surfaces, one pool, two answers.
+#
+# The whole chain is pinned here: the cache REMEMBERS (wk_r_seen, never
+# overwritten by an empty, backfilled from an older row's wk_r), the engine
+# PROJECTS from it, the projection is published under its own key and never
+# blended into resets_at, it RANKS, and it renders with a `~` plus one legend.
+#
+# Instants are built from an epoch this scenario computes, not from iso_in, so
+# the expected projection is exact arithmetic rather than a second call to a
+# clock that has moved on.
+proj_fixture() {  # proj_fixture <name> <seen-iso-or-empty> [extra-cache-fields-json]
+  new_run "$1"
+  mkdir -p "$RUN/.claude-pool/fresh"
+  printf '{"claudeAiOauth":{"accessToken":"TOK-PROJ"}}' > "$RUN/.claude/.credentials.json"
+  cp "$RUN/.claude/.credentials.json" "$RUN/.claude-pool/fresh/.credentials.json"
+  printf '{"oauthAccount":{"emailAddress":"fresh@example.com"}}' > "$RUN/.claude-pool/fresh/.claude.json"
+  printf '{"oauthAccount":{"emailAddress":"fresh@example.com"}}' > "$RUN/.claude.json"
+  cat > "$RUN/cfg/accounts" <<EOF
+fresh@example.com|$RUN/.claude-pool/fresh
+EOF
+  # the row a PREVIOUS run left behind: a real weekly instant in wk_r and NO
+  # wk_r_seen, which is every row on disk the day this ships
+  jq -n --arg wr "${2:-}" \
+    '{"fresh@example.com":{wk_u:"12",wk_r:$wr,se_u:"5",se_r:"",ts:"Sep 01 09:00",ts_epoch:"1"}}' \
+    > "$RUN/cfg/usage-cache.json"
+  # the live answer for an untouched window, verbatim from the vendor
+  printf '{"five_hour":{"utilization":0.0,"resets_at":null},
+ "seven_day":{"utilization":0.0,"resets_at":null},
+ "seven_day_opus":null,"seven_day_sonnet":null,
+ "limits":[{"kind":"session","group":"session","percent":0,"resets_at":null,"scope":null},
+   {"kind":"weekly_all","group":"weekly","percent":0,"resets_at":null,"scope":null},
+   {"kind":"weekly_scoped","group":"weekly","percent":0,"resets_at":null,
+    "scope":{"model":{"id":null,"display_name":"Fable"}}}]}' \
+    > "$RUN/state/usage-TOK-PROJ.json"
+}
+
+# (a) a cache row that HAS an instant → project it forward a week at a time
+PROJ_SEEN_EPOCH=$(( $(date -u '+%s') - 3 * 86400 ))
+PROJ_SEEN="$(date -u -r "$PROJ_SEEN_EPOCH" '+%Y-%m-%dT%H:%M:%S.123456+00:00')"
+PROJ_WANT="$(date -u -r $(( PROJ_SEEN_EPOCH + 604800 )) '+%Y-%m-%dT%H:%M:%S+00:00')"
+proj_fixture projected "$PROJ_SEEN"
+set +e
+OUT="$(FAKE_NEW_EMAIL=fresh@example.com "$SCRIPT" usage --no-color 2>/dev/null)"
+VOUT="$(FAKE_NEW_EMAIL=fresh@example.com "$SCRIPT" usage --no-color --verbose 2>/dev/null)"
+JSON_OUT="$(FAKE_NEW_EMAIL=fresh@example.com "$SCRIPT" usage --json 2>/dev/null)"
+RC=$?
+set -e
+PJ_ROW="$(prow "fresh@example.com" "$JSON_OUT")"
+[ "$RC" -eq 0 ] && ok "projection → usage --json exits 0" || bad "projection → exits 0 (got $RC: $JSON_OUT)"
+[ "$(jq -r '.weekly.resets_at' <<<"$PJ_ROW")" = "null" ] \
+  && ok "projection → weekly.resets_at stays NULL: the vendor said nothing and the published field must not pretend otherwise" \
+  || bad "projection → resets_at must stay null (got: $(jq -c '.weekly' <<<"$PJ_ROW"))"
+[ "$(jq -r '.weekly.resets_at_projected' <<<"$PJ_ROW")" = "$PROJ_WANT" ] \
+  && ok "projection → resets_at_projected is the seen instant rolled forward whole weeks past now" \
+  || bad "projection → resets_at_projected (want $PROJ_WANT, got: $(jq -c '.weekly' <<<"$PJ_ROW"))"
+[ "$(jq -r '.weekly.projected_from' <<<"$PJ_ROW")" = "$PROJ_SEEN" ] \
+  && ok "projection → projected_from names the instant it was computed from, so the claim is checkable" \
+  || bad "projection → projected_from (want $PROJ_SEEN, got: $(jq -c '.weekly' <<<"$PJ_ROW"))"
+[ "$(jq -r '.weekly.fresh' <<<"$PJ_ROW")" = "true" ] \
+  && ok "projection → the window is still FRESH: a projection describes it, it does not change what it is" \
+  || bad "projection → the window stays fresh (got: $(jq -c '.weekly' <<<"$PJ_ROW"))"
+# ⚠️ THE MEMORY ITSELF. wk_r goes empty (that is what the API said) and wk_r_seen
+# keeps the instant, seeded from the pre-existing row: scenario (f) of the same fix.
+[ "$(jq -r '."fresh@example.com".wk_r_seen' "$RUN/cfg/usage-cache.json")" = "$PROJ_SEEN" ] \
+  && ok "projection → the cache KEEPS the last non-empty reset in wk_r_seen (backfilled from the old row's wk_r)" \
+  || bad "projection → wk_r_seen kept (got: $(cat "$RUN/cfg/usage-cache.json"))"
+[ "$(jq -r '."fresh@example.com".wk_r' "$RUN/cfg/usage-cache.json")" = "" ] \
+  && ok "projection → wk_r still records what THIS fetch said (empty), so the two fields cannot be confused" \
+  || bad "projection → wk_r holds this run's answer (got: $(cat "$RUN/cfg/usage-cache.json"))"
+grep -q 'resets ~in ' <<<"$OUT" \
+  && ok "projection → the ACTIVE weekly row prints the countdown with a leading ~" \
+  || bad "projection → the ~ countdown renders (got: $OUT)"
+grep -q "~ projected: window untouched since it rolled" <<<"$OUT" \
+  && ok "projection → ONE legend line under the table explains the ~" \
+  || bad "projection → the legend renders (got: $OUT)"
+grep -q 'resets  weekly resets ~' <<<"$VOUT" \
+  && ok "projection → --verbose names the projected instant, marked, instead of 'no active window yet'" \
+  || bad "projection → verbose detail (got: $VOUT)"
+
+# (b) nothing ever seen for this seat → NO projection, and no ~ anywhere
+proj_fixture noseen ""
+set +e
+OUT="$(FAKE_NEW_EMAIL=fresh@example.com "$SCRIPT" usage --no-color 2>/dev/null)"
+JSON_OUT="$(FAKE_NEW_EMAIL=fresh@example.com "$SCRIPT" usage --json 2>/dev/null)"
+set -e
+NS_ROW="$(prow "fresh@example.com" "$JSON_OUT")"
+[ "$(jq -r '[.weekly.resets_at, .weekly.resets_at_projected, .weekly.projected_from] | @csv' <<<"$NS_ROW")" = ',,' ] \
+  && ok "no seen instant → all three reset fields are null: an unknown cadence is not guessed" \
+  || bad "no seen instant → nothing is invented (got: $(jq -c '.weekly' <<<"$NS_ROW"))"
+grep -q 'no active window yet (starts on first use)' <<<"$OUT" \
+  && ok "no seen instant → the row keeps the honest FRESH phrase" \
+  || bad "no seen instant → keeps the fresh phrase (got: $OUT)"
+! grep -q '~ projected' <<<"$OUT" \
+  && ok "no seen instant → no legend for a mark that is not on the page" \
+  || bad "no seen instant → legend must be absent (got: $OUT)"
+
+# (c) an EXPIRED cached window is UNMEASURED, and must not be given a deadline.
+# Its number describes a window that no longer exists, so there is nothing to
+# project FROM: inventing a reset here would put a confident deadline on a row
+# whose whole point is "go and look, this may be full".
+#
+# ⚠️ THIS IS THE ROW-LEVEL BEHAVIOUR, NOT THE GUARD. A fixture cannot reach
+# project_weekly's U_WKX guard: an expired flag only ever comes from
+# window_expired on the very stamp that is then in U_WKR, which the first guard
+# catches. The guard itself is pinned directly in case (g) below, so deleting it
+# reds the suite.
+proj_fixture expiredproj "$PROJ_SEEN"
+rm -f "$RUN/state/usage-TOK-PROJ.json"          # no live answer: the cache is all there is
+jq -n --arg wr "$(iso_in -2d)" \
+  '{"fresh@example.com":{wk_u:"40",wk_r:$wr,se_u:"5",se_r:"",ts:"Sep 01 09:00",ts_epoch:"1",wk_r_seen:$wr}}' \
+  > "$RUN/cfg/usage-cache.json"
+set +e
+JSON_OUT="$(FAKE_NEW_EMAIL=fresh@example.com "$SCRIPT" usage --json 2>/dev/null)"
+set -e
+EX_ROW="$(prow "fresh@example.com" "$JSON_OUT")"
+[ "$(jq -r '.weekly.expired' <<<"$EX_ROW")" = "true" ] \
+  && ok "expired window → still expired (the fixture is doing what it claims)" \
+  || bad "expired window → fixture (got: $(jq -c '.weekly' <<<"$EX_ROW"))"
+[ "$(jq -r '.weekly.resets_at_projected' <<<"$EX_ROW")" = "null" ] \
+  && ok "expired window → NO projection: an unmeasured row must not be handed a deadline" \
+  || bad "expired window → no projection (got: $(jq -c '.weekly' <<<"$EX_ROW"))"
+[ "$(jq -r '.unmeasured' <<<"$EX_ROW")" = "true" ] \
+  && ok "expired window → the row is still UNMEASURED, not quietly rescued by the projection" \
+  || bad "expired window → stays unmeasured (got: $EX_ROW)"
+
+# (d) THE RANKING. The projected seat loses its whole week on Saturday; the seat
+# with a real reset loses its on Thursday-week. Ranking the projected one as
+# "nothing expiring" (which is what an empty deadline does) sends the operator to
+# the wrong seat, which is the live defect this whole change exists to fix.
+new_run projrank
+mkdir -p "$RUN/.claude-pool/primary" "$RUN/.claude-pool/proj" "$RUN/.claude-pool/later"
+printf '{"claudeAiOauth":{"accessToken":"TOK-PR-PRIMARY"}}' > "$RUN/.claude/.credentials.json"
+cp "$RUN/.claude/.credentials.json" "$RUN/.claude-pool/primary/.credentials.json"
+printf '{"claudeAiOauth":{"accessToken":"TOK-PR-PROJ"}}'  > "$RUN/.claude-pool/proj/.credentials.json"
+printf '{"claudeAiOauth":{"accessToken":"TOK-PR-LATER"}}' > "$RUN/.claude-pool/later/.credentials.json"
+for a in primary proj later; do
+  printf '{"oauthAccount":{"emailAddress":"%s@example.com"}}' "$a" > "$RUN/.claude-pool/$a/.claude.json"
+done
+printf '{"oauthAccount":{"emailAddress":"primary@example.com"}}' > "$RUN/.claude.json"
+cat > "$RUN/cfg/accounts" <<EOF
+primary@example.com|$RUN/.claude-pool/primary
+proj@example.com|$RUN/.claude-pool/proj
+later@example.com|$RUN/.claude-pool/later
+EOF
+PR_SEEN_EPOCH=$(( $(date -u '+%s') - 5 * 86400 ))
+PR_SEEN="$(date -u -r "$PR_SEEN_EPOCH" '+%Y-%m-%dT%H:%M:%S.000000+00:00')"
+PR_WANT="$(date -u -r $(( PR_SEEN_EPOCH + 604800 )) '+%Y-%m-%dT%H:%M:%S+00:00')"   # ~2d out
+jq -n --arg wr "$PR_SEEN" \
+  '{"proj@example.com":{wk_u:"18",wk_r:$wr,se_u:"5",se_r:"",ts:"Sep 01 09:00",ts_epoch:"1",wk_r_seen:$wr}}' \
+  > "$RUN/cfg/usage-cache.json"
+printf '{"seven_day":{"utilization":0.0,"resets_at":null},"five_hour":{"utilization":0.0,"resets_at":null}}' \
+  > "$RUN/state/usage-TOK-PR-PROJ.json"
+printf '{"seven_day":{"utilization":30,"resets_at":"%s"},"five_hour":{"utilization":10,"resets_at":"%s"}}' \
+  "$(iso_in +5d)" "$(iso_in +2H)" > "$RUN/state/usage-TOK-PR-LATER.json"
+printf '{"seven_day":{"utilization":99,"resets_at":"%s"},"five_hour":{"utilization":15,"resets_at":"%s"}}' \
+  "$(iso_in +4d)" "$(iso_in +1H)" > "$RUN/state/usage-TOK-PR-PRIMARY.json"
+set +e
+JSON_OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --json 2>/dev/null)"
+set -e
+[ "$(jq -r '.recommendation.email' <<<"$JSON_OUT")" = "proj@example.com" ] \
+  && ok "projected ranking → the seat that loses its untouched week FIRST is the pick, not the one resetting later" \
+  || bad "projected ranking → picks proj (got: $(jq -c '.recommendation' <<<"$JSON_OUT"))"
+[ "$(jq -r '.recommendation.deadline_at' <<<"$JSON_OUT")" = "$PR_WANT" ] \
+  && ok "projected ranking → the published deadline IS the projected instant, so the sentence and the order agree" \
+  || bad "projected ranking → deadline_at (want $PR_WANT, got: $(jq -c '.recommendation' <<<"$JSON_OUT"))"
+[ "$(jq -r '.recommendation.deadline_kind' <<<"$JSON_OUT")" = "reset" ] \
+  && ok "projected ranking → the deadline is named a reset, which is what it is" \
+  || bad "projected ranking → deadline_kind (got: $(jq -c '.recommendation' <<<"$JSON_OUT"))"
+
+# (e) THE SECOND ROUTE TO THE SAME BLANK. weekly_binding picks the highest weekly
+# `limits` entry; the SCOPED one carries resets_at: null while its utilization is
+# 0 and weekly_all carries the instant. When the scoped entry binds, the row used
+# to publish no reset at all even with real weekly usage on the seat.
+new_run scopednullreset
+mkdir -p "$RUN/.claude-pool/solo"
+printf '{"claudeAiOauth":{"accessToken":"TOK-SCOPED-NULL"}}' > "$RUN/.claude/.credentials.json"
+cp "$RUN/.claude/.credentials.json" "$RUN/.claude-pool/solo/.credentials.json"
+printf '{"oauthAccount":{"emailAddress":"solo@example.com"}}' > "$RUN/.claude-pool/solo/.claude.json"
+printf '{"oauthAccount":{"emailAddress":"solo@example.com"}}' > "$RUN/.claude.json"
+cat > "$RUN/cfg/accounts" <<EOF
+solo@example.com|$RUN/.claude-pool/solo
+EOF
+SN_ALL_R="$(iso_in +3d)"; SN_FIVE_R="$(iso_in +2H)"
+printf '{"five_hour":{"utilization":10.0,"resets_at":"%s"},
+ "seven_day":{"utilization":21.0,"resets_at":"%s"},
+ "limits":[{"kind":"session","group":"session","percent":10,"resets_at":"%s","scope":null},
+   {"kind":"weekly_all","group":"weekly","percent":21,"resets_at":"%s","scope":null},
+   {"kind":"weekly_scoped","group":"weekly","percent":47,"resets_at":null,
+    "scope":{"model":{"id":null,"display_name":"Fable"}}}]}' \
+  "$SN_FIVE_R" "$SN_ALL_R" "$SN_FIVE_R" "$SN_ALL_R" > "$RUN/state/usage-TOK-SCOPED-NULL.json"
+set +e
+JSON_OUT="$(FAKE_NEW_EMAIL=solo@example.com "$SCRIPT" usage --json 2>/dev/null)"
+set -e
+SN_ROW="$(prow "solo@example.com" "$JSON_OUT")"
+[ "$(jq -r '[.weekly.kind, (.weekly.used_pct|tostring)] | join(" ")' <<<"$SN_ROW")" = "weekly_scoped 47" ] \
+  && ok "scoped null reset → the scoped entry BINDS and its 47% is the weekly figure (the fixture exercises the real path)" \
+  || bad "scoped null reset → scoped binds (got: $(jq -c '.weekly' <<<"$SN_ROW"))"
+[ "$(jq -r '.weekly.resets_at' <<<"$SN_ROW")" = "$SN_ALL_R" ] \
+  && ok "scoped null reset → weekly_all's instant fills in: a scoped cap shares the seat's weekly cadence" \
+  || bad "scoped null reset → weekly_all's instant is used (want $SN_ALL_R, got: $(jq -c '.weekly' <<<"$SN_ROW"))"
+[ "$(jq -r '.weekly.resets_at_projected' <<<"$SN_ROW")" = "null" ] \
+  && ok "scoped null reset → and it is a MEASURED instant, so nothing is projected" \
+  || bad "scoped null reset → no projection needed (got: $(jq -c '.weekly' <<<"$SN_ROW"))"
+
+# (f) the other half of the memory: a NON-EMPTY reading always updates wk_r_seen,
+# so the field tracks the seat's cadence forward instead of freezing on the first
+# instant this box ever saw.
+proj_fixture seenupdates "$PROJ_SEEN"
+SU_NEW_R="$(iso_in +4d)"
+printf '{"seven_day":{"utilization":30,"resets_at":"%s"},"five_hour":{"utilization":10,"resets_at":"%s"}}' \
+  "$SU_NEW_R" "$(iso_in +2H)" > "$RUN/state/usage-TOK-PROJ.json"
+set +e
+JSON_OUT="$(FAKE_NEW_EMAIL=fresh@example.com "$SCRIPT" usage --json 2>/dev/null)"
+set -e
+SU_ROW="$(prow "fresh@example.com" "$JSON_OUT")"
+[ "$(jq -r '."fresh@example.com".wk_r_seen' "$RUN/cfg/usage-cache.json")" = "$SU_NEW_R" ] \
+  && ok "seen updates → a non-empty reading overwrites wk_r_seen, so the remembered cadence follows the seat" \
+  || bad "seen updates → wk_r_seen follows the newest instant (got: $(cat "$RUN/cfg/usage-cache.json"))"
+[ "$(jq -r '.weekly.resets_at_projected' <<<"$SU_ROW")" = "null" ] \
+  && ok "seen updates → with a real reset in hand nothing is projected" \
+  || bad "seen updates → no projection alongside a real reset (got: $(jq -c '.weekly' <<<"$SU_ROW"))"
+
+# (g) project_weekly's GUARDS, asserted on the function itself.
+#
+# Every guard but one is reachable through a fixture; the U_WKX one is not,
+# because an expired flag always travels with the stamp that produced it. A test
+# that cannot fail is worse than no test - it reports that a deleted guard is
+# still there - so this calls the function directly with the arrays set by hand,
+# which is also the only way to state what each guard is FOR.
+GUARD_CACHE="$ROOT/guard-cache.json"
+jq -n --arg wr "$PROJ_SEEN" \
+  '{"seen@example.com":{wk_u:"0.0",wk_r:"",se_u:"0.0",se_r:"",ts:"x",ts_epoch:"1",wk_r_seen:$wr}}' \
+  > "$GUARD_CACHE"
+# <weekly-used> <weekly-reset> <expired> -> the projected instant, or ""
+guard_case() {  # guard_case <wk_u> <wk_r> <wk_x>
+  bash -c '
+    source "$1" >/dev/null 2>&1
+    USAGE_CACHE="$2"
+    U_EMAIL=(seen@example.com); U_WKU=("$3"); U_WKR=("$4"); U_WKX=("$5")
+    project_weekly 0
+    printf "%s" "${U_WKP[0]}"
+  ' _ "$LIB" "$GUARD_CACHE" "$1" "$2" "$3" 2>/dev/null
+}
+[ "$(guard_case "0.0" "" 0)" = "$PROJ_WANT" ] \
+  && ok "guards → the control case DOES project (so a failure below is the guard, not the fixture)" \
+  || bad "guards → control projects (got: $(guard_case "0.0" "" 0), want $PROJ_WANT)"
+[ -z "$(guard_case "0.0" "" 1)" ] \
+  && ok "guards → an EXPIRED window is never projected: its number describes a window that no longer exists" \
+  || bad "guards → expired window projects (got: $(guard_case "0.0" "" 1))"
+[ -z "$(guard_case "0.0" "$(iso_in +3d)" 0)" ] \
+  && ok "guards → a MEASURED reset is never overwritten by an inference" \
+  || bad "guards → measured reset survives (got: $(guard_case "0.0" "$(iso_in +3d)" 0))"
+[ -z "$(guard_case "" "" 0)" ] \
+  && ok "guards → an INCOMPLETE window (no parseable utilization) is left unknown, not projected" \
+  || bad "guards → incomplete window projects (got: $(guard_case "" "" 0))"
+
+# --- 60. THE PROJECTED INSTANT IS MARKED WHEREVER IT IS PRINTED ---------------
+# recommendation_text's output is published VERBATIM as recommendation.reason in
+# `usage --json`, which cl and pocketmux read, so an unmarked projected instant
+# in that sentence is the same lie on the machine surface as on the human one -
+# and worse, because a parser cannot see the table's legend. Same for the
+# optimizer-pick line switch-auto prints, which is the only record of why an
+# unattended switch happened.
+#
+# It also pins the pair of fields that must AGREE: recommendation.weekly_fresh
+# and the picked row's own weekly.fresh. They stopped agreeing the moment the
+# projection gave an untouched window a deadline, because weekly_fresh was
+# derived from the deadline rather than from the window.
+new_run projreason
+mkdir -p "$RUN/.claude-pool/primary" "$RUN/.claude-pool/proj"
+printf '{"claudeAiOauth":{"accessToken":"TOK-PJ-PRIMARY"}}' > "$RUN/.claude/.credentials.json"
+cp "$RUN/.claude/.credentials.json" "$RUN/.claude-pool/primary/.credentials.json"
+printf '{"claudeAiOauth":{"accessToken":"TOK-PJ-PROJ"}}' > "$RUN/.claude-pool/proj/.credentials.json"
+printf '{"oauthAccount":{"emailAddress":"primary@example.com"}}' > "$RUN/.claude-pool/primary/.claude.json"
+printf '{"oauthAccount":{"emailAddress":"proj@example.com"}}'    > "$RUN/.claude-pool/proj/.claude.json"
+printf '{"oauthAccount":{"emailAddress":"primary@example.com"}}' > "$RUN/.claude.json"
+cat > "$RUN/cfg/accounts" <<EOF
+primary@example.com|$RUN/.claude-pool/primary
+proj@example.com|$RUN/.claude-pool/proj
+EOF
+jq -n --arg wr "$PROJ_SEEN" \
+  '{"proj@example.com":{wk_u:"18",wk_r:$wr,se_u:"5",se_r:"",ts:"x",ts_epoch:"1",wk_r_seen:$wr}}' \
+  > "$RUN/cfg/usage-cache.json"
+# primary: comfortable (so the mode is `floor` and the pick is a SWITCH), and a
+# real reset LATER than proj's projected one
+printf '{"seven_day":{"utilization":40,"resets_at":"%s"},"five_hour":{"utilization":10,"resets_at":"%s"}}' \
+  "$(iso_in +6d)" "$(iso_in +2H)" > "$RUN/state/usage-TOK-PJ-PRIMARY.json"
+printf '{"seven_day":{"utilization":0.0,"resets_at":null},"five_hour":{"utilization":0.0,"resets_at":null}}' \
+  > "$RUN/state/usage-TOK-PJ-PROJ.json"
+set +e
+OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --no-color 2>/dev/null)"
+JSON_OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --json 2>/dev/null)"
+SA_OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" switch-auto --dry-run 2>&1)"
+set -e
+PJ_REASON="$(jq -r '.recommendation.reason' <<<"$JSON_OUT")"
+[ "$(jq -r '.recommendation.email' <<<"$JSON_OUT")" = "proj@example.com" ] \
+  && ok "marked reason → the projected seat is the pick (the fixture is exercising the right branch)" \
+  || bad "marked reason → picks proj (got: $(jq -c '.recommendation' <<<"$JSON_OUT"))"
+grep -q 'weekly window has not started yet' <<<"$PJ_REASON" \
+  && ok "marked reason → the sentence KEEPS the fact that the window has not started" \
+  || bad "marked reason → keeps the fresh fact (got: $PJ_REASON)"
+grep -qE 'lost ~[0-9]{2}:[0-9]{2}' <<<"$PJ_REASON" \
+  && ok "marked reason → and names the projected deadline with a leading ~, never bare" \
+  || bad "marked reason → marks the instant (got: $PJ_REASON)"
+# ⚠️ SCOPED TO THE PICK'S OWN CLAUSE. The sentence also states the ACTIVE
+# account's standing, and that instant is a real measurement which must stay
+# unmarked - marking everything would be as wrong as marking nothing.
+PJ_PICK_CLAUSE="${PJ_REASON%% The active account*}"
+! grep -qE '(^|[^~])[0-9]{2}:[0-9]{2} [A-Za-z]{3} ' <<<"$PJ_PICK_CLAUSE" \
+  && ok "marked reason → no UNMARKED instant survives in the clause about the pick itself" \
+  || bad "marked reason → an unmarked instant is still in the pick clause (got: $PJ_PICK_CLAUSE)"
+grep -qE 'resets [0-9]{2}:[0-9]{2} [A-Za-z]{3} ' <<<"${PJ_REASON#*The active account}" \
+  && ok "marked reason → the ACTIVE account's own real reset stays UNMARKED (a measurement is not an inference)" \
+  || bad "marked reason → the active account's real reset must not be marked (got: $PJ_REASON)"
+[ "$(jq -r '.recommendation.deadline_projected' <<<"$JSON_OUT")" = "true" ] \
+  && ok "marked reason (json) → deadline_projected says the instant is an inference" \
+  || bad "marked reason (json) → deadline_projected (got: $(jq -c '.recommendation' <<<"$JSON_OUT"))"
+[ "$(jq -r '.recommendation.weekly_fresh' <<<"$JSON_OUT")" = "true" ] \
+  && ok "marked reason (json) → weekly_fresh stays TRUE: a projection describes the window, it does not start it" \
+  || bad "marked reason (json) → weekly_fresh (got: $(jq -c '.recommendation' <<<"$JSON_OUT"))"
+[ "$(jq -r '.recommendation.weekly_fresh' <<<"$JSON_OUT")" \
+  = "$(jq -r '.accounts[] | select(.email=="proj@example.com") | .weekly.fresh' <<<"$JSON_OUT")" ] \
+  && ok "marked reason (json) → recommendation.weekly_fresh AGREES with the picked row's own weekly.fresh" \
+  || bad "marked reason (json) → the two fresh fields disagree about one window"
+grep -q 'lost ~' <<<"$OUT" \
+  && ok "marked reason → the human table prints the same marked sentence" \
+  || bad "marked reason → human table (got: $OUT)"
+grep -qE 'optimizer pick: proj@example\.com .*weekly resets ~[0-9]{4}-' <<<"$SA_OUT" \
+  && ok "marked reason → switch-auto's pick line marks it too (the only record of an unattended switch)" \
+  || bad "marked reason → switch-auto pick line (got: $SA_OUT)"
+
+# --- 61. THE LEGEND FOLLOWS THE PAGE, NOT THE POOL ----------------------------
+# The default table prints a weekly reset for the ACTIVE row only: an
+# ALTERNATIVES or UNAVAILABLE row prints no reset at all. So a pool whose IDLE
+# seat projects while the ACTIVE seat has a real instant has no `~` anywhere on
+# the page, and a legend explaining one is noise that trains the reader to skip
+# legends. --verbose is the case where every row can show its own mark.
+new_run projlegend
+mkdir -p "$RUN/.claude-pool/primary" "$RUN/.claude-pool/idle"
+printf '{"claudeAiOauth":{"accessToken":"TOK-PL-PRIMARY"}}' > "$RUN/.claude/.credentials.json"
+cp "$RUN/.claude/.credentials.json" "$RUN/.claude-pool/primary/.credentials.json"
+printf '{"claudeAiOauth":{"accessToken":"TOK-PL-IDLE"}}' > "$RUN/.claude-pool/idle/.credentials.json"
+printf '{"oauthAccount":{"emailAddress":"primary@example.com"}}' > "$RUN/.claude-pool/primary/.claude.json"
+printf '{"oauthAccount":{"emailAddress":"idle@example.com"}}'    > "$RUN/.claude-pool/idle/.claude.json"
+printf '{"oauthAccount":{"emailAddress":"primary@example.com"}}' > "$RUN/.claude.json"
+cat > "$RUN/cfg/accounts" <<EOF
+primary@example.com|$RUN/.claude-pool/primary
+idle@example.com|$RUN/.claude-pool/idle
+EOF
+jq -n --arg wr "$PROJ_SEEN" \
+  '{"idle@example.com":{wk_u:"18",wk_r:$wr,se_u:"5",se_r:"",ts:"x",ts_epoch:"1",wk_r_seen:$wr}}' \
+  > "$RUN/cfg/usage-cache.json"
+printf '{"seven_day":{"utilization":40,"resets_at":"%s"},"five_hour":{"utilization":10,"resets_at":"%s"}}' \
+  "$(iso_in +2d)" "$(iso_in +2H)" > "$RUN/state/usage-TOK-PL-PRIMARY.json"
+printf '{"seven_day":{"utilization":0.0,"resets_at":null},"five_hour":{"utilization":0.0,"resets_at":null}}' \
+  > "$RUN/state/usage-TOK-PL-IDLE.json"
+set +e
+OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --no-color 2>/dev/null)"
+VOUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --no-color --verbose 2>/dev/null)"
+JSON_OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --json 2>/dev/null)"
+set -e
+[ "$(jq -r '.accounts[] | select(.email=="idle@example.com") | .weekly.resets_at_projected' <<<"$JSON_OUT")" != "null" ] \
+  && ok "legend gate → the idle seat really does project (the fixture is doing what it claims)" \
+  || bad "legend gate → idle seat projects (got: $JSON_OUT)"
+! grep -q '~ projected' <<<"$OUT" \
+  && ok "legend gate → the DEFAULT table prints no legend: its only reset row (the active one) is measured" \
+  || bad "legend gate → default table must not print a legend for a mark it never rendered (got: $OUT)"
+! grep -q '~' <<<"$(active_block <<<"$OUT")" \
+  && ok "legend gate → and there is indeed no ~ on the page to explain" \
+  || bad "legend gate → the active block carries a ~ (got: $(active_block <<<"$OUT"))"
+grep -q '~ projected' <<<"$VOUT" \
+  && ok "legend gate → --verbose DOES print it, because that is where every row shows its own reset" \
+  || bad "legend gate → verbose legend (got: $VOUT)"
+[ "$(grep -c '~ projected' <<<"$VOUT")" = 1 ] \
+  && ok "legend gate → exactly ONE legend line, however many rows project" \
+  || bad "legend gate → one legend line (got $(grep -c '~ projected' <<<"$VOUT"))"
+
+# --- 62. the SHARED cache-row merge, and its failure being audible ------------
+# rota_cache_merge_row lives in rota-ranking.sh because there are TWO writers
+# (rota-engine.sh's cache_flush, rota-keeper.sh's per-tick write) and a copy in
+# each is how they come to disagree about a field - which matters most for the
+# keeper, running every minute, because it would win every race.
+merge() { bash -c 'source "$1"; shift; rota_cache_merge_row "$@"' _ "$ROOT/rota-ranking.sh" "$@"; }
+M_EMPTY='{}'
+M1="$(merge "$M_EMPTY" a@example.com 10 "2026-09-01T10:00:00+00:00" 5 "" ts 1 fa)"
+[ "$(jq -r '."a@example.com".wk_r_seen' <<<"$M1")" = "2026-09-01T10:00:00+00:00" ] \
+  && ok "merge → a non-empty reading is remembered in wk_r_seen" \
+  || bad "merge → remembers a real instant (got: $M1)"
+M2="$(merge "$M1" a@example.com 0 "" 0 "" ts 2 fa)"
+[ "$(jq -r '."a@example.com".wk_r_seen' <<<"$M2")" = "2026-09-01T10:00:00+00:00" ] \
+  && [ "$(jq -r '."a@example.com".wk_r' <<<"$M2")" = "" ] \
+  && ok "merge → an EMPTY reading updates wk_r and leaves wk_r_seen standing" \
+  || bad "merge → empty reading must not erase the memory (got: $M2)"
+M3="$(merge '{"a@example.com":{"wk_u":"9","wk_r":"2026-08-30T09:00:00+00:00"}}' \
+      a@example.com 0 "" 0 "" ts 3 fa)"
+[ "$(jq -r '."a@example.com".wk_r_seen' <<<"$M3")" = "2026-08-30T09:00:00+00:00" ] \
+  && ok "merge → a pre-field row SEEDS wk_r_seen from its own wk_r (the backfill)" \
+  || bad "merge → backfill from wk_r (got: $M3)"
+M4="$(merge '{}' a@example.com 0 "" 0 "" ts 4 fa)"
+[ "$(jq -r '."a@example.com" | has("wk_r_seen")' <<<"$M4")" = "false" ] \
+  && ok "merge → nothing ever seen means NO key, never an empty string standing in for one" \
+  || bad "merge → absent key when nothing seen (got: $M4)"
+! merge 'not json at all {{{' a@example.com 0 "" 0 "" ts 5 fa >/dev/null 2>&1 \
+  && ok "merge → refuses (non-zero) rather than answering with something it did not merge" \
+  || bad "merge → must fail on unparseable input"
+[ -z "$(merge 'not json at all {{{' a@example.com 0 "" 0 "" ts 5 fa 2>/dev/null)" ] \
+  && ok "merge → and prints NOTHING on failure, so a caller cannot mistake junk for a merge" \
+  || bad "merge → silent on failure"
+# ⚠️ A FROZEN CACHE MUST NOT BE A SILENT ONE. If jq ever rejects the merge, every
+# field stops updating, not just the new one, and the numbers keep rendering as
+# though they were current. Once per run, naming the file.
+WARN_OUT="$(bash -c 'source "$1" >/dev/null 2>&1; USAGE_CACHE=/tmp/rota-test-cache.json; cache_merge_warn; cache_merge_warn' _ "$LIB" 2>&1 >/dev/null)"
+[ "$(grep -c 'could NOT update the usage cache' <<<"$WARN_OUT")" = 1 ] \
+  && ok "merge → a failed merge warns on stderr exactly ONCE per run, not once per account" \
+  || bad "merge → one warning per run (got: $WARN_OUT)"
+grep -q '/tmp/rota-test-cache.json' <<<"$WARN_OUT" \
+  && ok "merge → and the warning names the file, so the next step is obvious" \
+  || bad "merge → warning names the cache file (got: $WARN_OUT)"
+
+# --- 60. dormant seat × 429: the wake the operator used to have to remember -----
 # tommy, 2026-08-25 → 09-01: nothing touched the seat after its weekly window
 # rolled, the usage API 429'd its in-date token six days straight, the skip
 # filed it under "live sessions share this token", and the row sat UNMEASURED
