@@ -42,13 +42,17 @@
 #                  dashboard's staleness rendering and this daemon read one file.
 #   4. AUTO-SWITCH at AUTO_SWITCH_PCT (90) on the ACTIVE account's binding
 #                  weekly OR five-hour utilization: pick the best target
-#                  (logged in, not dead, SOONEST weekly reset among accounts
+#                  (logged in, not dead, SOONEST DEADLINE among accounts
 #                  with at least AUTO_SWITCH_TARGET_MIN_LEFT_PCT (30) weekly
 #                  left; the operator's 2026-08-16 policy: work the account that
 #                  expires next and burn it before moving on), `switch-all
 #                  <target> [--restart-idle]`, notify once. Hysteresis: never
 #                  switch back to the account we just left within 30 min,
-#                  never onto an account above 80%.
+#                  never onto an account above 80%. The deadline is
+#                  min(weekly reset, SEAT END) and the ordering around it lives
+#                  in rota-ranking.sh, SHARED with rota-engine.sh's own picker,
+#                  so the unattended switch and the interactive advice cannot
+#                  name different seats.
 #   4b. PANE CONVERGE (2026-08-12), after a switch, EVERY pane must end up
 #                  on the active account without further action: idle panes
 #                  immediately (the switch's own default restart), and panes
@@ -111,9 +115,31 @@ set -euo pipefail
 export PATH="${CLAUDE_KEEPER_PATH_PREFIX:-/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin}:/usr/bin:/bin${PATH:+:$PATH}"
 
 ROTA_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ⚠️ THE AUTO-SWITCH PICKER'S RANKING IS NOT WRITTEN IN THIS FILE. It is
+# rota_seat_deadline + rota_deadline_beats, shared with rota-engine.sh's
+# compute_recommendation, because the two used to hold the same rule separately
+# and drifted the moment one of them learned something (see rota-ranking.sh).
+# Sourcing it defines functions and nothing else.
+#
+# ⚠️ HARD FAIL, never a silent degrade: an unattended daemon that has quietly
+# lost its ranking rule would keep switching seats, just to the wrong ones, and
+# nobody is watching it at 03:00.
+if [[ ! -r "$ROTA_LIB/rota-ranking.sh" ]]; then
+  printf 'rota-keeper: %s/rota-ranking.sh is missing; this is an incomplete checkout (it holds the seat ranking, shared with rota-engine.sh)\n' "$ROTA_LIB" >&2
+  exit 1
+fi
+# shellcheck source=lib/rota-ranking.sh
+. "$ROTA_LIB/rota-ranking.sh"
+
 CFG_DIR="${CLAUDE_FAILOVER_HOME:-$HOME/.config/claude-failover}"
 ACCOUNTS_FILE="$CFG_DIR/accounts"
 USAGE_CACHE="$CFG_DIR/usage-cache.json"
+# The seat lifecycle (status + end date) the ranking needs. Same default and
+# same override as rota-engine.sh's, so both pickers read ONE file; absent, every
+# seat is "active with no end date" and the ranking degrades to the weekly reset,
+# which is what this picker did before it read the file at all.
+BILLING_JSON="${CLAUDE_BILLING_JSON:-$CFG_DIR/billing.json}"
 USAGE_API="${CLAUDE_KEEPER_USAGE_API:-https://api.anthropic.com/api/oauth/usage}"
 # The UA is load-bearing: the usage API buckets unknown agents into a much
 # tighter rate limit (spec §3). Override only in tests.
@@ -885,6 +911,10 @@ nudge_account() {  # nudge_account <label> <dir> <why>
   cred_is_complete "$cred" || { log "skip nudge $label: credential incomplete (husk, needs a browser login)"; return 1; }
   refresh_known_dead "$label" "$cred" && { log "skip nudge $label: refresh already rejected for this credential (dead-refresh marker)"; return 1; }
   dir_has_live_process "$dir" && { log "skip nudge $label: a live claude process is pinned to $(tilde "$dir") (it refreshes its own chain)"; return 1; }
+  if seat_is_reserved "$label" "$dir" && [[ "${ROTA_NUDGE_RESERVED:-0}" != "1" ]]; then
+    log "skip nudge $label: reserved seat, its owner's machine rotates the token and a nudge from here would rotate the chain out from under it (ROTA_NUDGE_RESERVED=1 overrides)"
+    return 1
+  fi
   pre_fp="$(cred_fingerprint "$cred" 2>/dev/null || true)"
   pre_exp="$(jq -r '.claudeAiOauth.expiresAt // empty' "$cred" 2>/dev/null || true)"
   [[ "$pre_exp" =~ ^[0-9]+$ ]] || pre_exp=""
@@ -934,7 +964,10 @@ nudge_account() {  # nudge_account <label> <dir> <why>
 
 # ── usage fetch (one per account per tick), cache_flush's row shape ──────────
 # Per-label results for this tick, consumed by auto-switch + warming.
-U_LBL=(); U_WK=(); U_WKR=(); U_SE=(); U_SER=()
+# U_WKP is the PROJECTED weekly reset (weekly_projection), empty unless the API
+# named none for a window that still parses. It is a separate array, never mixed
+# into U_WKR, so nothing downstream can lose track of which of the two it holds.
+U_LBL=(); U_WK=(); U_WKR=(); U_SE=(); U_SER=(); U_WKP=()
 FETCHED=0
 usage_for() {  # usage_for <label> → index into U_* or empty
   local i
@@ -990,21 +1023,69 @@ fetch_usage() {  # fetch_usage <label> <dir>
   IFS=$'\x1f' read -r wk wk_r se se_r <<<"$row"
   U_LBL+=("$label"); U_WK+=("$wk"); U_WKR+=("$wk_r"); U_SE+=("$se"); U_SER+=("$se_r")
   FETCHED=$((FETCHED + 1))
+  # ⚠️ THE PROJECTION IS TAKEN BEFORE THE WRITE BELOW, deliberately: the row
+  # still on disk holds the PREVIOUS reading, and on an untouched window that is
+  # the only instant there is to project from (this fetch answered null). Same
+  # ordering, same reason, as rota-engine.sh's live path.
+  U_WKP+=("$(weekly_projection "$label" "$wk" "$wk_r")")
   # cache row, cache_flush's exact shape + fetched_at
-  local data ts te fa
+  local data ts te fa merged
   ts="$(date '+%b %d %H:%M')"; te="$(date '+%s')"; fa="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   mkdir -p "$CFG_DIR"
   data="$(cat "$USAGE_CACHE" 2>/dev/null || echo '{}')"
   # a corrupt cache (truncated write, disk hiccup) must SELF-HEAL: without
   # this the jq below fails and the junk file lives forever (stage-2 review)
   jq -e . <<<"$data" >/dev/null 2>&1 || data='{}'
-  data="$(jq --arg e "$label" --arg wu "$wk" --arg wr "$wk_r" --arg su "$se" \
-             --arg sr "$se_r" --arg ts "$ts" --arg te "$te" --arg fa "$fa" \
-             '.[$e]={wk_u:$wu,wk_r:$wr,se_u:$su,se_r:$sr,ts:$ts,ts_epoch:$te,fetched_at:$fa}' \
-             <<<"$data" 2>/dev/null || printf '%s' "$data")"
+  # The merge is rota_cache_merge_row (rota-ranking.sh), the SAME function
+  # rota-engine.sh's cache_flush calls. It used to be a copy of that jq here, and
+  # a copy is how the two writers come to disagree about a field - which matters
+  # more for this writer than any other, because it runs every minute on the pool
+  # host and would win every race. See there for what wk_r_seen is.
+  if merged="$(rota_cache_merge_row "$data" "$label" "$wk" "$wk_r" "$se" "$se_r" "$ts" "$te" "$fa")"; then
+    data="$merged"
+    log_state_clear "cache-merge"
+  else
+    # ⚠️ NEVER SILENTLY. A rejected merge freezes EVERY field in the cache, not
+    # just the new one, and this process has no terminal to complain to, so it
+    # goes in the log - once per state, so a persistent failure is one line and
+    # not a minute-by-minute wall.
+    log_once "cache-merge" "fail" "usage cache at $USAGE_CACHE could NOT be updated (jq rejected the row merge); cached numbers are being kept as they are and will go on aging"
+  fi
   printf '%s' "$data" > "$USAGE_CACHE.tmp.$$" 2>/dev/null \
     && mv "$USAGE_CACHE.tmp.$$" "$USAGE_CACHE" || rm -f "$USAGE_CACHE.tmp.$$"
   return 0
+}
+
+# ── the untouched window's reset, for the UNATTENDED picker ──────────────────
+#
+# ⚠️ THE KEEPER HAS TO ANSWER THIS TOO, OR IT DISAGREES WITH EVERY OTHER SURFACE.
+# It fetches /api/oauth/usage itself rather than reading `rota usage --json`, so
+# when the API answers `resets_at: null` for a window nothing has spent in yet,
+# its `jreset` is empty, rota_seat_deadline gets nothing, and rota_deadline_beats
+# ranks that seat LAST ("nothing expiring") - while `rota usage`, `rota billing`
+# and `cl` now rank it by its projected reset. The 90%-wall auto-switch would
+# then send him somewhere the dashboard says is wrong, unattended, at 03:00.
+#
+# Same guards as the engine's project_weekly, minus the ones that cannot arise
+# here: this only ever runs on a LIVE fetch, so there is no expired-cache case.
+# Empty answer for anything unknown; nothing is ever guessed.
+weekly_projection() {  # weekly_projection <label> <weekly-used> <weekly-reset> -> <iso>|""
+  local label="${1:-}" wk="${2:-}" wk_r="${3:-}" seen
+  [[ -z "$wk_r" ]] || return 0                    # a measured instant needs no projection
+  [[ -n "$(pct_int "$wk")" ]] || return 0         # no usable number → nothing to describe
+  [[ -n "$label" && -f "$USAGE_CACHE" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  # wk_r_seen first, then the row's own wk_r for a row written before the field
+  # existed: the same read-side backfill project_weekly does, so the first tick
+  # after an upgrade is already right rather than the one after it.
+  # ⚠️ NOT `.wk_r_seen // .wk_r`: in jq only null and false are falsy, so an
+  # empty-STRING wk_r_seen (a hand-edited row, a row from another writer) would
+  # win the `//` and silently answer "". The test is explicit for that reason.
+  seen="$(jq -r --arg e "$label" '(.[$e] // {})
+            | (if (.wk_r_seen // "") != "" then .wk_r_seen else (.wk_r // "") end)' \
+          "$USAGE_CACHE" 2>/dev/null || true)"
+  [[ -n "$seen" ]] || return 0
+  rota_roll_forward_weekly "$seen"
 }
 
 pct_int() {  # "91.5" → 91, "" → empty
@@ -1251,31 +1332,56 @@ main() {
   # 3b. RESERVED SEATS, say so ONCE when one drops below its floor.
   check_reserved_seats
 
-  # 4. AUTO-SWITCH, the claim's binding weekly OR 5h utilization ≥ threshold
-  local claim="" ui="" wk="" se=""
+  # 4. AUTO-SWITCH, the claim's binding weekly OR 5h utilization ≥ threshold,
+  #    OR the claim's SEAT HAS ENDED (a wall no percentage can express)
+  local claim="" ui="" wk="" se="" claim_ended=0
   claim="$(jq -r '.oauthAccount.emailAddress // empty' "$HOME/.claude.json" 2>/dev/null || true)"
   if [[ -n "$claim" ]]; then
     ui="$(usage_for "$claim")"
     if [[ -n "$ui" ]]; then
       wk="$(pct_int "${U_WK[$ui]}")"; se="$(pct_int "${U_SE[$ui]}")"
     fi
-    if [[ -n "$wk" || -n "$se" ]] && { { [[ -n "$wk" ]] && (( wk >= AUTO_SWITCH_PCT )); } \
-                                        || { [[ -n "$se" ]] && (( se >= AUTO_SWITCH_PCT )); }; }; then
+    # ⚠️ THE THRESHOLD CANNOT SEE THIS ONE, AND THE POOL SAT ON IT FOR A DAY.
+    # A seat that has ended does not report 100% used; it reports NOTHING, so
+    # `wk`/`se` come back empty, the whole condition below is skipped, and the
+    # keeper holds the claim on a dead account tick after tick while every pane
+    # pinned to it fails. That is exactly what 2026-09-07 looked like on this
+    # pool (thea.hawk@, ended 6 Sep, still the claim on the 7th). Refusing to
+    # PICK an ended seat, the guard in the loop below, does not cover it: the
+    # seat was picked while it was alive and ended underneath the claim.
+    rota_seat_ended "$BILLING_JSON" "$claim" && claim_ended=1
+    if (( claim_ended )) \
+       || { [[ -n "$wk" || -n "$se" ]] && { { [[ -n "$wk" ]] && (( wk >= AUTO_SWITCH_PCT )); } \
+                                        || { [[ -n "$se" ]] && (( se >= AUTO_SWITCH_PCT )); }; }; }; then
       # THE KEEPER'S PICKER. NB a SECOND picker exists: the engine's
-      # compute_recommendation (floor/burn-down modes, soonest-reset ranking)
-      # drives the interactive `rota switch`/`rota usage` surfaces.
+      # compute_recommendation (floor/burn-down modes) drives the interactive
+      # `rota switch`/`rota usage` surfaces.
       #
       # 2026-08-16, THE OPERATOR DECIDED (asked explicitly). The old rule here was
       # "lowest binding weekly utilization, tie-break soonest weekly reset";
       # his policy is the other way round: "always work on the one that
       # expires next and burn all those tokens before switching to the one
-      # right after". So the RANKING is now SOONEST WEEKLY RESET, and the two
+      # right after". So the RANKING is soonest-deadline-first, and the two
       # pickers are INTENTIONALLY ALIGNED on it, that alignment is a decision,
       # not accidental drift, and a future reader should not "fix" it back.
-      # What stays separate is the FLOORS: the leaf runs MIN_WEEKLY (20%-left)
-      # + MIN_SESSION (10%-left) for an interactive choice the operator is watching;
-      # this one runs AUTO_SWITCH_TARGET_MIN_LEFT_PCT (30%-left) plus the
-      # AUTO_SWITCH_TARGET_MAX_PCT ceiling and the bounce hysteresis, because
+      #
+      # ⚠️ AND SINCE 2026-08-28 THAT ALIGNMENT IS ONE FUNCTION, NOT A CONVENTION.
+      # Both pickers call rota_seat_deadline + rota_deadline_beats
+      # (rota-ranking.sh). The convention was NOT enough: on 2026-08-27 the
+      # engine moved to min(weekly reset, SEAT END) and this file did not, so for
+      # a cancelled seat whose end date falls before its next weekly reset the two
+      # named DIFFERENT seats - live on the pool within days (tartare@ ending
+      # 1 Sep, thea.hawk@ ending 6 Sep, both resetting first). Do not re-inline
+      # the comparison here, and do NOT "restore" the weekly reset alone: that
+      # older rule agrees with this one almost always and is wrong exactly on a
+      # cancelled seat's last partial week, which is the one week that cannot be
+      # had back.
+      #
+      # What stays separate is the ELIGIBILITY floors, because they answer WHICH
+      # seats may be picked rather than in what ORDER: the leaf runs MIN_WEEKLY
+      # (20%-left) + MIN_SESSION (10%-left) for an interactive choice the operator
+      # is watching; this one runs AUTO_SWITCH_TARGET_MIN_LEFT_PCT (30%-left) plus
+      # the AUTO_SWITCH_TARGET_MAX_PCT ceiling and the bounce hysteresis, because
       # it fires unattended at the 90% wall and must not land the operator on an
       # account that is nearly spent too. Changing either side's floors is
       # still a decision to weigh against the other.
@@ -1283,19 +1389,30 @@ main() {
       # Pick: logged in, not dead, not the active, weekly ≤
       # AUTO_SWITCH_TARGET_MAX_PCT (ceiling, default 80) AND at least
       # AUTO_SWITCH_TARGET_MIN_LEFT_PCT weekly left (floor, default 30 → at
-      # most 70% used), then SOONEST weekly reset. Two refinements the ranking
-      # itself does not spell out: an account with NO weekly reset instant is
-      # a fresh window (nothing expiring) and therefore ranks LAST, never
-      # first, an empty string would otherwise sort ahead of every real
-      # timestamp; and an exact tie on the reset instant keeps the old rule as
-      # the tie-break (lowest utilization wins), so the pick stays
-      # deterministic where the new policy is silent.
-      local best=-1 best_wk="" best_reset="" best_fresh=0 j jwk jreset jfresh
+      # most 70% used), then the shared ranking. Two refinements it carries that
+      # this file used to spell out itself, and which rota_deadline_beats now
+      # owns for both callers: an account with NO deadline at all is a fresh
+      # window (nothing expiring) and therefore ranks LAST, never first, since an
+      # empty string would otherwise sort ahead of every real timestamp; and an
+      # exact tie on the deadline keeps the old rule as the tie-break (lowest
+      # utilization wins), so the pick stays deterministic where the newer
+      # policy is silent.
+      local best=-1 best_wk="" best_reset="" best_deadline="" best_kind="" best_proj=0
+      local j jwk jreset jends jpair jdeadline jkind jproj
       for j in "${!DIRS[@]}"; do
         [[ "${LABELS[$j]}" == "$claim" ]] && continue
         cred="${DIRS[$j]}/.credentials.json"
         cred_is_complete "$cred" || continue
         refresh_known_dead "${LABELS[$j]}" "$cred" && continue
+        # ⚠️ AN ENDED SEAT IS RANKED FIRST BY THE SHARED ORDERING AND MUST NOT BE
+        # PICKED AT ALL. rota_seat_deadline is min(weekly reset, seat end), so a
+        # seat whose end date has passed carries the soonest deadline in the pool
+        # and wins every comparison below - the use-it-or-lose-it rule pointed at
+        # a seat that can no longer be used. Live on this pool 2026-09-07; the
+        # whole story is on rota_seat_ended (rota-ranking.sh). A credential can be
+        # perfectly complete and refresh cleanly on such a seat, so neither guard
+        # above catches it: the account authenticates and then refuses the work.
+        rota_seat_ended "$BILLING_JSON" "${LABELS[$j]}" && continue
         ui="$(usage_for "${LABELS[$j]}")"
         [[ -n "$ui" ]] || continue
         jwk="$(pct_int "${U_WK[$ui]}")"
@@ -1303,12 +1420,29 @@ main() {
         (( jwk > AUTO_SWITCH_TARGET_MAX_PCT )) && continue          # ceiling
         (( 100 - jwk < AUTO_SWITCH_TARGET_MIN_LEFT_PCT )) && continue  # headroom floor
         jreset="${U_WKR[$ui]}"
-        jfresh=0; [[ -n "$jreset" ]] || jfresh=1
+        # ⚠️ A PROJECTED RESET IS FED IN AS A REAL ONE, and it has to be: an
+        # untouched weekly window loses its whole allowance on the seat's own
+        # fixed cadence, so leaving jreset empty here tells rota_deadline_beats
+        # "nothing is expiring" and ranks the seat LAST - which is how this
+        # picker came to disagree with `rota usage` about which seat is urgent.
+        # The flag rides along so the log line can mark what it printed.
+        jproj=0
+        if [[ -z "$jreset" && -n "${U_WKP[$ui]:-}" ]]; then
+          jreset="${U_WKP[$ui]}"; jproj=1
+        fi
+        # The seat's own end date, keyed by the label, which IS the login email
+        # and is what billing.json keys its accounts by.
+        jends="$(rota_seat_field "$BILLING_JSON" "${LABELS[$j]}" 2)"
+        jpair="$(rota_seat_deadline "$jreset" "$jends")"
+        jdeadline="${jpair%%$'\t'*}"; jkind="${jpair#*$'\t'}"
         if (( best < 0 )) \
-           || { (( ! jfresh )) && (( best_fresh )); } \
-           || { (( ! jfresh )) && (( ! best_fresh )) && [[ "$jreset" < "$best_reset" ]]; } \
-           || { (( jfresh == best_fresh )) && [[ "$jreset" == "$best_reset" ]] && (( jwk < best_wk )); }; then
-          best="$j"; best_wk="$jwk"; best_reset="$jreset"; best_fresh="$jfresh"
+           || rota_deadline_beats "$jdeadline" "$jwk" "$best_deadline" "$best_wk"; then
+          best="$j"; best_wk="$jwk"; best_reset="$jreset"
+          best_deadline="$jdeadline"; best_kind="$jkind"
+          # only a RESET deadline can be the projected one; a seat-end is a date
+          # out of billing.json, which is nobody's inference
+          best_proj=0
+          (( jproj )) && [[ "$jkind" == "reset" ]] && best_proj=1
         fi
       done
       # hysteresis: don't bounce back to the account we switched OFF within
@@ -1326,7 +1460,29 @@ main() {
       if (( best >= 0 )); then
         local sw_args=("switch-all" "${LABELS[$best]}") sw_out sw_rc=0
         [[ "$AUTO_SWITCH_RESTART_IDLE" == "1" ]] && sw_args+=("--restart-idle")
-        log "auto-switch: $claim at weekly ${wk:-?}% / 5h ${se:-?}% (threshold $AUTO_SWITCH_PCT%) → ${LABELS[$best]} (weekly ${best_wk}%, resets ${best_reset:-a fresh window}, soonest-reset pick above the ${AUTO_SWITCH_TARGET_MIN_LEFT_PCT}%-left floor)"
+        # ⚠️ THE LOG NAMES THE DATE THAT ACTUALLY BOUND THE PICK. Writing "resets
+        # <x>" for a seat chosen because it ENDS first is the right decision under
+        # the wrong noun, and this line is the only record of why an unattended
+        # switch happened at 03:00. best_kind comes out of the same
+        # rota_seat_deadline call that produced the ordering.
+        #
+        # ⚠️ AND IT MARKS AN INFERENCE AS ONE. `~` means this box computed the
+        # instant from the seat's cadence because the vendor reported none for an
+        # untouched window (weekly_projection); the same mark `rota usage` and
+        # `rota billing` print. Reading this line back weeks later, a date that
+        # was never measured must not look like one that was.
+        local why_clause="resets ${best_reset:-a fresh window}"
+        (( best_proj )) && why_clause="resets ~${best_reset} (projected from this seat's own cadence, the window is untouched so the API reports none)"
+        [[ "$best_kind" == "seat-end" ]] \
+          && why_clause="seat ENDS ${best_deadline%%T*}, before its weekly reset (${best_reset:-none}), so this is its LAST window"
+        # ⚠️ NAME THE TRIGGER THAT ACTUALLY FIRED. An ended claim reports no
+        # percentages at all, so the threshold sentence would render as
+        # "weekly ?% / 5h ?% (threshold 90%)" - a switch attributed to a wall it
+        # never hit, in the one log line that explains an unattended 03:00 move.
+        local trigger="at weekly ${wk:-?}% / 5h ${se:-?}% (threshold $AUTO_SWITCH_PCT%)"
+        (( claim_ended )) \
+          && trigger="ENDED $(rota_seat_field "$BILLING_JSON" "$claim" 2), the seat is over whatever quota it still reports"
+        log "auto-switch: $claim $trigger → ${LABELS[$best]} (weekly ${best_wk}%, $why_clause, soonest-deadline pick above the ${AUTO_SWITCH_TARGET_MIN_LEFT_PCT}%-left floor)"
         set +e
         sw_out="$(bash "$FAILOVER" "${sw_args[@]}" 2>&1)"
         sw_rc=$?
@@ -1334,7 +1490,11 @@ main() {
         if (( sw_rc == 0 )); then
           st_switch="to:${LABELS[$best]}"
           printf '%s %s %s\n' "$(date +%s)" "${LABELS[$best]}" "$claim" > "$LAST_SWITCH_FILE"
-          notify_once "auto-switch" "Switched to ${LABELS[$best]}: $claim hit ${wk:-?}% weekly / ${se:-?}% 5h."
+          if (( claim_ended )); then
+            notify_once "auto-switch" "Switched to ${LABELS[$best]}: $claim's seat ended $(rota_seat_field "$BILLING_JSON" "$claim" 2)."
+          else
+            notify_once "auto-switch" "Switched to ${LABELS[$best]}: $claim hit ${wk:-?}% weekly / ${se:-?}% 5h."
+          fi
           log "auto-switch: done, $sw_out"
           log_state_clear no-target
         else
@@ -1343,7 +1503,7 @@ main() {
         fi
       elif [[ "$st_switch" == "none" ]]; then
         # persists tick after tick while the wall stands, log ONCE per state
-        log_once no-target "$claim:$wk:$se" "auto-switch: $claim at weekly ${wk:-?}% / 5h ${se:-?}% ≥ $AUTO_SWITCH_PCT% but no eligible target (all above ${AUTO_SWITCH_TARGET_MAX_PCT}%, under the ${AUTO_SWITCH_TARGET_MIN_LEFT_PCT}%-left floor, dead, or unmeasured)"
+        log_once no-target "$claim:$wk:$se:$claim_ended" "auto-switch: $claim $( (( claim_ended )) && printf 'has ENDED' || printf "at weekly ${wk:-?}%% / 5h ${se:-?}%% ≥ $AUTO_SWITCH_PCT%%" ) but no eligible target (all above ${AUTO_SWITCH_TARGET_MAX_PCT}%, under the ${AUTO_SWITCH_TARGET_MIN_LEFT_PCT}%-left floor, ended, dead, or unmeasured)"
         st_switch="no-target"
       fi
     fi
@@ -1461,10 +1621,33 @@ main() {
       cred="${DIRS[$i]}/.credentials.json"
       cred_is_complete "$cred" || continue
       refresh_known_dead "${LABELS[$i]}" "$cred" && continue
+      if seat_is_reserved "${LABELS[$i]}" "${DIRS[$i]}" && [[ "${ROTA_NUDGE_RESERVED:-0}" != "1" ]]; then
+        # decided, not undecided: the marker still stamps, and the seat is measured
+        # wherever it is actually used (or recorded by hand), never warmed from here
+        log "warm ${LABELS[$i]}: reserved seat, not nudged from this box (its owner's machine rotates the token; ROTA_NUDGE_RESERVED=1 overrides)"
+        continue
+      fi
       # window OPEN = a five-hour resets_at in the future, or any utilization
       # already spent. Cold = utilization 0 with a null/past resets_at.
       ui="$(usage_for "${LABELS[$i]}")"
       if [[ -z "$ui" ]]; then
+        # No usage data AND the stored access token has already expired: the
+        # fetch could not have answered and never will until something rotates
+        # the token, and with keepalive off this nudge is the only thing that
+        # does. So the seat is COLD by construction, not undecided. Before this,
+        # four seats on the pool host (2026-08-25 → 08-30) sat in a loop: no data
+        # because the token was expired, no nudge because there was no data, 144
+        # "retrying next tick" lines a day. Decided either way after the nudge:
+        # rotated (measurable next tick), husked (marked dead, skipped from now
+        # on) or ineffective (logged by nudge_account, not retried every tick).
+        left="$(token_expiry_in "$cred")"
+        if [[ -n "$left" ]] && (( left <= 0 )); then
+          log "warm ${LABELS[$i]}: no usage data and the stored access token expired $(( -left / 60 ))min ago, cold by construction, nudging once (the nudge is also the only refresh path with keepalive off)"
+          if nudge_account "${LABELS[$i]}" "${DIRS[$i]}" "warming: access token expired $(( -left / 60 ))min ago"; then
+            warmed=$((warmed + 1))
+          fi
+          continue
+        fi
         # UNDECIDED, not skipped (stage-1 review, 2026-08-12): without usage
         # data we cannot tell open from cold, and stamping the marker anyway
         # would let one transient fetch failure at 03:00 kill warming for the

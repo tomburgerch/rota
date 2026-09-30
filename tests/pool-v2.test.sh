@@ -559,6 +559,69 @@ grep -q 'switch=no-target' "$RUN/cfg/keeper-status" \
   && ok "keeper → never switches ONTO an account above 80% (hysteresis ceiling)" \
   || bad "keeper → >80% targets refused (status: $(cat "$RUN/cfg/keeper-status"))"
 
+# ── 5a2. AN UNTOUCHED WINDOW STILL HAS A DEADLINE, AND THIS PICKER SEES IT ───
+#
+# The usage API answers `resets_at: null` for any weekly window whose
+# utilization is 0.0 - i.e. for the seat with a whole untouched week in it. This
+# picker fetches the API itself rather than reading `rota usage --json`, so that
+# null left `jreset` empty, rota_seat_deadline returned the no-deadline sentinel
+# and rota_deadline_beats ranked the seat LAST ("nothing expiring"). Meanwhile
+# `rota usage`, `rota billing` and `cl` had learned to rank it by the reset
+# projected from the seat's own 7-day cadence, so the unattended 90%-wall switch
+# would send him somewhere every interactive surface says is wrong - at 03:00,
+# with only the log to explain it afterwards.
+#
+# primary is untouched (0% used, no reset reported) with a remembered cadence
+# putting its next reset ~2 days out; wk has a REAL reset 4 days out. The pick
+# must be primary, and the log line must MARK the instant as projected.
+proj_cache() {  # proj_cache <alias> <seen-iso>, the row that remembers a seat's cadence
+  jq -n --arg e "$(email_of "$1")" --arg wr "$2" \
+    '{($e):{wk_u:"12",wk_r:"",se_u:"5",se_r:"",ts:"Sep 04 09:00",ts_epoch:"1",wk_r_seen:$wr}}' \
+    > "$RUN/cfg/usage-cache.json"
+}
+untouched_fixture() {  # untouched_fixture <alias>, the vendor's answer for an unused window
+  printf '{"seven_day":{"utilization":0.0,"resets_at":null},"five_hour":{"utilization":0.0,"resets_at":null}}' \
+    > "$FAKE_STATE/usage-$(email_of "$1").json"
+}
+KP_SEEN_EPOCH=$(( $(date -u '+%s') - 5 * 86400 ))
+KP_SEEN="$(date -u -r "$KP_SEEN_EPOCH" '+%Y-%m-%dT%H:%M:%S.000000+00:00')"
+KP_WANT="$(date -u -r $(( KP_SEEN_EPOCH + 604800 )) '+%Y-%m-%dT%H:%M:%S+00:00')"   # ~2d out
+mk_pool kproj
+usage_fixture alpha 91 50 "$(iso_in +2H)" "$(iso_in +6d)"   # the claim, over the wall
+untouched_fixture primary                                    # 0% used, NO reset reported
+usage_fixture wk    40 10 "$(iso_in +2H)" "$(iso_in +4d)"    # a real reset, LATER
+usage_fixture team  45 10 "$(iso_in +2H)" "$(iso_in +5d)"
+proj_cache primary "$KP_SEEN"
+run_keeper "${keeper_env[@]}"
+grep -q "switch=to:$(email_of primary)" "$RUN/cfg/keeper-status" \
+  && ok "keeper projection → the untouched seat whose week dies FIRST is the pick, not the one with the later real reset" \
+  || bad "keeper projection → picks the projected-soonest seat (status: $(cat "$RUN/cfg/keeper-status"), log: $OUT)"
+grep -q "resets ~$KP_WANT" <<<"$OUT" \
+  && ok "keeper projection → the log line names the projected instant and MARKS it with ~" \
+  || bad "keeper projection → log marks the projection (want ~$KP_WANT, got: $OUT)"
+grep -q "projected from this seat's own cadence" <<<"$OUT" \
+  && ok "keeper projection → and says in words why the API reported none, for whoever reads the log weeks later" \
+  || bad "keeper projection → log explains the projection (got: $OUT)"
+[ "$(jq -r --arg e "$(email_of primary)" '.[$e].wk_r_seen' "$RUN/cfg/usage-cache.json")" = "$KP_SEEN" ] \
+  && ok "keeper projection → the tick's own cache write KEEPS wk_r_seen (it runs every minute; dropping it would erase the memory)" \
+  || bad "keeper projection → wk_r_seen survives the keeper's write (got: $(cat "$RUN/cfg/usage-cache.json"))"
+
+# ...and with NOTHING ever seen for that seat the old behaviour is unchanged: no
+# cadence to project from, so the untouched seat ranks last and the seat with a
+# real reset wins. Nothing is invented.
+mk_pool kprojnoseen
+usage_fixture alpha 91 50 "$(iso_in +2H)" "$(iso_in +6d)"
+untouched_fixture primary
+usage_fixture wk    40 10 "$(iso_in +2H)" "$(iso_in +4d)"
+usage_fixture team  45 10 "$(iso_in +2H)" "$(iso_in +5d)"
+run_keeper "${keeper_env[@]}"
+grep -q "switch=to:$(email_of wk)" "$RUN/cfg/keeper-status" \
+  && ok "keeper projection → with no remembered cadence the untouched seat still ranks last, exactly as before" \
+  || bad "keeper projection → no seen instant means no projection (status: $(cat "$RUN/cfg/keeper-status"), log: $OUT)"
+! grep -q 'resets ~' <<<"$OUT" \
+  && ok "keeper projection → and no ~ is printed for an instant nobody has" \
+  || bad "keeper projection → nothing to mark (got: $OUT)"
+
 # ── 5b. the headroom FLOOR (AUTO_SWITCH_TARGET_MIN_LEFT_PCT, 2026-08-16) ─────
 # The soonest reset only wins if the account still has headroom worth burning:
 # primary resets first but is 75% spent (25% left, under the 30%-left floor),
@@ -657,6 +720,236 @@ run_keeper "${keeper_env[@]}" AUTO_SWITCH_BOUNCE_SECS=0
 grep -q "switch=to:$(email_of primary)" "$RUN/cfg/keeper-status" \
   && ok "bounce → and it is a knob: AUTO_SWITCH_BOUNCE_SECS=0 lets the same pick through" \
   || bad "bounce → knob (status: $(cat "$RUN/cfg/keeper-status"))"
+
+# ── 5c. ONE RANKING: the keeper and the engine must name the SAME seat ───────
+#
+# rota has TWO pickers - the engine's compute_recommendation behind
+# `rota usage` / `rota switch`, and this keeper's unattended auto-switch at the
+# 90% wall. They were kept in step BY CONVENTION, each carrying a comment saying
+# the other ranked the same way. Convention failed the moment one of them
+# learned something: on 2026-08-27 the engine moved to min(weekly reset, SEAT
+# END) and the keeper did not, so for a CANCELLED seat whose end date falls
+# before its next weekly reset the two named DIFFERENT seats. That shape was
+# live on the real pool within days (tartare@ ending 1 Sep and thea.hawk@ ending
+# 6 Sep, both with their quota resetting first). A picker that disagrees with
+# ITSELF is worse than either rule: neither answer can be trusted without
+# knowing which code path produced it.
+#
+# Both now call rota_seat_deadline + rota_deadline_beats (lib/rota-ranking.sh),
+# and these scenarios are what stops the two drifting again. THE ASSERTION IS
+# AGREEMENT, not "the keeper picks X": a test that only pinned one side would go
+# green again the moment the other side moved.
+#
+# ONE set of numbers is served to BOTH pickers - the keeper reads them through
+# its CLAUDE_FAILOVER_USAGE_CMD stub (keyed by EMAIL), the engine through the
+# curl stub (keyed by the seat's access TOKEN). Same bytes in both files, so any
+# disagreement is the ranking and never the input.
+pair_fixture() {  # pair_fixture <alias> <weekly-util> <5h-util> <5h-reset-iso> <weekly-reset-iso ("" = fresh)>
+  local wkr body
+  # a FRESH weekly window is resets_at:null, the API's own shape for "this
+  # window has not started"; an empty string here would be a third state neither
+  # picker has ever seen.
+  if [ -n "${5:-}" ]; then wkr="\"$5\""; else wkr=null; fi
+  body="$(printf '{"seven_day":{"utilization":%s,"resets_at":%s},"five_hour":{"utilization":%s,"resets_at":"%s"}}' \
+    "$2" "$wkr" "$3" "$4")"
+  printf '%s' "$body" > "$FAKE_STATE/usage-$(email_of "$1").json"
+  printf '%s' "$body" > "$FAKE_STATE/usage-TOK-$1.json"
+}
+
+# billing.json in $RUN/cfg, i.e. at the DEFAULT path both scripts resolve from
+# $CFG_DIR. Passing it by env would prove less: the keeper had never read this
+# file before, so "does it find it where the engine finds it" is part of the claim.
+seat_fixture() {  # seat_fixture [<alias>:<status>:<ends-date> ...]
+  local spec entries="" a
+  for spec in "$@"; do
+    a="${spec%%:*}"; spec="${spec#*:}"
+    entries="$entries$(printf '"%s":{"plan":"Max 20x","status":"%s","ends":"%s"},' \
+      "$(email_of "$a")" "${spec%%:*}" "${spec#*:}")"
+  done
+  printf '{"accounts":{%s}}' "${entries%,}" > "$RUN/cfg/billing.json"
+}
+
+# The alias the ENGINE's own picker names, straight out of the surface a human
+# reads (`rota usage`), not a re-derivation.
+engine_pick() {
+  local j
+  set +e
+  j="$(bash "$FAILOVER" usage --json 2>/dev/null)"
+  set -e
+  jq -r '.recommendation.alias // ""' <<<"$j" 2>/dev/null
+}
+keeper_pick() {  # the alias the KEEPER switched to this tick, or ""
+  sed -n 's/.*switch=to:\([^@ ]*\)@example\.com.*/\1/p' "$RUN/cfg/keeper-status" 2>/dev/null
+}
+
+# THE SHAPE THE WHOLE TASK EXISTS FOR: a cancelled seat whose END DATE precedes
+# its weekly reset. Separated by construction, so the two rules cannot both be
+# right:
+#   wk    CANCELLED, ends in 2 DAYS, weekly resets in 6 DAYS  -> deadline +2d
+#   team  active,                    weekly resets in 3 DAYS  -> deadline +3d
+# Ranking on the weekly reset alone picks TEAM; ranking on min(reset, seat end)
+# picks WK, correctly - whatever is unspent on wk in two days is gone forever,
+# while team's window merely rolls.
+mk_pool kagree
+pair_fixture alpha   91 50 "$(iso_in +2H)" "$(iso_in +4d)"   # the claim, over the wall
+pair_fixture wk      40 10 "$(iso_in +2H)" "$(iso_in +6d)"   # ends first, resets LAST
+pair_fixture team    40 10 "$(iso_in +2H)" "$(iso_in +3d)"   # resets first, never ends
+pair_fixture primary 40 10 "$(iso_in +2H)" "$(iso_in +5d)"
+seat_fixture "wk:cancelled:$(date -u -v+2d '+%Y-%m-%d')"
+EP="$(engine_pick)"
+run_keeper "${keeper_env[@]}"
+KP="$(keeper_pick)"
+[ -n "$EP" ] && [ "$EP" = "$KP" ] \
+  && ok "one ranking → keeper and engine name the SAME seat for a cancelled seat ending before its reset (both: ${EP:-none})" \
+  || bad "one ranking → the two pickers disagree (engine: ${EP:-none}, keeper: ${KP:-none})"
+[ "$EP" = wk ] \
+  && ok "one ranking → and the seat they agree on is the one that ENDS first, not the one that resets first" \
+  || bad "one ranking → min(weekly reset, seat end) must pick wk (engine: ${EP:-none}, keeper: ${KP:-none})"
+grep -q 'seat ENDS' "$RUN/cfg/keeper.log" \
+  && ok "one ranking → the keeper's log names the SEAT END as the reason, not a reset it did not use" \
+  || bad "one ranking → keeper log names the binding date (log: $(grep auto-switch "$RUN/cfg/keeper.log" | tail -1))"
+
+# THE ORDINARY CASE, and it has to be able to fail differently: the same seat is
+# still cancelled, but now its end is FAR (10 days) and its reset is near (2
+# days), so the deadline is its RESET. If min() were reading the seat end here,
+# wk would rank last (+10d) and team (+3d) would win, so this pins the min()
+# rather than a blanket "cancelled seats first".
+mk_pool kagreereset
+pair_fixture alpha   91 50 "$(iso_in +2H)" "$(iso_in +4d)"
+pair_fixture wk      40 10 "$(iso_in +2H)" "$(iso_in +2d)"   # resets first, ends far away
+pair_fixture team    40 10 "$(iso_in +2H)" "$(iso_in +3d)"
+pair_fixture primary 40 10 "$(iso_in +2H)" "$(iso_in +5d)"
+seat_fixture "wk:cancelled:$(date -u -v+10d '+%Y-%m-%d')"
+EP="$(engine_pick)"
+run_keeper "${keeper_env[@]}"
+KP="$(keeper_pick)"
+[ "$EP" = wk ] && [ "$KP" = wk ] \
+  && ok "one ranking → a seat whose RESET precedes its end still ranks on the reset, and both pickers agree" \
+  || bad "one ranking → reset-bound pick (engine: ${EP:-none}, keeper: ${KP:-none})"
+! grep -q 'seat ENDS' "$RUN/cfg/keeper.log" \
+  && ok "one ranking → and the log calls it a reset when the reset is what bound it" \
+  || bad "one ranking → reset-bound pick must not claim a seat end (log: $(grep auto-switch "$RUN/cfg/keeper.log" | tail -1))"
+
+# ── 5d. A SEAT THAT HAS ALREADY ENDED IS NOT A TARGET, IT IS THE TOP-RANKED ONE ─
+#
+# ⚠️ THE ORDERING TURNS THIS SHAPE INTO ITS OWN WORST CASE, WHICH IS WHY IT NEEDS
+# ITS OWN GUARD RATHER THAN "the deadline handles it". min(weekly reset, seat
+# end) means a seat whose end date is in the PAST carries the earliest deadline
+# in the pool, so both pickers rank it FIRST, most urgent - use-it-or-lose-it
+# aimed at a seat nobody can use. Nothing else in either eligibility list catches
+# it: the credential is complete, the refresh chain is alive, and the row can
+# still report quota.
+#
+# LIVE ON THE REAL POOL, 2026-09-07. thea.hawk@tomahawk.vc ended 6 Sep. On the
+# 7th `rota billing` printed "USE NEXT rota switch thea ... its weekly window
+# resets first", and all six live tmux panes on ballito were restarted onto a
+# seat that answers every request with "Your organization has disabled Claude
+# subscription access for Claude Code".
+#
+# The fixture makes the two rules disagree by construction. wk ended YESTERDAY
+# and its weekly window resets LAST; team resets in 3 days and never ends. On the
+# deadline alone wk wins outright; eligible-only, the pick has to fall to team.
+mk_pool kended
+pair_fixture alpha   91 50 "$(iso_in +2H)" "$(iso_in +4d)"   # the claim, over the wall
+pair_fixture wk      40 10 "$(iso_in +2H)" "$(iso_in +6d)"   # ENDED yesterday, resets last
+pair_fixture team    40 10 "$(iso_in +2H)" "$(iso_in +3d)"   # the only real candidate
+pair_fixture primary 40 10 "$(iso_in +2H)" "$(iso_in +5d)"
+seat_fixture "wk:cancelled:$(date -u -v-1d '+%Y-%m-%d')"
+EP="$(engine_pick)"
+run_keeper "${keeper_env[@]}"
+KP="$(keeper_pick)"
+[ "$EP" != wk ] && [ "$KP" != wk ] \
+  && ok "ended seat → neither picker offers a seat whose end date has passed, though it ranks soonest" \
+  || bad "ended seat → must never be picked (engine: ${EP:-none}, keeper: ${KP:-none})"
+[ "$EP" = team ] && [ "$KP" = team ] \
+  && ok "ended seat → and both fall through to the soonest ELIGIBLE seat, in agreement" \
+  || bad "ended seat → both should pick team (engine: ${EP:-none}, keeper: ${KP:-none})"
+
+# ⚠️ AND THE END DATE IS THE SEAT'S LAST WORKING DAY, NOT ITS FIRST DEAD ONE.
+# Measured on the same incident: thea served requests through 6 Sep, its stated
+# end date, and refused them on the 7th. So the compare is STRICTLY before today;
+# a seat ending TODAY is both eligible and the most urgent thing in the pool,
+# and retiring it a day early throws away the one window that cannot be had back.
+mk_pool kendstoday
+pair_fixture alpha   91 50 "$(iso_in +2H)" "$(iso_in +4d)"
+pair_fixture wk      40 10 "$(iso_in +2H)" "$(iso_in +6d)"   # ends TODAY, resets last
+pair_fixture team    40 10 "$(iso_in +2H)" "$(iso_in +3d)"
+pair_fixture primary 40 10 "$(iso_in +2H)" "$(iso_in +5d)"
+seat_fixture "wk:cancelled:$(date '+%Y-%m-%d')"
+EP="$(engine_pick)"
+run_keeper "${keeper_env[@]}"
+KP="$(keeper_pick)"
+[ "$EP" = wk ] && [ "$KP" = wk ] \
+  && ok "ended seat → a seat ending TODAY is still spendable, and still the most urgent" \
+  || bad "ended seat → ends-today must stay eligible (engine: ${EP:-none}, keeper: ${KP:-none})"
+
+# ── 5e. THE CLAIM ITSELF ENDED: a wall no percentage can express ─────────────
+#
+# ⚠️ REFUSING TO PICK AN ENDED SEAT DOES NOT COVER THIS. The seat was picked
+# while it was alive and ended UNDERNEATH the claim, which is the actual
+# 2026-09-07 sequence - thea was the active account on the 6th and simply stopped
+# working on the 7th. The keeper's trigger is "the claim's utilization ≥ 90%",
+# and an ended seat does not report 100%: it reports NOTHING, so the trigger was
+# never evaluated and the pool held a dead claim tick after tick while every pane
+# pinned to it failed.
+#
+# The fixture withholds alpha's usage entirely - no numbers at all, the shape an
+# ended seat really has - so the ONLY thing that can fire the switch is the end
+# date. team resets soonest among the eligible, so it is the target.
+mk_pool kclaimended
+pair_fixture wk      40 10 "$(iso_in +2H)" "$(iso_in +6d)"
+pair_fixture team    40 10 "$(iso_in +2H)" "$(iso_in +3d)"
+pair_fixture primary 40 10 "$(iso_in +2H)" "$(iso_in +5d)"
+seat_fixture "alpha:cancelled:$(date -u -v-1d '+%Y-%m-%d')"
+run_keeper "${keeper_env[@]}"
+KP="$(keeper_pick)"
+[ -n "$KP" ] && [ "$KP" != alpha ] \
+  && ok "ended claim → the keeper switches off a claim whose seat ended, with no utilization to trigger on" \
+  || bad "ended claim → must switch away from an ended claim (keeper: ${KP:-none})"
+[ "$KP" = team ] \
+  && ok "ended claim → and it lands on the soonest-expiring eligible seat" \
+  || bad "ended claim → target should be team (keeper: ${KP:-none})"
+grep -q 'ENDED' "$RUN/cfg/keeper.log" \
+  && ok "ended claim → the log names the end date, not a threshold the claim never hit" \
+  || bad "ended claim → log must name the real trigger (log: $(grep auto-switch "$RUN/cfg/keeper.log" | tail -1))"
+
+# ⚠️ THE "NOTHING IS EXPIRING" SENTINEL MUST RANK LAST, NEVER FIRST. It is the
+# empty string, and an empty string sorts BEFORE every real ISO timestamp under
+# a string compare, so the healthiest seat in the pool would otherwise be
+# recommended as the most urgent. wk here has no weekly reset instant at all (a
+# window that has not started) and no end date, so it must lose to team's real
+# +3d deadline in BOTH pickers.
+mk_pool kfresh
+pair_fixture alpha   91 50 "$(iso_in +2H)" "$(iso_in +4d)"
+pair_fixture wk      40 10 "$(iso_in +2H)" ""                # fresh: nothing expiring
+pair_fixture team    40 10 "$(iso_in +2H)" "$(iso_in +3d)"   # a real deadline
+pair_fixture primary 40 10 "$(iso_in +2H)" "$(iso_in +5d)"
+seat_fixture "alpha:active:"
+EP="$(engine_pick)"
+run_keeper "${keeper_env[@]}"
+KP="$(keeper_pick)"
+[ "$EP" = team ] && [ "$KP" = team ] \
+  && ok "sentinel → a seat with NO deadline ranks LAST in both pickers, never ahead of a real one" \
+  || bad "sentinel → fresh seat must not win (engine: ${EP:-none}, keeper: ${KP:-none})"
+
+# ⚠️ AN EXACT TIE ON THE DEADLINE GOES TO THE LOWEST UTILIZATION. This is the
+# keeper's older rule, kept as the tie-break so the pick stays deterministic
+# where the newer policy is silent. Without it the tie falls to whatever order
+# the accounts file happens to list, which is not a rule anyone chose: wk is
+# listed BEFORE team here, so a first-wins tie would name wk.
+mk_pool ktie
+TIE_RESET="$(iso_in +3d)"
+pair_fixture alpha   91 50 "$(iso_in +2H)" "$(iso_in +4d)"
+pair_fixture wk      60 10 "$(iso_in +2H)" "$TIE_RESET"      # listed first, but emptier
+pair_fixture team    40 10 "$(iso_in +2H)" "$TIE_RESET"      # same instant, more left
+pair_fixture primary 40 10 "$(iso_in +2H)" "$(iso_in +5d)"
+seat_fixture "alpha:active:"
+EP="$(engine_pick)"
+run_keeper "${keeper_env[@]}"
+KP="$(keeper_pick)"
+[ "$EP" = team ] && [ "$KP" = team ] \
+  && ok "tie-break → an exact deadline tie goes to the LOWEST utilization in both pickers, not to accounts-file order" \
+  || bad "tie-break → lowest utilization on a tie (engine: ${EP:-none}, keeper: ${KP:-none})"
 
 # ── 6. keeper: keepalive is OFF by default (2026-08-16) ──────────────────────
 # It husked 23 credential files across two machines in one day and verified
@@ -787,6 +1080,56 @@ run_keeper "${warm_env[@]}"
   && grep -q "claude-pool/alpha|" "$FAKE_STATE/claude-calls" \
   && ok "warming → WARM_ACCOUNTS=active warms only the active account" \
   || bad "warming → active-only (calls: $(cat "$FAKE_STATE/claude-calls" 2>/dev/null || echo none))"
+
+# A seat whose stored ACCESS token has already expired can produce no usage data
+# until something refreshes it, and with keepalive off the warm nudge IS the only
+# thing that does. The old "no usage data → undecided → retry next tick" rule met
+# that seat with a loop: no data because the token is expired, no nudge because
+# there is no data, 144 log lines a day and the seat unmeasurable for five days
+# (the pool host, 2026-08-25 → 08-30, four seats). Expired + no data = COLD, and
+# it gets its one nudge; every guard inside nudge_account still applies.
+mk_pool warmexpired
+usage_fixture wk      10 30 "$(iso_in +2H)"       # open, skip
+usage_fixture team    10 30 "$(iso_in +2H)"       # open, skip
+usage_fixture primary 10 30 "$(iso_in +2H)"       # open, skip
+printf '{"claudeAiOauth":{"accessToken":"TOK-alpha","refreshToken":"rt-TOK-alpha","expiresAt":%s,"refreshTokenExpiresAt":%s}}' \
+  "$(( ($(date +%s) - 5 * 86400) * 1000 ))" "$EXP_MS" > "$RUN/.claude-pool/alpha/.credentials.json"
+# NO usage fixture for alpha: the API will not answer an expired token
+run_keeper "${warm_env[@]}"
+[ -f "$FAKE_STATE/claude-calls" ] \
+  && [ "$(grep -c '' "$FAKE_STATE/claude-calls")" -eq 1 ] \
+  && grep -q "claude-pool/alpha|" "$FAKE_STATE/claude-calls" \
+  && ok "warming → a seat with NO usage data and an EXPIRED access token is nudged (it is cold by construction)" \
+  || bad "warming → expired-token seat nudged (calls: $(cat "$FAKE_STATE/claude-calls" 2>/dev/null || echo none))"
+grep -q 'warmed=1' "$RUN/cfg/keeper-status" \
+  && ok "warming → and counts as warmed, not as 'retry'" \
+  || bad "warming → warmed=1 (status: $(cat "$RUN/cfg/keeper-status"))"
+ls "$RUN/cfg"/warmed-* >/dev/null 2>&1 \
+  && ok "warming → the day's marker is stamped, no 144-line retry loop" \
+  || bad "warming → marker missing after the expired-token nudge"
+grep -q 'access token expired' "$RUN/cfg/keeper.log" \
+  && ok "warming → the log names WHY the seat was nudged (expired access token)" \
+  || bad "warming → log reason (got: $(grep 'warm' "$RUN/cfg/keeper.log" | tail -3))"
+
+# a RESERVED seat with an expired token: decided (marker stamps), never nudged.
+# Its chain is also held on the owner's box; see seat_is_reserved in rota-ranking.sh.
+mk_pool warmreserved
+usage_fixture wk      10 30 "$(iso_in +2H)"       # open, skip
+usage_fixture team    10 30 "$(iso_in +2H)"       # open, skip
+usage_fixture primary 10 30 "$(iso_in +2H)"       # open, skip
+printf '{"claudeAiOauth":{"accessToken":"TOK-alpha","refreshToken":"rt-TOK-alpha","expiresAt":%s,"refreshTokenExpiresAt":%s}}' \
+  "$(( ($(date +%s) - 5 * 86400) * 1000 ))" "$EXP_MS" > "$RUN/.claude-pool/alpha/.credentials.json"
+touch "$RUN/.claude-pool/alpha/RESERVED"
+run_keeper "${warm_env[@]}"
+! grep -q "claude-pool/alpha|" "$FAKE_STATE/claude-calls" 2>/dev/null \
+  && ok "warming → a RESERVED seat with an expired token is NOT nudged (its owner's box rotates the chain)" \
+  || bad "warming → reserved seat nudged (calls: $(cat "$FAKE_STATE/claude-calls" 2>/dev/null || echo none))"
+ls "$RUN/cfg"/warmed-* >/dev/null 2>&1 \
+  && ok "warming → and the day's marker still stamps: reserved is DECIDED, not undecided" \
+  || bad "warming → marker missing for a reserved seat (status: $(cat "$RUN/cfg/keeper-status"))"
+grep -q 'reserved seat' "$RUN/cfg/keeper.log" \
+  && ok "warming → the log says WHY it was skipped (reserved seat)" \
+  || bad "warming → log reason (got: $(grep 'warm' "$RUN/cfg/keeper.log" | tail -3))"
 
 # ── 8. the reconcile→normalize COMPOSITION (stage-1 review, finding 1) ───────
 # reconcile --apply rewrites the labels to match the dirs, which destroys the
@@ -1214,6 +1557,38 @@ set -e
   && [ "$(cat "$RUN/cfg/accounts")" = "$ACC_BEFORE" ] \
   && ok "pool-init → second run is a byte-for-byte no-op" \
   || bad "pool-init → idempotence (got $RC: $OUT)"
+
+# first-run state (t_wvsjwh): every seat's .claude.json gets exactly the keys that
+# keep claude off its theme picker / onboarding / trust / what's-new screens, a
+# seat that already has them is not rewritten, and oauthAccount is never touched
+mk_fresh poolinitfirstrun
+mkdir -p "$RUN/code" "$RUN/.claude-pool/alpha"
+printf '{"oauthAccount":{"emailAddress":"%s"},"hasCompletedOnboarding":true,"lastOnboardingVersion":"1.0.0","lastReleaseNotesSeen":"1.0.0","projects":{"%s":{"hasTrustDialogAccepted":true}}}' \
+  "$(email_of alpha)" "$RUN/code" > "$RUN/.claude-pool/alpha/.claude.json"
+ALPHA_BEFORE="$(cat "$RUN/.claude-pool/alpha/.claude.json")"
+set +e
+OUT="$(ROTA_CLAUDE_VERSION=9.8.7 bash "$FAILOVER" pool-init 2>&1)"; RC=$?
+set -e
+FR_OK=1
+for a in "${ALIASES[@]}"; do
+  [ "$a" = alpha ] && continue
+  jq -e --arg d "$RUN/code" '.hasCompletedOnboarding == true
+      and .lastOnboardingVersion == "9.8.7" and .lastReleaseNotesSeen == "9.8.7"
+      and .projects[$d].hasTrustDialogAccepted == true' \
+    "$RUN/.claude-pool/$a/.claude.json" >/dev/null 2>&1 || FR_OK=0
+done
+[ "$RC" -eq 0 ] && [ "$FR_OK" -eq 1 ] \
+  && ok "pool-init → every new seat gets onboarding done, release notes seen and ~/code trusted" \
+  || bad "pool-init → first-run state (rc=$RC: $OUT)"
+[ "$(cat "$RUN/.claude-pool/alpha/.claude.json")" = "$ALPHA_BEFORE" ] \
+  && ok "pool-init → a seat that already starts clean is not rewritten (its login and older versions kept)" \
+  || bad "pool-init → rewrote a complete seat (got: $(cat "$RUN/.claude-pool/alpha/.claude.json"))"
+set +e
+OUT="$(ROTA_CLAUDE_VERSION=9.8.7 bash "$FAILOVER" pool-init 2>&1)"; RC=$?
+set -e
+[ "$RC" -eq 0 ] && grep -q 'already initialized' <<<"$OUT" \
+  && ok "pool-init → first-run seeding is idempotent" \
+  || bad "pool-init → first-run idempotence (got $RC: $OUT)"
 
 # a leading ~/ in the accounts file (what the README and the example use) means $HOME,
 # never a literal directory named "~" under the cwd
