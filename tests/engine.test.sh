@@ -117,6 +117,12 @@ if [ "${1:-}" = "-p" ] && [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
     printf '{"claudeAiOauth":{"accessToken":"","refreshToken":"","refreshTokenExpiresAt":%s000,"scopes":["user:inference"],"subscriptionType":"max"}}' \
       "$(cat "$FAKE_STATE/deadrefresh-$base")" > "$CLAUDE_CONFIG_DIR/.credentials.json"
   fi
+  # the HEALTHY rotation, the opposite of the husk: when a nudged seat's refresh
+  # token is alive the real CLI installs a fresh credential; a scenario stages
+  # that by putting the post-rotation credential in $FAKE_STATE/rotate-<base>
+  if [ -f "$FAKE_STATE/rotate-$base" ]; then
+    cat "$FAKE_STATE/rotate-$base" > "$CLAUDE_CONFIG_DIR/.credentials.json"
+  fi
 fi
 n=$(cat "$FAKE_STATE/authcalls" 2>/dev/null || echo 0)
 n=$((n + 1))
@@ -176,14 +182,18 @@ cat > "$STUB_DIR/curl" <<'STUB'
 #!/usr/bin/env bash
 token=""
 prev=""
+ua=""
 for a in "$@"; do
   if [ "$prev" = "-H" ]; then
     case "$a" in
       Authorization:*) token="${a#Authorization: Bearer }" ;;
+      User-Agent:*)    ua="${a#User-Agent: }" ;;
     esac
   fi
   prev="$a"
 done
+# the UA each token was probed with, so a test can prove the header went out
+[ -n "$token" ] && printf '%s\n' "${ua:-NONE}" > "$FAKE_STATE/ua-$token"
 file="$FAKE_STATE/usage-$token.json"
 code="$FAKE_STATE/usage-$token.code"
 if [ -n "$token" ] && [ -f "$file" ]; then
@@ -195,6 +205,34 @@ else
 fi
 STUB
 chmod +x "$STUB_DIR/curl"
+
+# --- fake `ssh` ----------------------------------------------------------------
+# Stands in for the ONE peer call (peer_ssh): `rota accounts --json --no-refresh`
+# on a box that holds a credential this one does not. Stubbed for the WHOLE suite
+# and, by default, REFUSING: unstubbed, a scenario that configured a peer would
+# dial the real network and every assertion would depend on whose laptop the
+# suite happens to run on. Refusing by default is also the exact host-is-down
+# behaviour the feature promises to degrade through.
+#
+# $FAKE_STATE/peer-<host>.json arms it: that file becomes the peer's stdout.
+# $FAKE_STATE/peer-slow-<host> makes it hang (the timeout bound), and
+# $FAKE_STATE/peer-junk-<host> makes it answer with something that is not JSON.
+# Every call APPENDS its host to $FAKE_STATE/ssh-calls, which is what lets a
+# scenario prove a round trip did NOT happen (--no-refresh, the 90s TTL and the
+# never-ssh-to-yourself rule are all assertions about a call that must be absent).
+# No key, no known_hosts, no socket: nothing here can reach a real machine.
+cat > "$STUB_DIR/ssh" <<'STUB'
+#!/usr/bin/env bash
+# rota calls this as: ssh -o … -o … <host> <remote-command>
+host="${@: -2:1}"
+printf '%s\n' "$host" >> "${FAKE_STATE:-/tmp}/ssh-calls"
+[ -f "${FAKE_STATE:-/nonexistent}/peer-slow-$host" ] && { sleep 30; exit 0; }
+[ -f "${FAKE_STATE:-/nonexistent}/peer-junk-$host" ] && { printf 'ssh: this is not JSON\n'; exit 0; }
+f="${FAKE_STATE:-/nonexistent}/peer-$host.json"
+[ -f "$f" ] || exit 255            # ssh's own "could not connect" exit code
+cat "$f"
+STUB
+chmod +x "$STUB_DIR/ssh"
 
 # --- fake `tmux` ---------------------------------------------------------------
 # The PANES block (render_panes_summary / restart_idle_panes) asks tmux what is
@@ -288,6 +326,23 @@ export ROTA_TMUX_SESSION="rota-test-panes"
 # Never inherit the real session's pane id: restart_idle_panes skips $TMUX_PANE,
 # and a leaked value could silently skip a pane a scenario is asserting on.
 unset TMUX_PANE
+# Same for the peer list. ROTA_PEERS is SET-BUT-EMPTY-aware by design (that is how
+# the remote leg of a peer call switches the feature off), so inheriting one from
+# the surrounding shell would arm a peer in every scenario that never asked for
+# one. $CLAUDE_FAILOVER_HOME already points the peers FILE at the fake cfg dir.
+unset ROTA_PEERS
+# Nor the operator's own billing/hand-measurement files. `usage` reads both now
+# (seat status, end dates, dated `boosts`, recorded readings), and both default
+# inside $CFG_DIR, which every scenario throws away, so the only way a REAL file
+# could reach this suite is an inherited override. A run that read one would
+# assert against somebody's live seats and change its answer on the day a boost
+# expires.
+unset CLAUDE_BILLING_JSON CLAUDE_HUMAN_USAGE
+# Nor the transcript store: the restart machinery resolves a pane title to a
+# session id by reading it, and it defaults under $HOME (thrown away per
+# scenario), so an inherited override is the only way this suite could read
+# someone's real sessions, and resume one of them by id in an assertion.
+unset CLAUDE_PROJECTS_DIR
 
 # --- per-run fixture ----------------------------------------------------------
 # A fresh $HOME each run so state never leaks into the next scenario. v2 shape
@@ -355,10 +410,14 @@ trap 'restore_home; cleanup' EXIT
 active_block()  { awk '/^▶ ACTIVE/{f=1} f&&/^$/{exit} f'; }
 alt_block()     { awk '/^  ALTERNATIVES/{f=1;next} f&&/^$/{exit} f'; }
 unavail_block() { awk '/^  UNAVAILABLE/{f=1;next} f&&/^$/{exit} f'; }
-# How many ACCOUNT rows a report rendered: the ACTIVE header plus one ✓/✗ line
+# The FOURTH bucket (2026-08-25). "I have not measured this" is a statement about
+# the TOOL, not a verdict on the account, and filing it under UNAVAILABLE told
+# every reader the opposite of the truth about two cancelled-but-live seats.
+unmeasured_block() { awk '/^  UNMEASURED/{f=1;next} f&&/^$/{exit} f'; }
+# How many ACCOUNT rows a report rendered: the ACTIVE header plus one ✓/✗/? line
 # per other account. Alternation rather than a [✓✗] bracket expression, those
 # are multi-byte and BSD grep collapses them byte-wise outside a UTF-8 locale.
-rendered_rows() { grep -cE '^(▶ ACTIVE|  ✓ |  ✗ )' || true; }
+rendered_rows() { grep -cE '^(▶ ACTIVE|  ✓ |  ✗ |  \? )' || true; }
 # Any line that leads with "N% left · M% used" while NOT being one of the two
 # metered ACTIVE window rows. The metered rows lead with left deliberately (they
 # sit next to a bar whose filled cells ARE the left figure); every SENTENCE must
@@ -711,12 +770,26 @@ JSON_OUT="$("$SCRIPT" usage --no-refresh --json 2>>"$ERRLOG")"
 RC=$?
 set -e
 [ "$RC" -eq 0 ] && ok "expired cache → usage --no-refresh exits 0" || bad "expired cache → usage --no-refresh exits 0 (got $RC)"
-# The row lands in UNAVAILABLE, and its short reason is the expiry itself, an
-# already-reset cached window is not "old data", it is data from a window that no
-# longer exists, so that is the whole answer for why the row cannot be used.
-grep -q "weekly window expired" <<<"$(unavail_block <<<"$OUT")" \
-  && ok "expired cache → the row is UNAVAILABLE, reason 'weekly window expired'" \
-  || bad "expired cache → UNAVAILABLE with an expiry reason (got: $OUT)"
+# ⚠️ THIS ASSERTION WAS INVERTED ON PURPOSE, 2026-08-25. It used to require the
+# row to land in UNAVAILABLE reading "weekly window expired", and that wording
+# was load-bearing in the worst way: the string means "the number I have is
+# stale, go and measure it" and it READS as "this account is finished". Every
+# session believed it. Measured 2026-08-21 08:30, both cancelled-but-live seats
+# rendered exactly that while each still had roughly two more full weekly
+# refreshes of already-paid-for quota.
+#
+# A cached window that has ROLLED is not bad news about the account, the quota
+# behind it is new and simply unmeasured. So the row must NOT be under
+# UNAVAILABLE, and must not use the word "expired" about the account.
+! grep -q "wk@example.com" <<<"$(unavail_block <<<"$OUT")" \
+  && ok "expired cache → the row is NOT filed under UNAVAILABLE" \
+  || bad "expired cache → must not be UNAVAILABLE, a rolled window is not a dead seat (got: $OUT)"
+grep -q "unmeasured, may be full" <<<"$(unmeasured_block <<<"$OUT")" \
+  && ok "expired cache → it is UNMEASURED, and says the quota may be full" \
+  || bad "expired cache → UNMEASURED with an invitation to measure (got: $OUT)"
+! grep -q "weekly window expired" <<<"$OUT" \
+  && ok "expired cache → the word 'expired' never describes the ACCOUNT again" \
+  || bad "expired cache → 'weekly window expired' is back (got: $OUT)"
 ! grep -q "55% left" <<<"$OUT" \
   && ok "expired cache → the stale 55% (100-45) never renders" \
   || bad "expired cache → the stale 55% never renders (got: $OUT)"
@@ -727,6 +800,292 @@ cs_row="$(jq -c '.accounts[] | select(.email=="wk@example.com")' <<<"$JSON_OUT" 
 [ "$(jq -r '.weekly.remaining_pct' <<<"$cs_row" 2>/dev/null)" = "null" ] \
   && ok "expired cache (json) → weekly.remaining_pct is null, never the stale number" \
   || bad "expired cache (json) → weekly.remaining_pct is null (got: $cs_row)"
+
+# --- 10b. THE SEAT'S LIFECYCLE IS NOT A QUOTA FACT (2026-08-25) --------------
+#
+# The operator, 2026-08-21: two seats had been cancelled and were still
+# perfectly usable, with two or three more weekly refreshes each still to come,
+# and every session was writing them off.
+#
+# The two cases the fix has to tell apart, and they differ ONLY by a date:
+#   a cancelled seat whose window ROLLED  -> still live, quota unknown and very
+#                                            possibly full
+#   a cancelled seat past its END date    -> genuinely finished
+# A tool that cannot separate these writes off a live seat carrying two more
+# full weekly refreshes of already-paid-for quota, which is what happened.
+seed_cancelled_seat() {  # seed_cancelled_seat <ends-date>
+  mkdir -p "$RUN/.claude-pool/spare"
+  printf '{"claudeAiOauth":{"accessToken":"TOK-SPARE-SEAT"}}' > "$RUN/.claude-pool/spare/.credentials.json"
+  cat > "$RUN/cfg/accounts" <<EOF
+spare@example.com|$RUN/.claude-pool/spare
+EOF
+  # a cached weekly window that has ALREADY ROLLED, the exact state that used
+  # to render as "weekly window expired"
+  jq -n --arg wr "$(iso_in -2d)" --arg sr "$(iso_in +2H)" \
+    '{"spare@example.com":{wk_u:"45",wk_r:$wr,se_u:"20",se_r:$sr,ts:"stale fixture",ts_epoch:"0"}}' \
+    > "$RUN/cfg/usage-cache.json"
+  jq -n --arg ends "$1" \
+    '{accounts:{"spare@example.com":{plan:"Max 20x",status:"cancelled",ends:$ends}}}' \
+    > "$RUN/billing.json"
+}
+
+new_run seatlive
+seed_cancelled_seat "$(date -u -v+14d '+%Y-%m-%d')"
+set +e
+OUT="$(CLAUDE_BILLING_JSON="$RUN/billing.json" "$SCRIPT" usage --no-refresh 2>>"$ERRLOG")"
+JSON_OUT="$(CLAUDE_BILLING_JSON="$RUN/billing.json" "$SCRIPT" usage --no-refresh --json 2>>"$ERRLOG")"
+set -e
+! grep -q "spare@example.com" <<<"$(unavail_block <<<"$OUT")" \
+  && ok "cancelled seat, window rolled → NOT unavailable: the seat has not ended" \
+  || bad "cancelled seat, window rolled → must not be UNAVAILABLE (got: $OUT)"
+grep -q "spare@example.com" <<<"$(unmeasured_block <<<"$OUT")" \
+  && ok "cancelled seat, window rolled → filed under UNMEASURED instead" \
+  || bad "cancelled seat, window rolled → belongs in UNMEASURED (got: $OUT)"
+# ⚠️ The END DATE is the column that changes behaviour: for a cancelled seat the
+# question is never "is this any good", it is "how many weekly windows are left".
+grep -q "cancelled, quota until" <<<"$(unmeasured_block <<<"$OUT")" \
+  && ok "cancelled seat, window rolled → names the deadline that actually matters" \
+  || bad "cancelled seat → must name its end date (got: $OUT)"
+grep -q "rota usage --record spare" <<<"$(unmeasured_block <<<"$OUT")" \
+  && ok "cancelled seat, window rolled → hands over the exact command that answers it" \
+  || bad "cancelled seat → must name the command (got: $OUT)"
+[ "$(jq -r '.accounts[0].seat.ended' <<<"$JSON_OUT" 2>/dev/null)" = "false" ] \
+  && ok "cancelled seat, window rolled (json) → seat.ended is false" \
+  || bad "cancelled seat (json) → seat.ended false (got: $JSON_OUT)"
+[ "$(jq -r '.accounts[0].seat.status' <<<"$JSON_OUT" 2>/dev/null)" = "cancelled" ] \
+  && ok "cancelled seat, window rolled (json) → seat.status is published verbatim" \
+  || bad "cancelled seat (json) → seat.status cancelled (got: $JSON_OUT)"
+[ "$(jq -r '.accounts[0].unmeasured' <<<"$JSON_OUT" 2>/dev/null)" = "true" ] \
+  && ok "cancelled seat, window rolled (json) → unmeasured is true" \
+  || bad "cancelled seat (json) → unmeasured true (got: $JSON_OUT)"
+
+# ⚠️ AND IT MUST BE ABLE TO FAIL. Same fixture, same rolled window, ONE field
+# different, the end date is in the past. If this did not flip, the check above
+# would be passing on "it never says unavailable", which is not the claim.
+new_run seatended
+seed_cancelled_seat "$(date -u -v-1d '+%Y-%m-%d')"
+set +e
+OUT="$(CLAUDE_BILLING_JSON="$RUN/billing.json" "$SCRIPT" usage --no-refresh 2>>"$ERRLOG")"
+JSON_OUT="$(CLAUDE_BILLING_JSON="$RUN/billing.json" "$SCRIPT" usage --no-refresh --json 2>>"$ERRLOG")"
+set -e
+grep -q "spare@example.com" <<<"$(unavail_block <<<"$OUT")" \
+  && ok "seat past its end date → IS unavailable" \
+  || bad "seat past its end date → must be UNAVAILABLE (got: $OUT)"
+grep -q "seat ended" <<<"$(unavail_block <<<"$OUT")" \
+  && ok "seat past its end date → the reason is the SEAT, not the window" \
+  || bad "seat past its end date → reason names the seat (got: $OUT)"
+[ "$(jq -r '.accounts[0].seat.ended' <<<"$JSON_OUT" 2>/dev/null)" = "true" ] \
+  && ok "seat past its end date (json) → seat.ended is true" \
+  || bad "seat past its end date (json) → seat.ended true (got: $JSON_OUT)"
+[ "$(jq -r '.accounts[0].unmeasured' <<<"$JSON_OUT" 2>/dev/null)" = "false" ] \
+  && ok "seat past its end date (json) → an ended seat is never merely unmeasured" \
+  || bad "seat past its end date (json) → unmeasured false (got: $JSON_OUT)"
+
+# --- 10b-ii. THE DEADLINE IS min(weekly reset, SEAT END) ---------------------
+#
+# ⚠️ WRITTEN BECAUSE A SABOTAGE PROVED THE RULE WAS UNTESTED. Removing the seat
+# end from the deadline entirely left the whole suite GREEN, so the ranking
+# change was riding on nothing, and a later "simplification" back to the weekly
+# reset alone would have passed review.
+#
+# The fixture separates the two rules by construction. Both candidates clear the
+# health floor; neither is active:
+#   alpha  ACTIVE seat,    weekly resets in 5 DAYS                  -> deadline +5d
+#   spare  CANCELLED, ends in 2 DAYS, weekly resets in 6 DAYS       -> deadline +2d
+# Ranking on the weekly reset alone picks alpha. Ranking on min(reset, end)
+# picks spare, correctly, because whatever is unspent on that seat in two days
+# is gone forever, while alpha's window merely rolls.
+new_run seatrank
+mkdir -p "$RUN/.claude-pool/primary" "$RUN/.claude-pool/alpha" "$RUN/.claude-pool/spare"
+sr_exp=$(( ($(date +%s) + 86400) * 1000 ))
+for a in primary alpha spare; do
+  printf '{"claudeAiOauth":{"accessToken":"TOK-SR-%s","refreshToken":"rt","expiresAt":%s,"refreshTokenExpiresAt":%s}}' \
+    "$a" "$sr_exp" "$sr_exp" > "$RUN/.claude-pool/$a/.credentials.json"
+  printf '{"oauthAccount":{"emailAddress":"%s@example.com"}}' "$a" > "$RUN/.claude-pool/$a/.claude.json"
+done
+cp "$RUN/.claude-pool/primary/.credentials.json" "$RUN/.claude/.credentials.json"
+printf '{"oauthAccount":{"emailAddress":"primary@example.com"}}' > "$RUN/.claude.json"
+cat > "$RUN/cfg/accounts" <<EOF
+primary@example.com|$RUN/.claude-pool/primary
+alpha@example.com|$RUN/.claude-pool/alpha
+spare@example.com|$RUN/.claude-pool/spare
+EOF
+# active, spent enough that the ordinary ranking decides
+printf '{"seven_day":{"utilization":98,"resets_at":"%s"},"five_hour":{"utilization":50,"resets_at":"%s"}}' \
+  "$(iso_in +10H)" "$(iso_in +4H)" > "$RUN/state/usage-TOK-SR-primary.json"
+printf '{"seven_day":{"utilization":20,"resets_at":"%s"},"five_hour":{"utilization":0,"resets_at":"%s"}}' \
+  "$(iso_in +5d)" "$(iso_in +4H)" > "$RUN/state/usage-TOK-SR-alpha.json"
+printf '{"seven_day":{"utilization":20,"resets_at":"%s"},"five_hour":{"utilization":0,"resets_at":"%s"}}' \
+  "$(iso_in +6d)" "$(iso_in +4H)" > "$RUN/state/usage-TOK-SR-spare.json"
+jq -n --arg ends "$(date -u -v+2d '+%Y-%m-%d')" \
+  '{accounts:{"spare@example.com":{plan:"Max 20x",status:"cancelled",ends:$ends},
+              "alpha@example.com":{plan:"Max 20x",status:"active"}}}' > "$RUN/billing.json"
+set +e
+SR_OUT="$(FAKE_NEW_EMAIL=primary@example.com CLAUDE_BILLING_JSON="$RUN/billing.json" \
+          "$SCRIPT" usage 2>>"$ERRLOG")"
+set -e
+grep -q "switch to spare@example.com" <<<"$SR_OUT" \
+  && ok "seat deadline → the CANCELLED seat is picked, though its weekly reset is LATER" \
+  || bad "seat deadline → must rank on min(weekly reset, seat end) (got: $SR_OUT)"
+! grep -q "switch to alpha@example.com" <<<"$SR_OUT" \
+  && ok "seat deadline → and the later-ending seat is not preferred just for resetting sooner" \
+  || bad "seat deadline → alpha must not win (got: $SR_OUT)"
+
+# ⚠️ AND THE SENTENCE MUST NAME THE DATE THAT ACTUALLY BOUND THE CHOICE. This
+# pick was decided by the SEAT END, and the rationale used to call it "soonest
+# weekly reset" anyway, then print a reset instant six days out that had nothing
+# to do with it: the right answer under the wrong noun, pointing the reader at
+# the wrong date to sanity-check it against.
+grep -q "this seat ENDS $(date -u -v+2d '+%Y-%m-%d')" <<<"$SR_OUT" \
+  && ok "seat deadline → the rationale names the SEAT END, with the date that bound the pick" \
+  || bad "seat deadline → rationale must name the seat end (got: $SR_OUT)"
+grep -q "LAST window" <<<"$SR_OUT" \
+  && ok "seat deadline → and says why that matters: it is the seat's LAST window" \
+  || bad "seat deadline → rationale must say last window (got: $SR_OUT)"
+! grep -q "soonest weekly reset among" <<<"$SR_OUT" \
+  && ok "seat deadline → and does NOT claim a soonest-weekly-reset rationale it did not use" \
+  || bad "seat deadline → must not claim the reset decided it (got: $SR_OUT)"
+
+# ⚠️ AND THE MACHINE SURFACE MUST BE AS HONEST AS THE SENTENCE ABOVE. The
+# recommendation published this same instant under the key `weekly_resets_at`
+# from 2026-08-27 to 2026-08-28, i.e. THIS pick - bound by a seat end two days
+# out - shipped that end date under a name promising a weekly reset that is six
+# days out. The date was right, the noun was wrong, and a consumer doing "when
+# does quota come back" arithmetic on it got an answer to a question it never
+# asked. `deadline_at` names the instant and `deadline_kind` names WHICH of the
+# two dates it is; the kind is the load-bearing half, because a bare timestamp
+# cannot tell the two apart and that ambiguity was the whole defect.
+set +e
+SR_JSON="$(FAKE_NEW_EMAIL=primary@example.com CLAUDE_BILLING_JSON="$RUN/billing.json" \
+           "$SCRIPT" usage --json 2>>"$ERRLOG")"
+set -e
+[ "$(jq -r '.recommendation.email' <<<"$SR_JSON" 2>/dev/null)" = "spare@example.com" ] \
+  && ok "seat deadline (json) → the seat-end-bound pick is the one published" \
+  || bad "seat deadline (json) → spare must be the pick (got: $(jq -c '.recommendation' <<<"$SR_JSON" 2>/dev/null))"
+[ "$(jq -r '.recommendation.deadline_at' <<<"$SR_JSON" 2>/dev/null)" = "$(date -u -v+2d '+%Y-%m-%d')T00:00:00Z" ] \
+  && ok "seat deadline (json) → deadline_at carries the SEAT END, the date that bound the pick" \
+  || bad "seat deadline (json) → deadline_at must be the seat end (got: $(jq -c '.recommendation' <<<"$SR_JSON" 2>/dev/null))"
+[ "$(jq -r '.recommendation.deadline_kind' <<<"$SR_JSON" 2>/dev/null)" = "seat-end" ] \
+  && ok "seat deadline (json) → deadline_kind says seat-end, so the date cannot be read as a reset" \
+  || bad "seat deadline (json) → deadline_kind must be seat-end (got: $(jq -c '.recommendation' <<<"$SR_JSON" 2>/dev/null))"
+# the misnamed key is GONE, not kept beside the honest one: nothing outside this
+# repo ever read it, so a parallel field would only preserve the lie
+[ "$(jq -r '.recommendation | has("weekly_resets_at")' <<<"$SR_JSON" 2>/dev/null)" = "false" ] \
+  && ok "seat deadline (json) → the misnamed weekly_resets_at is removed, not left alongside" \
+  || bad "seat deadline (json) → weekly_resets_at must be gone (got: $(jq -c '.recommendation' <<<"$SR_JSON" 2>/dev/null))"
+# ⚠️ AND THE FIXTURE MUST GENUINELY SEPARATE THE TWO DATES. They agree on almost
+# every real seat, so without this the assertions above would pass on a pool where
+# `deadline_at` could still be the raw weekly reset and nobody would know.
+SR_SPARE_RESET="$(jq -r '.accounts[] | select(.email=="spare@example.com") | .weekly.resets_at' <<<"$SR_JSON" 2>/dev/null)"
+[ -n "$SR_SPARE_RESET" ] && [ "${SR_SPARE_RESET%%T*}" != "$(date -u -v+2d '+%Y-%m-%d')" ] \
+  && ok "seat deadline (json) → the picked seat's own weekly reset is a DIFFERENT date, so the assertion discriminates" \
+  || bad "seat deadline (json) → reset and seat end must differ in this fixture (reset: $SR_SPARE_RESET)"
+
+# THE CONTROL, one field different: the seat now ends in 8 days, AFTER its own
+# weekly reset at +6d, so nothing is bound by a seat end any more and alpha's
+# +5d reset is the soonest deadline in the pool. The pick flips AND the noun
+# flips with it - without this the assertions above would pass on a sentence
+# that says "seat ENDS" unconditionally.
+jq -n --arg ends "$(date -u -v+8d '+%Y-%m-%d')" \
+  '{accounts:{"spare@example.com":{plan:"Max 20x",status:"cancelled",ends:$ends},
+              "alpha@example.com":{plan:"Max 20x",status:"active"}}}' > "$RUN/billing.json"
+set +e
+SR_OUT2="$(FAKE_NEW_EMAIL=primary@example.com CLAUDE_BILLING_JSON="$RUN/billing.json" \
+           "$SCRIPT" usage 2>>"$ERRLOG")"
+set -e
+grep -q "switch to alpha@example.com" <<<"$SR_OUT2" \
+  && ok "seat deadline (control) → an end date AFTER the reset stops binding, and the soonest reset wins" \
+  || bad "seat deadline (control) → alpha must win (got: $SR_OUT2)"
+grep -q "soonest weekly reset among the accounts clearing the health floor" <<<"$SR_OUT2" \
+  && ok "seat deadline (control) → and the rationale says RESET when the reset is what bound it" \
+  || bad "seat deadline (control) → rationale must name the reset (got: $SR_OUT2)"
+! grep -q "this seat ENDS" <<<"$SR_OUT2" \
+  && ok "seat deadline (control) → the seat-end wording is not printed unconditionally" \
+  || bad "seat deadline (control) → must not claim a seat end (got: $SR_OUT2)"
+# the machine surface flips with it, and `deadline_at` is that account's OWN
+# weekly reset to the instant, compared against the row rather than against a
+# recomputed clock, so the two can never disagree about the same pick
+set +e
+SR_JSON2="$(FAKE_NEW_EMAIL=primary@example.com CLAUDE_BILLING_JSON="$RUN/billing.json" \
+            "$SCRIPT" usage --json 2>>"$ERRLOG")"
+set -e
+[ "$(jq -r '.recommendation.deadline_kind' <<<"$SR_JSON2" 2>/dev/null)" = "reset" ] \
+  && ok "seat deadline (control, json) → deadline_kind flips to reset when the reset is what bound it" \
+  || bad "seat deadline (control, json) → deadline_kind must be reset (got: $(jq -c '.recommendation' <<<"$SR_JSON2" 2>/dev/null))"
+SR_ALPHA_RESET="$(jq -r '.accounts[] | select(.email=="alpha@example.com") | .weekly.resets_at' <<<"$SR_JSON2" 2>/dev/null)"
+[ -n "$SR_ALPHA_RESET" ] \
+  && [ "$(jq -r '.recommendation.deadline_at' <<<"$SR_JSON2" 2>/dev/null)" = "$SR_ALPHA_RESET" ] \
+  && ok "seat deadline (control, json) → deadline_at is the picked account's own weekly reset" \
+  || bad "seat deadline (control, json) → deadline_at must equal alpha's reset $SR_ALPHA_RESET (got: $(jq -c '.recommendation' <<<"$SR_JSON2" 2>/dev/null))"
+
+# --- 10c. a boost is dated data, and expires itself -------------------------
+# A percentage is only meaningful against a known baseline, and the baseline
+# moves: weekly Claude Code limits were 50% higher through 2026-08-31. A
+# hard-coded sentence would still be claiming that months later, so each entry
+# carries its own `through` date and simply stops printing.
+new_run boost
+mkdir -p "$RUN/.claude-pool/spare"
+printf '{"claudeAiOauth":{"accessToken":"TOK-B"}}' > "$RUN/.claude-pool/spare/.credentials.json"
+printf 'spare@example.com|%s\n' "$RUN/.claude-pool/spare" > "$RUN/cfg/accounts"
+jq -n --arg t "$(date -u -v+3d '+%Y-%m-%d')" \
+  '{boosts:[{through:$t,what:"Weekly limits are 50% higher"}],accounts:{}}' > "$RUN/live.json"
+jq -n --arg t "$(date -u -v-3d '+%Y-%m-%d')" \
+  '{boosts:[{through:$t,what:"Weekly limits are 50% higher"}],accounts:{}}' > "$RUN/past.json"
+set +e
+LIVE_OUT="$(CLAUDE_BILLING_JSON="$RUN/live.json" "$SCRIPT" usage --no-refresh 2>>"$ERRLOG")"
+PAST_OUT="$(CLAUDE_BILLING_JSON="$RUN/past.json" "$SCRIPT" usage --no-refresh 2>>"$ERRLOG")"
+set -e
+grep -q "boost until" <<<"$LIVE_OUT" \
+  && ok "boost → a live boost is stated, so a percentage is read against the right baseline" \
+  || bad "boost → a live boost must be shown (got: $LIVE_OUT)"
+! grep -q "boost until" <<<"$PAST_OUT" \
+  && ok "boost → one whose date has passed disappears on its own" \
+  || bad "boost → an expired boost must not print (got: $PAST_OUT)"
+
+# --- 10d. `usage --record`: the path that works when the API will not ---------
+# Measured 2026-08-21 09:35 on the pool host: GET /api/oauth/usage answered 429
+# for both cancelled seats across six attempts over two and a half minutes, with
+# no live session on either and a valid credential in every pool dir. The number
+# was two clicks away on the vendor's usage page the whole time.
+new_run record
+mkdir -p "$RUN/.claude-pool/spare"
+printf '{"claudeAiOauth":{"accessToken":"TOK-R"}}' > "$RUN/.claude-pool/spare/.credentials.json"
+printf '{"oauthAccount":{"emailAddress":"spare@example.com"}}' > "$RUN/.claude-pool/spare/.claude.json"
+printf 'spare@example.com|%s\n' "$RUN/.claude-pool/spare" > "$RUN/cfg/accounts"
+set +e
+REC_OUT="$(CLAUDE_POOL_DIR="$RUN/.claude-pool" "$SCRIPT" usage --record spare 12 2>&1)"; REC_RC=$?
+BAD_OUT="$(CLAUDE_POOL_DIR="$RUN/.claude-pool" "$SCRIPT" usage --record spare 150 2>&1)"; BAD_RC=$?
+NOALIAS="$(CLAUDE_POOL_DIR="$RUN/.claude-pool" "$SCRIPT" usage --record 2>&1)"; NOALIAS_RC=$?
+set -e
+[ "$REC_RC" -eq 0 ] && ok "--record → a real reading is accepted" || bad "--record rc=$REC_RC: $REC_OUT"
+[ "$BAD_RC" -ne 0 ] && ok "--record → refuses a percentage outside 0-100" || bad "--record accepted 150%: $BAD_OUT"
+[ "$NOALIAS_RC" -ne 0 ] && ok "--record → refuses without an alias and a number" || bad "--record accepted nothing: $NOALIAS"
+# ⚠️ IT MUST CARRY THE WINDOW IT BELONGS TO. A measurement with no window is
+# indistinguishable from a fresh one forever, which is the very defect this
+# whole change is about, a number outliving the window it described.
+[ -n "$(jq -r '.accounts["spare@example.com"].weekly_resets_at // empty' "$RUN/cfg/human-usage.json" 2>/dev/null)" ] \
+  && ok "--record → the reading is stamped with the window it belongs to" \
+  || bad "--record → stored without a window (got: $(cat "$RUN/cfg/human-usage.json" 2>/dev/null))"
+[ "$(jq -r '.accounts["spare@example.com"].weekly_used' "$RUN/cfg/human-usage.json" 2>/dev/null)" = "12" ] \
+  && ok "--record → stores the USED percentage, the polarity the vendor page prints" \
+  || bad "--record → weekly_used wrong (got: $(cat "$RUN/cfg/human-usage.json" 2>/dev/null))"
+# ⚠️ AND IT MUST SURVIVE THE READ WITH ITS TIMESTAMP INTACT. Tab is IFS
+# *whitespace*, so a tab-joined row collapses its two routinely-empty 5h fields
+# and shifts the stamp out of position: the recorded number then rendered with
+# NO age at all, a hand-typed figure looking freshly measured, which is exactly
+# the dishonesty this change exists to remove.
+set +e
+REC_TABLE="$(CLAUDE_POOL_DIR="$RUN/.claude-pool" CLAUDE_HUMAN_USAGE="$RUN/cfg/human-usage.json" \
+             "$SCRIPT" usage --no-refresh 2>>"$ERRLOG")"
+REC_JSON="$(CLAUDE_POOL_DIR="$RUN/.claude-pool" CLAUDE_HUMAN_USAGE="$RUN/cfg/human-usage.json" \
+            "$SCRIPT" usage --no-refresh --json 2>>"$ERRLOG")"
+set -e
+[ "$(jq -r '.accounts[0].weekly.used_pct' <<<"$REC_JSON" 2>/dev/null)" = "12" ] \
+  && ok "--record → the recorded reading is what the usage report then shows" \
+  || bad "--record → the reading never reached the report (got: $REC_JSON)"
+grep -qE 'cached [A-Z][a-z]{2} [0-9]' <<<"$REC_TABLE" \
+  && ok "--record → and it renders WITH its age, never as a stamp-less number" \
+  || bad "--record → the read-at stamp was lost on the way back (got: $REC_TABLE)"
 
 # --- 11. move_oauth_account copies the WHOLE object and leaves siblings alone -
 new_run oauthmove
@@ -1110,9 +1469,16 @@ grep -q "weekly window has not started yet" <<<"$OUT" \
 [ "$(jq -r '.recommendation.action' <<<"$JSON_OUT" 2>/dev/null)" = "switch" ] \
   && ok "fresh wins (json) → action is switch" \
   || bad "fresh wins (json) → action is switch (got: $(jq -c '.recommendation' <<<"$JSON_OUT" 2>/dev/null))"
-[ "$(jq -r '.recommendation.weekly_resets_at' <<<"$JSON_OUT" 2>/dev/null)" = "null" ] \
-  && ok "fresh wins (json) → weekly_resets_at is null, not an empty string" \
-  || bad "fresh wins (json) → weekly_resets_at is null (got: $(jq -c '.recommendation' <<<"$JSON_OUT" 2>/dev/null))"
+[ "$(jq -r '.recommendation.deadline_at' <<<"$JSON_OUT" 2>/dev/null)" = "null" ] \
+  && ok "fresh wins (json) → deadline_at is null, not an empty string" \
+  || bad "fresh wins (json) → deadline_at is null (got: $(jq -c '.recommendation' <<<"$JSON_OUT" 2>/dev/null))"
+# ⚠️ AND THE KIND GOES NULL WITH IT. A kind beside no date would be a claim about
+# a deadline that does not exist, the same shape of dishonesty this pair replaced;
+# rota_seat_deadline returns BOTH fields empty for a seat with neither date, and
+# the published pair mirrors that rather than inventing a default of "reset".
+[ "$(jq -r '.recommendation.deadline_kind' <<<"$JSON_OUT" 2>/dev/null)" = "null" ] \
+  && ok "fresh wins (json) → deadline_kind is null too, never a kind without a date" \
+  || bad "fresh wins (json) → deadline_kind is null (got: $(jq -c '.recommendation' <<<"$JSON_OUT" 2>/dev/null))"
 [ "$(jq -r '.recommendation.weekly_fresh' <<<"$JSON_OUT" 2>/dev/null)" = "true" ] \
   && ok "fresh wins (json) → weekly_fresh marks the null reset as fresh, not missing" \
   || bad "fresh wins (json) → weekly_fresh is true (got: $(jq -c '.recommendation' <<<"$JSON_OUT" 2>/dev/null))"
@@ -1526,6 +1892,82 @@ BF_PROSE="$(left_first_prose <<<"$OUT")"
 [ -z "$BF_PROSE" ] \
   && ok "binding floor → no SENTENCE in a multi-account report leads with left either" \
   || bad "binding floor → a sentence leads with left (got: $BF_PROSE)"
+
+# --- 24b. a SCOPED cap spent is not a spent SEAT: weekly_all travels too -------
+# Fable's per-model weekly at 100% binds (and must keep excluding the seat from the
+# pick), but weekly_all at 60% used means the seat still runs every other model. The
+# engine publishes that all-model figure as weekly_all{used_pct,remaining_pct,
+# resets_at} and the short reason says so. Two controls: a limits array with no
+# scoped entry, and no limits key at all (weekly_all then IS seven_day).
+new_run scopedspent
+mkdir -p "$RUN/.claude-pool/alpha" "$RUN/.claude-pool/fable" "$RUN/.claude-pool/nosc" "$RUN/.claude-pool/plain"
+printf '{"claudeAiOauth":{"accessToken":"TOK-SS-ALPHA"}}' > "$RUN/.claude/.credentials.json"
+cp "$RUN/.claude/.credentials.json" "$RUN/.claude-pool/alpha/.credentials.json"
+printf '{"oauthAccount":{"emailAddress":"alpha@example.com"}}' > "$RUN/.claude-pool/alpha/.claude.json"
+printf '{"oauthAccount":{"emailAddress":"alpha@example.com"}}' > "$RUN/.claude.json"
+for n in fable nosc plain; do
+  printf '{"claudeAiOauth":{"accessToken":"TOK-SS-%s"}}' "$n" > "$RUN/.claude-pool/$n/.credentials.json"
+  printf '{"oauthAccount":{"emailAddress":"%s@example.com"}}' "$n" > "$RUN/.claude-pool/$n/.claude.json"
+done
+cat > "$RUN/cfg/accounts" <<EOF
+alpha@example.com|$RUN/.claude-pool/alpha
+fable@example.com|$RUN/.claude-pool/fable
+nosc@example.com|$RUN/.claude-pool/nosc
+plain@example.com|$RUN/.claude-pool/plain
+EOF
+SS_ALL_R="$(iso_in +6d)"; SS_SCOPED_R="$(iso_in +2d)"; SS_SE_R="$(iso_in +2H)"
+printf '{"seven_day":{"utilization":18,"resets_at":"%s"},"five_hour":{"utilization":23,"resets_at":"%s"}}' \
+  "$(iso_in +3d)" "$SS_SE_R" > "$RUN/state/usage-TOK-SS-ALPHA.json"
+printf '{"five_hour":{"utilization":16,"resets_at":"%s"},"seven_day":{"utilization":60,"resets_at":"%s"},
+ "limits":[{"kind":"session","group":"session","percent":16,"resets_at":"%s","scope":null},
+   {"kind":"weekly_all","group":"weekly","percent":60,"resets_at":"%s","scope":null},
+   {"kind":"weekly_scoped","group":"weekly","percent":100,"resets_at":"%s",
+    "scope":{"model":{"id":null,"display_name":"Fable"}}}]}' \
+  "$SS_SE_R" "$SS_ALL_R" "$SS_SE_R" "$SS_ALL_R" "$SS_SCOPED_R" \
+  > "$RUN/state/usage-TOK-SS-fable.json"
+printf '{"five_hour":{"utilization":5,"resets_at":"%s"},"seven_day":{"utilization":30,"resets_at":"%s"},
+ "limits":[{"kind":"weekly_all","group":"weekly","percent":30,"resets_at":"%s","scope":null}]}' \
+  "$SS_SE_R" "$SS_ALL_R" "$SS_ALL_R" > "$RUN/state/usage-TOK-SS-nosc.json"
+printf '{"five_hour":{"utilization":5,"resets_at":"%s"},"seven_day":{"utilization":45,"resets_at":"%s"}}' \
+  "$SS_SE_R" "$SS_ALL_R" > "$RUN/state/usage-TOK-SS-plain.json"
+set +e
+OUT="$(FAKE_NEW_EMAIL=alpha@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
+VOUT="$(FAKE_NEW_EMAIL=alpha@example.com "$SCRIPT" usage --verbose 2>>"$ERRLOG")"
+JSON_OUT="$(FAKE_NEW_EMAIL=alpha@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
+RC=$?
+set -e
+[ "$RC" -eq 0 ] && ok "scoped spent → usage exits 0" || bad "scoped spent → usage exits 0 (got $RC: $OUT)"
+ss_row="$(jq -c '.accounts[] | select(.email=="fable@example.com")' <<<"$JSON_OUT" 2>/dev/null)"
+[ "$(jq -r '.weekly | [.used_pct,.remaining_pct,.kind,.scope] | @csv' <<<"$ss_row" 2>/dev/null)" = '100,0,"weekly_scoped","Fable"' ] \
+  && ok "scoped spent (json) → weekly is still the binding Fable cap, unchanged" \
+  || bad "scoped spent (json) → weekly unchanged (got: $(jq -c '.weekly' <<<"$ss_row" 2>/dev/null))"
+[ "$(jq -r '.weekly_all | [.used_pct,.remaining_pct,.resets_at] | @csv' <<<"$ss_row" 2>/dev/null)" = "60,40,\"$SS_ALL_R\"" ] \
+  && ok "scoped spent (json) → weekly_all carries the all-model 60 used / 40 left and its own reset" \
+  || bad "scoped spent (json) → weekly_all (got: $(jq -c '.weekly_all' <<<"$ss_row" 2>/dev/null))"
+[ "$(jq -r '.recommendable' <<<"$ss_row" 2>/dev/null)" = "false" ] \
+  && ok "scoped spent (json) → the ranking still excludes the seat (display-only change)" \
+  || bad "scoped spent (json) → still excluded (got: $ss_row)"
+grep -qE '^  ✗ fable@example\.com +weekly spent \(Fable\) · all models 40% left' <<<"$(unavail_block <<<"$OUT")" \
+  && ok "scoped spent → the short reason names the spent Fable cap AND the all-model headroom" \
+  || bad "scoped spent → short reason with all-model figure (got: $(unavail_block <<<"$OUT"))"
+grep -qE 'resets  weekly .* · all models .* · 5h ' <<<"$VOUT" \
+  && ok "scoped spent → --verbose reset line carries the all-model reset too" \
+  || bad "scoped spent → --verbose all-model reset (got: $VOUT)"
+[ "$(jq -r '.accounts[] | select(.email=="nosc@example.com") | .weekly_all | [.used_pct,.remaining_pct] | @csv' <<<"$JSON_OUT" 2>/dev/null)" = '30,70' ] \
+  && ok "no scoped entry (json) → weekly_all is the weekly_all entry" \
+  || bad "no scoped entry (json) → weekly_all (got: $(jq -c '.accounts[] | select(.email=="nosc@example.com") | .weekly_all' <<<"$JSON_OUT" 2>/dev/null))"
+[ "$(jq -r '.accounts[] | select(.email=="plain@example.com") | [.weekly.kind, .weekly_all.used_pct, .weekly_all.remaining_pct] | @csv' <<<"$JSON_OUT" 2>/dev/null)" = ',45,55' ] \
+  && ok "no limits key (json) → weekly_all falls back to seven_day, kind stays null" \
+  || bad "no limits key (json) → weekly_all from seven_day (got: $(jq -c '.accounts[] | select(.email=="plain@example.com")' <<<"$JSON_OUT" 2>/dev/null))"
+! grep -qE '(nosc|plain)@example\.com.*all models' <<<"$OUT" \
+  && ok "unscoped rows → no all-models note where nothing is scoped" \
+  || bad "unscoped rows → no all-models note (got: $OUT)"
+set +e
+SS_CACHED_JSON="$("$SCRIPT" usage --no-refresh --json 2>>"$ERRLOG")"
+set -e
+[ "$(jq -r '.accounts[] | select(.email=="fable@example.com") | .weekly_all' <<<"$SS_CACHED_JSON" 2>/dev/null)" = "null" ] \
+  && ok "scoped spent (json) → a cached row leaves weekly_all null, never invented" \
+  || bad "scoped spent (json) → cached weekly_all null (got: $(jq -c '.accounts[] | select(.email=="fable@example.com")' <<<"$SS_CACHED_JSON" 2>/dev/null))"
 
 # --- 25. switch-auto must never dead-end merely because the data was old -------
 # The 2026-08-05 defect. `rota switch` with no argument exists so the operator never has to
@@ -2208,7 +2650,14 @@ EX_RC=$?
 EX_OUT_V="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" switch-auto --dry-run --verbose 2>&1)"
 EXQ_OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" switch-auto --dry-run --quiet 2>&1)"
 EXQ_RC=$?
-EX_USAGE="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
+# ⚠️ AN EMPTY BILLING FILE, PINNED ON PURPOSE. `usage` reads billing.json now,
+# for seat status, end dates and dated `boosts`. Under this suite that path
+# resolves inside the throwaway $CFG_DIR and does not exist, but pinning it says
+# so out loud: a golden snapshot that ever read a REAL billing file would
+# inherit its dated boosts and then fail by itself on the day one expired, with
+# a diff pointing at a line nobody touched.
+printf '{"accounts":{}}\n' > "$RUN/no-billing.json"
+EX_USAGE="$(FAKE_NEW_EMAIL=primary@example.com CLAUDE_BILLING_JSON="$RUN/no-billing.json" "$SCRIPT" usage 2>>"$ERRLOG")"
 set -e
 
 [ "$EX_RC" -eq 0 ] && ok "self-explaining switch → still exits 0 and still switches" \
@@ -2398,6 +2847,11 @@ done < <(grep -E '^(▶ ACTIVE|  ✓ |  ✗ |    (weekly|5h) )' <<<"$EX_USAGE_NO
 # Scenarios 38 and 37 left DIFFERENT fixtures behind, and 39b/40/41 all run the
 # script live, so the explains fixture, the same three accounts scenario 39
 # snapshots, is re-established here rather than inherited from whatever ran last.
+#
+# 2026-08-27 GREW the pinned set by four paths (accounts.N.quota_data,
+# accounts.N.quota_source, accounts.N.quota_measured_at and the top-level `peer`),
+# which is the point: provenance is part of the published contract now, so it is
+# pinned like everything else rather than the guard being loosened to let it in.
 explains_fixture explainsjson
 norm_json() {
   jq -S 'del(.generated_at, .generatedAt)
@@ -2405,16 +2859,54 @@ norm_json() {
          | (.accounts[].session.resetsInSeconds) |= null
          | (.accounts[].weekly.resets_at, .accounts[].weekly.resetsAt,
             .accounts[].five_hour.resets_at, .accounts[].session.resetsAt,
-            .recommendation.weekly_resets_at) |= (if . == null then null else "<iso>" end)
+            .recommendation.deadline_at) |= (if . == null then null else "<iso>" end)
          | .recommendation.reason |= (gsub("\\(in [^)]*\\)"; "(in <t>)")
                                       | gsub("[0-9]{2}:[0-9]{2} [A-Za-z0-9 ]+?(?=\\)|;|,)"; "<time>"))'
 }
-EX_JSON="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --json 2>>"$ERRLOG" | norm_json)"
+# the same pinned-empty billing file as scenario 39, and for the same reason:
+# this fixture's run dir is a fresh one, so it needs its own copy
+printf '{"accounts":{}}\n' > "$RUN/no-billing.json"
+EX_JSON="$(FAKE_NEW_EMAIL=primary@example.com CLAUDE_BILLING_JSON="$RUN/no-billing.json" "$SCRIPT" usage --json 2>>"$ERRLOG" | norm_json)"
 # every published key path, in sorted order, the shape contract itself
 # LC_ALL=C so the ordering is ASCII and identical on every box, a locale-sorted
 # expectation would pass here and fail on a runner with a different LC_COLLATE.
 EX_JSON_PATHS="$(jq -S -r 'paths | join(".")' <<<"$EX_JSON" | sed -E 's/\.[0-9]+/.N/g' | LC_ALL=C sort -u | tr '\n' ' ')"
-EX_JSON_PATHS_WANT="accounts accounts.N accounts.N.active accounts.N.alias accounts.N.cached_at accounts.N.config_dir accounts.N.current accounts.N.data accounts.N.email accounts.N.five_hour accounts.N.five_hour.expired accounts.N.five_hour.fresh accounts.N.five_hour.remaining_pct accounts.N.five_hour.resets_at accounts.N.five_hour.used_pct accounts.N.label accounts.N.live accounts.N.loggedIn accounts.N.note accounts.N.reason accounts.N.recommendable accounts.N.session accounts.N.session.expired accounts.N.session.fresh accounts.N.session.leftPct accounts.N.session.resetsAt accounts.N.session.resetsInSeconds accounts.N.session.usedPct accounts.N.stale accounts.N.stale_reason accounts.N.weekly accounts.N.weekly.expired accounts.N.weekly.fresh accounts.N.weekly.kind accounts.N.weekly.leftPct accounts.N.weekly.remaining_pct accounts.N.weekly.resetsAt accounts.N.weekly.resetsInSeconds accounts.N.weekly.resets_at accounts.N.weekly.scope accounts.N.weekly.usedPct accounts.N.weekly.used_pct active active.auth_status active.auth_warning active.email active.fingerprint active.nested_config_warning active.source active.warning activeEmail floors floors.comfortable_pct floors.exhausted_pct floors.session_pct floors.weekly_pct recommendation recommendation.action recommendation.alias recommendation.best_alternative recommendation.best_alternative.email recommendation.best_alternative.weekly_left_pct recommendation.burn_down_hold recommendation.email recommendation.from_cached_numbers recommendation.label recommendation.mode recommendation.mode_forced recommendation.reason recommendation.weekly_fresh recommendation.weekly_resets_at "
+# ⚠️ GREW BY NINE PATHS ACROSS TWO ADDITIVE CHANGES, then took its FIRST
+# BREAKING ONE. Read the third entry before assuming the promise is still
+# "nothing is ever renamed or removed": it is not, and this line is where a
+# rename has to be argued for rather than slipped through.
+#   2026-08-25  `seat.{status,ends,ended}` and `unmeasured`, because a consumer
+#               that only ever saw `weekly.expired` could not tell "this account
+#               is finished" from "I have not measured this", the same confusion
+#               the human table had and the reason two live seats were written off
+#   2026-08-27  `quota_data` / `quota_source` / `quota_measured_at` per row and the
+#               top-level `peer` object, so a consumer can see WHOSE measurement a
+#               number is and HOW OLD it is, not merely that one exists
+#   2026-08-28  BREAKING, deliberately: `recommendation.weekly_resets_at` REMOVED,
+#               `recommendation.deadline_at` + `recommendation.deadline_kind` added.
+#               The old key had held min(weekly reset, seat end) since 2026-08-27,
+#               so on a seat-end-bound pick it published an end date under a name
+#               promising a reset. A fleet-wide grep found it read in exactly two
+#               places, both this file, so keeping it would have preserved a lie
+#               for an audience of zero. THIS ASSERTION IS WHY THAT WAS SAFE: the
+#               rename could not land quietly, it reds here until the published
+#               contract is edited by hand and the diff is reviewed.
+#   2026-09-04  `weekly.resets_at_projected` + `weekly.projected_from`, additive.
+#               resets_at is null for a weekly window nothing has spent in yet, and
+#               every consumer rendered that as "weekly reset unknown" and sorted the
+#               seat LAST, so the seat with a whole untouched week in it was the one
+#               the tool refused to recommend. The projection gets its OWN two keys
+#               rather than filling resets_at: a consumer has to be able to tell what
+#               the vendor reported from what this box worked out for itself.
+#               `recommendation.deadline_projected` lands with them, for the reason
+#               `deadline_kind` exists: `deadline_at` can now be a projection, and a
+#               bare instant cannot say whether the vendor reported it or this box
+#               inferred it. The human surfaces mark that with `~`; a parser gets
+#               the boolean.
+#   2026-09-26  ADDITIVE: `accounts.N.weekly_all{used_pct,remaining_pct,resets_at}`,
+#               the all-model weekly, null when the row never measured it. A spent
+#               SCOPED cap (Fable) binds `weekly` but the seat still runs Opus.
+EX_JSON_PATHS_WANT="accounts accounts.N accounts.N.active accounts.N.alias accounts.N.cached_at accounts.N.config_dir accounts.N.current accounts.N.data accounts.N.email accounts.N.five_hour accounts.N.five_hour.expired accounts.N.five_hour.fresh accounts.N.five_hour.remaining_pct accounts.N.five_hour.resets_at accounts.N.five_hour.used_pct accounts.N.label accounts.N.live accounts.N.loggedIn accounts.N.note accounts.N.quota_data accounts.N.quota_measured_at accounts.N.quota_source accounts.N.reason accounts.N.recommendable accounts.N.seat accounts.N.seat.ended accounts.N.seat.ends accounts.N.seat.status accounts.N.session accounts.N.session.expired accounts.N.session.fresh accounts.N.session.leftPct accounts.N.session.resetsAt accounts.N.session.resetsInSeconds accounts.N.session.usedPct accounts.N.stale accounts.N.stale_reason accounts.N.unmeasured accounts.N.weekly accounts.N.weekly.expired accounts.N.weekly.fresh accounts.N.weekly.kind accounts.N.weekly.leftPct accounts.N.weekly.projected_from accounts.N.weekly.remaining_pct accounts.N.weekly.resetsAt accounts.N.weekly.resetsInSeconds accounts.N.weekly.resets_at accounts.N.weekly.resets_at_projected accounts.N.weekly.scope accounts.N.weekly.usedPct accounts.N.weekly.used_pct accounts.N.weekly_all accounts.N.weekly_all.remaining_pct accounts.N.weekly_all.resets_at accounts.N.weekly_all.used_pct active active.auth_status active.auth_warning active.email active.fingerprint active.nested_config_warning active.source active.warning activeEmail floors floors.comfortable_pct floors.exhausted_pct floors.session_pct floors.weekly_pct peer recommendation recommendation.action recommendation.alias recommendation.best_alternative recommendation.best_alternative.email recommendation.best_alternative.weekly_left_pct recommendation.burn_down_hold recommendation.deadline_at recommendation.deadline_kind recommendation.deadline_projected recommendation.email recommendation.from_cached_numbers recommendation.label recommendation.mode recommendation.mode_forced recommendation.reason recommendation.weekly_fresh "
 [ "$EX_JSON_PATHS" = "$EX_JSON_PATHS_WANT" ] \
   && ok "json byte-identity → every published key path is exactly what the dashboard was promised" \
   || bad "json byte-identity → key paths drifted:
@@ -2423,9 +2915,9 @@ $(diff <(tr ' ' '\n' <<<"$EX_JSON_PATHS_WANT") <(tr ' ' '\n' <<<"$EX_JSON_PATHS"
 EX_JSON_VALS="$(jq -S -c '{a:[.accounts[]|{email,data,active,loggedIn,live,stale,recommendable,
                                             wk:[.weekly.used_pct,.weekly.remaining_pct,.weekly.usedPct,.weekly.leftPct,.weekly.fresh,.weekly.expired,.weekly.kind,.weekly.scope],
                                             se:[.five_hour.used_pct,.five_hour.remaining_pct,.session.usedPct,.session.leftPct,.session.fresh,.session.expired]}],
-                           r:(.recommendation|{action,email,label,alias,weekly_fresh,from_cached_numbers,mode,mode_forced,burn_down_hold,best_alternative}),
+                           r:(.recommendation|{action,email,label,alias,deadline_kind,weekly_fresh,from_cached_numbers,mode,mode_forced,burn_down_hold,best_alternative}),
                            f:.floors, ae:.activeEmail}' <<<"$EX_JSON")"
-EX_JSON_VALS_WANT='{"a":[{"active":true,"data":"live","email":"primary@example.com","live":true,"loggedIn":true,"recommendable":false,"se":[50,50,50,50,false,false],"stale":false,"wk":[98,2,98,2,false,false,null,null]},{"active":false,"data":"live","email":"wk@example.com","live":true,"loggedIn":true,"recommendable":true,"se":[0,100,0,100,false,false],"stale":false,"wk":[20,80,20,80,false,false,null,null]},{"active":false,"data":"live","email":"alpha@example.com","live":true,"loggedIn":true,"recommendable":false,"se":[10,90,10,90,false,false],"stale":false,"wk":[95,5,95,5,false,false,null,null]}],"ae":"primary@example.com","f":{"comfortable_pct":50,"exhausted_pct":2,"session_pct":10,"weekly_pct":20},"r":{"action":"switch","alias":"wk","best_alternative":{"email":"wk@example.com","weekly_left_pct":80},"burn_down_hold":false,"email":"wk@example.com","from_cached_numbers":false,"label":"wk@example.com","mode":"floor","mode_forced":false,"weekly_fresh":false}}'
+EX_JSON_VALS_WANT='{"a":[{"active":true,"data":"live","email":"primary@example.com","live":true,"loggedIn":true,"recommendable":false,"se":[50,50,50,50,false,false],"stale":false,"wk":[98,2,98,2,false,false,null,null]},{"active":false,"data":"live","email":"wk@example.com","live":true,"loggedIn":true,"recommendable":true,"se":[0,100,0,100,false,false],"stale":false,"wk":[20,80,20,80,false,false,null,null]},{"active":false,"data":"live","email":"alpha@example.com","live":true,"loggedIn":true,"recommendable":false,"se":[10,90,10,90,false,false],"stale":false,"wk":[95,5,95,5,false,false,null,null]}],"ae":"primary@example.com","f":{"comfortable_pct":50,"exhausted_pct":2,"session_pct":10,"weekly_pct":20},"r":{"action":"switch","alias":"wk","best_alternative":{"email":"wk@example.com","weekly_left_pct":80},"burn_down_hold":false,"deadline_kind":"reset","email":"wk@example.com","from_cached_numbers":false,"label":"wk@example.com","mode":"floor","mode_forced":false,"weekly_fresh":false}}'
 [ "$EX_JSON_VALS" = "$EX_JSON_VALS_WANT" ] \
   && ok "json byte-identity → every published VALUE is unchanged too, not just the names" \
   || bad "json byte-identity → values drifted:
@@ -2792,6 +3284,105 @@ set -e
 grep -qE '%1 +skipped, this is the pane running the switch' <<<"$RI_SELF" \
   && ok "restart-idle → never restarts the pane it is running in" \
   || bad "restart-idle → self-pane skipped (got: $RI_SELF)"
+
+# --- 43b. resume by SESSION ID; the title is only the lookup key (2026-09-02)
+# A pane title is not unique: sessions get renamed to their predecessor's
+# title, and `claude --resume "<title>"` on a non-unique title parks the pane
+# in a session picker nobody is watching (three of four restarted panes
+# stalled there). So the title is resolved to the id of the NEWEST transcript
+# whose CURRENT title is exactly that, and that id is what every surface
+# reports and sends. Transcripts live under CLAUDE_PROJECTS_DIR as
+# <cwd-slug>/<session-id>.jsonl; a fake store is built here:
+#   A  titled "rainbow rush game", an hour old          → the older twin
+#   B  titled "rainbow rush game", written just now     → THE pane's session
+#   C  was "rainbow rush game", renamed since, newest   → an earlier
+#      custom-title line must not count, only the last one is the title
+#   D  titled "rainbow rush game", newest, but a SIDECAR file below C's own
+#      directory                                        → never a session
+# and pane %5, titled "untracked pane", has no transcript at all, so the
+# title itself is sent, exactly as before.
+panes_fixture resumebyid
+FAKE_TMUX_PANES="%1${US}/dev/ttys001${US}claude.exe${US}✳ rainbow rush game
+%5${US}/dev/ttys005${US}claude.exe${US}✳ untracked pane"
+export FAKE_TMUX_PANES
+{ ps_row "$(( $(date +%s) - 3600 ))" claude.exe; } > "$FAKE_STATE/ps-ttys005.txt"
+RB_PROJ="$RUN/projects"
+RB_A=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa
+RB_B=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb
+RB_C=cccccccc-cccc-4ccc-8ccc-cccccccccccc
+RB_D=dddddddd-dddd-4ddd-8ddd-dddddddddddd
+mkdir -p "$RB_PROJ/-home-code/$RB_C"
+printf '{"type":"user","message":"hello"}\n{"type":"custom-title","customTitle":"rainbow rush game","sessionId":"%s"}\n' \
+  "$RB_A" > "$RB_PROJ/-home-code/$RB_A.jsonl"
+# a malformed line in front, the way a truncated write leaves one: skipped, not fatal
+printf 'not json at all\n{"type":"custom-title","customTitle":"rainbow rush game","sessionId":"%s"}\n' \
+  "$RB_B" > "$RB_PROJ/-home-code/$RB_B.jsonl"
+printf '{"type":"custom-title","customTitle":"rainbow rush game"}\n{"type":"custom-title","customTitle":"renamed since"}\n' \
+  > "$RB_PROJ/-home-code/$RB_C.jsonl"
+printf '{"type":"custom-title","customTitle":"rainbow rush game"}\n' > "$RB_PROJ/-home-code/$RB_C/$RB_D.jsonl"
+touch -t "$(date -r $(( $(date +%s) - 3600 )) '+%Y%m%d%H%M.%S')" "$RB_PROJ/-home-code/$RB_A.jsonl"
+export CLAUDE_PROJECTS_DIR="$RB_PROJ"
+set +e
+RB_DRY="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" switch-auto --dry-run --restart-idle 2>&1)"
+RB_DRY_RC=$?
+set -e
+[ "$RB_DRY_RC" -eq 0 ] \
+  && grep -q "%1 *would restart → CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" claude --resume \"$RB_B\"" <<<"$RB_DRY" \
+  && ok "resume by id → the plan resumes the NEWEST transcript carrying the title, by session id, not by title" \
+  || bad "resume by id → newest id in the plan (got $RB_DRY_RC: $RB_DRY)"
+! grep -q "$RB_A" <<<"$RB_DRY" \
+  && ok "resume by id → the older twin with the same title is never the pick" \
+  || bad "resume by id → picked the older twin (got: $RB_DRY)"
+! grep -q "$RB_C" <<<"$RB_DRY" \
+  && ok "resume by id → a session renamed AWAY from the title does not match on its old custom-title line, even as the newest file" \
+  || bad "resume by id → matched a renamed-away session (got: $RB_DRY)"
+! grep -q "$RB_D" <<<"$RB_DRY" \
+  && ok "resume by id → a sidecar file below a session directory is never a session, however new" \
+  || bad "resume by id → picked a sidecar file (got: $RB_DRY)"
+! grep -q 'claude --resume "rainbow rush game"' <<<"$RB_DRY" \
+  && ok "resume by id → once the id resolves, the bare title is never what gets resumed" \
+  || bad "resume by id → title still proposed (got: $RB_DRY)"
+grep -q "%5 *would restart → CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" claude --resume \"untracked pane\"" <<<"$RB_DRY" \
+  && ok "resume by id → a title with no transcript falls back to the title itself (today's behaviour, kept)" \
+  || bad "resume by id → title fallback (got: $RB_DRY)"
+
+# pane-converge is the other caller of the same machinery: same id
+cat > "$FAKE_STATE/pool-ps.txt" <<POOLPS
+PID TT STAT TIME COMMAND
+101 s001 S+ 0:00 /usr/local/bin/claude CLAUDE_CONFIG_DIR=$RUN/.claude-pool/wk HOME=$RUN
+105 s005 S+ 0:00 /usr/local/bin/claude CLAUDE_CONFIG_DIR=$RUN/.claude-pool/wk HOME=$RUN
+POOLPS
+set +e
+RB_PC="$("$SCRIPT" pane-converge --dry-run 2>&1)"
+set -e
+grep -q "%1 on wk@example.com → would restart (CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" claude --resume \"$RB_B\")" <<<"$RB_PC" \
+  && grep -q "%5 on wk@example.com → would restart (CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" claude --resume \"untracked pane\")" <<<"$RB_PC" \
+  && ok "resume by id → pane-converge resolves the same id (and the same fallback) through the shared restart machinery" \
+  || bad "resume by id → pane-converge lines (got: $RB_PC)"
+rm -f "$FAKE_STATE/pool-ps.txt"
+
+# the live run: what was planned is what is SENT, and what is reported
+RB_LOG="$ROOT/tmux-resumebyid.log"
+set +e
+RB_LIVE="$(TMUX_LOG="$RB_LOG" FAKE_NEW_EMAIL=wk@example.com FAKE_LAG=0 \
+  "$SCRIPT" switch-auto --restart-idle 2>&1)"
+RB_LIVE_RC=$?
+set -e
+[ "$RB_LIVE_RC" -eq 0 ] \
+  && grep -q "tmux send-keys -t %1 CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/wk\" claude --resume \"$RB_B\" Enter" "$RB_LOG" \
+  && ok "resume by id → the line sent to the pane carries the session id" \
+  || bad "resume by id → sent line (got $RB_LIVE_RC: $(cat "$RB_LOG"))"
+grep -q "tmux send-keys -t %5 CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/wk\" claude --resume \"untracked pane\" Enter" "$RB_LOG" \
+  && ok "resume by id → the unresolvable title is sent as the title, on the same run" \
+  || bad "resume by id → fallback sent line ($(cat "$RB_LOG"))"
+! grep -q 'claude --resume "rainbow rush game"' "$RB_LOG" \
+  && ok "resume by id → the resolvable title itself never reaches a pane" \
+  || bad "resume by id → title sent ($(grep 'send-keys' "$RB_LOG"))"
+grep -qE "%1 +restarted → CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/wk\" claude --resume \"$RB_B\"" <<<"$RB_LIVE" \
+  && ok "resume by id → the result line shows the id that was sent (one resolution per pane)" \
+  || bad "resume by id → result line (got: $RB_LIVE)"
+unset CLAUDE_PROJECTS_DIR
+panes_teardown
 
 # --- 44. with no configured session the whole thing is a SILENT no-op -----------
 # ROTA_TMUX_SESSION has no default: pane convergence is opt-in. Two shapes, both
@@ -3191,6 +3782,13 @@ husk_json() {
 # with that single last line removed is pure definitions and can be sourced.
 LIB="$ROOT/failover-lib.sh"
 sed '$d' "$SCRIPT" > "$LIB"
+# ⚠️ AND ITS SIBLING. The script sources $ROTA_LIB/rota-ranking.sh (the seat
+# ranking it shares with the keeper), and ROTA_LIB is the dirname of whatever
+# copy is running, so a copy alone in $ROOT cannot find it and dies at source
+# time. Every positive `lib …` assertion below then fails for a reason that has
+# nothing to do with what it is testing (and every NEGATED one silently
+# "passes"), which is exactly how this was found.
+cp "$REPO_ROOT/lib/rota-ranking.sh" "$ROOT/rota-ranking.sh"
 lib() { bash -c 'source "$1"; shift; "$@"' _ "$LIB" "$@"; }
 
 new_run credpred
@@ -3538,6 +4136,1307 @@ set -e
 grep -q 'needs one browser login' <<<"$SW_OUT" \
   && ok "switch-all → the refusal names the login that fixes it, not just the failure" \
   || bad "switch-all → refusal names the next step (got: $SW_OUT)"
+
+# --- 53. PEER USAGE: read the numbers from the box that holds the credential ----
+# THE DEFECT, measured on the laptop 2026-08-27: four of five seats printed `-` in
+# every quota column and `[quota none]` in NOTES, because that box holds exactly
+# one credential. The rejected fix is copying the other four over: an OAuth
+# refresh token is SINGLE-USE, so the second copy husks the first (the 2026-08-07
+# incident). The accepted fix is to read the NUMBERS from the box that
+# legitimately holds them, over ssh, read-only, with nothing moving.
+#
+# Everything below runs against the fake `ssh` stubbed at the top of this file, so
+# no scenario here can reach a real machine, and the DEFAULT behaviour of that
+# stub (refuse) is itself one of the cases under test.
+
+# UTC ISO at a `date -v` offset, e.g. `iso_at -30S` (30 seconds ago), `iso_at -2d`.
+# ⚠️ BSD date: uppercase M is MINUTES, lowercase m is MONTHS. The offsets here stay
+# in S/H/d for exactly that reason.
+iso_at() { date -u -v"$1" '+%Y-%m-%dT%H:%M:%SZ'; }
+
+# A peer payload in the shape `rota accounts --json` publishes (the command the
+# peer is actually asked to run). Any number of seats, `<email>:<weekly-left>:<5h-left>`.
+peer_json() {  # peer_json <measured-at-iso> <alias> <email:wk:se>...
+  local meas="$1" alias="$2"; shift 2
+  local rows="[]" spec e wk se
+  for spec in "$@"; do
+    IFS=: read -r e wk se <<<"$spec"
+    rows="$(jq -c --argjson r "$rows" --arg e "$e" --argjson wk "$wk" --argjson se "$se" \
+      --arg a "$alias" --arg m "$meas" --arg wr "$(iso_in +3d)" --arg sr "$(iso_in +2H)" \
+      -n '$r + [{account:$e, alias:$a, active_now:false,
+                 weekly_left_pct:$wk, weekly_resets_at:$wr,
+                 five_hour_left_pct:$se, five_hour_resets_at:$sr,
+                 quota_data:"cached", quota_source:null, quota_measured_at:$m}]')"
+  done
+  jq -cn --argjson rows "$rows" --arg g "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    '{generated_at:$g, active:"whoever@example.com", peer:null,
+      monthly_total_usd_approx:0, accounts:$rows}'
+}
+
+# Two seats: one this box CAN measure (credential + a curl fixture) and one it
+# cannot (no credential at all), which is the laptop's real shape in miniature.
+peer_fixture() {  # peer_fixture <name> [weekly-utilization for the local seat]
+  new_run "$1"
+  local lu="${2:-10}"
+  mkdir -p "$RUN/.claude-pool/localseat" "$RUN/.claude-pool/remoteseat"
+  cred_json TOK-LOCAL > "$RUN/.claude-pool/localseat/.credentials.json"
+  printf '{"oauthAccount":{"emailAddress":"local@example.com"}}' > "$RUN/.claude-pool/localseat/.claude.json"
+  printf '{"oauthAccount":{"emailAddress":"remote@example.com"}}' > "$RUN/.claude-pool/remoteseat/.claude.json"
+  printf '{"oauthAccount":{"emailAddress":"local@example.com"}}' > "$RUN/.claude.json"
+  cat > "$RUN/cfg/accounts" <<EOF
+local@example.com|$RUN/.claude-pool/localseat
+remote@example.com|$RUN/.claude-pool/remoteseat
+EOF
+  printf '{"seven_day":{"utilization":%s,"resets_at":"%s"},"five_hour":{"utilization":5,"resets_at":"%s"}}' \
+    "$lu" "$(iso_in +5d)" "$(iso_in +3H)" > "$RUN/state/usage-TOK-LOCAL.json"
+}
+prow() { jq -c --arg e "$1" '.accounts[] | select(.email==$e)' <<<"$2" 2>/dev/null; }
+ssh_count() { grep -c . "$FAKE_STATE/ssh-calls" 2>/dev/null || echo 0; }
+# norm_clock on BOTH sides, plus the day-form countdown it does not collapse
+# ("4d23h"): the byte-identity cases below compare two separate runs seconds
+# apart, and a reset countdown that legitimately ticks over between them would
+# fail the compare once an hour for a reason that has nothing to do with peers.
+norm_peer() { sed -E 's/resets in [0-9][0-9dhm]*/resets in <t>/g' | norm_clock; }
+
+# --- 53a. a peer fills the slots this box cannot measure ------------------------
+peer_fixture peerfill
+peer_json "$(iso_at -30S)" remotealias remote@example.com:73:88 > "$RUN/state/peer-peerbox.json"
+# ⚠️ ONE $? PER RUN. Capturing it after the second assignment silently tested the
+# --json run twice and never checked the table run's exit code at all.
+set +e
+P_OUT="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
+RC=$?
+P_JSON="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
+RC_JSON=$?
+set -e
+P_REMOTE="$(prow remote@example.com "$P_JSON")"
+P_LOCAL="$(prow local@example.com "$P_JSON")"
+[ "$RC" -eq 0 ] && ok "peer → the TABLE run exits 0 with a peer configured" || bad "peer → table exits 0 (got $RC: $P_OUT)"
+[ "$RC_JSON" -eq 0 ] && ok "peer → and so does the --json run" || bad "peer → --json exits 0 (got $RC_JSON: $P_JSON)"
+[ "$(jq -r '.quota_data' <<<"$P_REMOTE")" = peer ] \
+  && ok "peer → the slot this box cannot measure comes back as quota_data=peer" \
+  || bad "peer → remote slot is quota_data=peer (got: $P_REMOTE)"
+[ "$(jq -r '.quota_source' <<<"$P_REMOTE")" = peerbox ] \
+  && ok "peer → quota_source names the box the numbers were read from" \
+  || bad "peer → quota_source is the host (got: $(jq -r '.quota_source' <<<"$P_REMOTE"))"
+[ "$(jq -r '.weekly.remaining_pct' <<<"$P_REMOTE")" = 73 ] \
+  && [ "$(jq -r '.five_hour.remaining_pct' <<<"$P_REMOTE")" = 88 ] \
+  && ok "peer → both windows carry the peer's numbers (% LEFT round-trips through % USED)" \
+  || bad "peer → windows carry the peer's numbers (got: $(jq -c '.weekly,.five_hour' <<<"$P_REMOTE"))"
+[ "$(jq -r '.quota_measured_at' <<<"$P_REMOTE")" != null ] \
+  && ok "peer → the row publishes WHEN it was measured, not just that it is borrowed" \
+  || bad "peer → quota_measured_at present (got: $P_REMOTE)"
+[ "$(jq -r '.peer.host' <<<"$P_JSON")" = peerbox ] \
+  && ok "peer (json) → the top-level peer object names the host that answered" \
+  || bad "peer (json) → top-level peer object (got: $(jq -c '.peer' <<<"$P_JSON"))"
+grep -q 'via peerbox' <<<"$P_OUT" \
+  && ok "peer → the rendered row says [via peerbox], a borrowed number never passes as local" \
+  || bad "peer → the row is marked [via peerbox] (got: $P_OUT)"
+[ "$(jq -r '.quota_data' <<<"$P_LOCAL")" = live ] \
+  && [ "$(jq -r '.quota_source' <<<"$P_LOCAL")" = null ] \
+  && ok "peer → a locally measured row keeps quota_data=live and a null quota_source" \
+  || bad "peer → local row unchanged (got: $P_LOCAL)"
+# THE INVARIANT: a peer's numbers are never seeded into THIS box's usage cache.
+# That cache means "what this box measured"; a borrowed row written into it would
+# come back next run wearing local clothes with the provenance stripped off.
+[ "$(jq -r 'has("remote@example.com")' "$RUN/cfg/usage-cache.json" 2>/dev/null)" = false ] \
+  && ok "peer → peer numbers are NEVER written into this box's usage-cache.json" \
+  || bad "peer → the local cache was polluted with a peer's numbers: $(cat "$RUN/cfg/usage-cache.json" 2>/dev/null)"
+# two runs, one round trip: the 90s TTL is what makes `rota accounts` twice in a
+# row cost what it costs once, which is exactly how a human uses it
+[ "$(ssh_count)" -eq 1 ] \
+  && ok "peer → the 90s TTL cache means two consecutive runs pay ONE ssh round trip" \
+  || bad "peer → expected 1 ssh call across two runs, got $(ssh_count)"
+
+# --- 53b. R6: a peer row is exactly as (in)eligible as a cached one -------------
+# Real data about a real seat, measured somewhere else. It must not become
+# eligible for anything a cached row is excluded from, and 73%/88% would clear
+# both floors comfortably if it were live, so an accidental promotion shows here.
+[ "$(jq -r '.live' <<<"$P_REMOTE")" = false ] \
+  && [ "$(jq -r '.stale' <<<"$P_REMOTE")" = true ] \
+  && ok "peer (R6) → a peer row is live=false / stale=true, same as a cached row" \
+  || bad "peer (R6) → peer row must read as stale, not live (got: $P_REMOTE)"
+[ "$(jq -r '.recommendable' <<<"$P_REMOTE")" = false ] \
+  && ok "peer (R6) → and it is NOT recommendable on the strict live-only pass" \
+  || bad "peer (R6) → a peer row must not be recommendable where a cached row is not"
+
+# --- 53c. a LIVE local fetch always beats a peer row for the same slot ----------
+peer_fixture peerlocalwins
+peer_json "$(iso_at -30S)" remotealias local@example.com:1:1 remote@example.com:73:88 \
+  > "$RUN/state/peer-peerbox.json"
+P_JSON="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
+P_LOCAL="$(prow local@example.com "$P_JSON")"
+[ "$(jq -r '.quota_data' <<<"$P_LOCAL")" = live ] \
+  && [ "$(jq -r '.weekly.remaining_pct' <<<"$P_LOCAL")" = 90 ] \
+  && ok "precedence → local LIVE wins outright, the peer's 1% never displaces it" \
+  || bad "precedence → local live must win (got: $P_LOCAL)"
+
+# --- 53d. between local cache and peer, the NEWER MEASUREMENT wins --------------
+# Both directions, because a rule that only ever prefers one side is not a
+# comparison. The remote seat has no credential either way, so the only question
+# is which remembered number is younger.
+peer_fixture peerfresherlocal
+jq -n --arg wr "$(iso_in +3d)" --arg sr "$(iso_in +2H)" --arg te "$(( $(date +%s) - 60 ))" \
+  '{"remote@example.com":{wk_u:"40",wk_r:$wr,se_u:"30",se_r:$sr,ts:"a minute ago",ts_epoch:$te}}' \
+  > "$RUN/cfg/usage-cache.json"
+peer_json "$(iso_at -2d)" remotealias remote@example.com:73:88 > "$RUN/state/peer-peerbox.json"
+P_JSON="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
+P_REMOTE="$(prow remote@example.com "$P_JSON")"
+[ "$(jq -r '.quota_data' <<<"$P_REMOTE")" = cached ] \
+  && [ "$(jq -r '.weekly.remaining_pct' <<<"$P_REMOTE")" = 60 ] \
+  && ok "precedence → a MINUTE-old local cache beats a two-day-old peer row" \
+  || bad "precedence → fresher local cache must win (got: $P_REMOTE)"
+
+peer_fixture peerfresherpeer
+jq -n --arg wr "$(iso_in +3d)" --arg sr "$(iso_in +2H)" --arg te "$(( $(date +%s) - 259200 ))" \
+  '{"remote@example.com":{wk_u:"40",wk_r:$wr,se_u:"30",se_r:$sr,ts:"three days ago",ts_epoch:$te}}' \
+  > "$RUN/cfg/usage-cache.json"
+peer_json "$(iso_at -30S)" remotealias remote@example.com:73:88 > "$RUN/state/peer-peerbox.json"
+P_JSON="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
+P_REMOTE="$(prow remote@example.com "$P_JSON")"
+[ "$(jq -r '.quota_data' <<<"$P_REMOTE")" = peer ] \
+  && [ "$(jq -r '.weekly.remaining_pct' <<<"$P_REMOTE")" = 73 ] \
+  && ok "precedence → a fresh peer row beats a three-day-old local cache" \
+  || bad "precedence → fresher peer must win (got: $P_REMOTE)"
+
+# --- 53e. AGE IS VISIBLE on anything that is not a live local measurement -------
+# 2026-08-27: two seats on the pool host have had dead access tokens for ~17h and
+# ~59h, and the keeper cannot rotate them (nothing runs a session on those seats),
+# so the staleness is STRUCTURAL. Their rows printed a confident percentage behind
+# a bare marker. A 2.5-day-old number shown like a live one is worse than a blank.
+peer_fixture peerage
+peer_json "$(iso_at -2d)" remotealias remote@example.com:73:88 > "$RUN/state/peer-peerbox.json"
+P_OUT="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
+grep -q 'via peerbox, 2d old' <<<"$P_OUT" \
+  && ok "age → a two-day-old peer number says so, in one coarse glanceable unit" \
+  || bad "age → a stale peer row shows its age (got: $P_OUT)"
+peer_fixture peerageminor
+peer_json "$(iso_at -30S)" remotealias remote@example.com:73:88 > "$RUN/state/peer-peerbox.json"
+P_OUT="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
+grep -q 'via peerbox' <<<"$P_OUT" && ! grep -qE 'via peerbox, [0-9]+[mhd] old' <<<"$P_OUT" \
+  && ok "age → a number measured 30s ago carries no age: below 120s it IS now" \
+  || bad "age → a fresh peer row shows no age (got: $P_OUT)"
+
+# --- 53f. an unreachable peer degrades to BYTE-IDENTICAL output -----------------
+# The whole feature is a bonus on top of a table that was already correct. A peer
+# problem must never cost the operator a line to read, a stack trace, or a hang.
+peer_fixture peerdown
+P_NOPEER="$("$SCRIPT" usage 2>>"$ERRLOG" | norm_peer)"
+P_DEAD="$(ROTA_PEERS=deadbox "$SCRIPT" usage 2>"$RUN/peer.err" | norm_peer)"
+[ "$P_NOPEER" = "$P_DEAD" ] \
+  && ok "unreachable peer → output is byte-identical to having no peer at all" \
+  || bad "unreachable peer → output drifted: $(diff <(printf '%s\n' "$P_NOPEER") <(printf '%s\n' "$P_DEAD") || true)"
+[ ! -s "$RUN/peer.err" ] \
+  && ok "unreachable peer → not one byte on stderr, it is not the operator's problem" \
+  || bad "unreachable peer → stderr must stay empty (got: $(cat "$RUN/peer.err"))"
+grep -q 'peer deadbox' <<<"$(ROTA_PEERS=deadbox "$SCRIPT" usage --verbose 2>&1 >/dev/null)" \
+  && ok "unreachable peer → --verbose, and only --verbose, explains what happened" \
+  || bad "unreachable peer → --verbose explains it"
+# the same for a peer that answers with something that is not JSON
+peer_fixture peerjunk
+: > "$RUN/state/peer-junk-peerbox"
+P_JUNK="$(ROTA_PEERS=peerbox "$SCRIPT" usage --json 2>>"$ERRLOG")"
+[ "$(jq -r '.accounts[] | select(.email=="remote@example.com") | .quota_data' <<<"$P_JUNK")" = none ] \
+  && ok "junk from a peer → ignored, the row stays honestly empty" \
+  || bad "junk from a peer → must be ignored (got: $P_JUNK)"
+
+# a peer that ACCEPTS the connection and then hangs is the case ConnectTimeout
+# cannot cover, and the one that would turn `cdt accounts` into a wait. The bound
+# is enforced by peer_ssh itself, so the run must come back on its own.
+peer_fixture peerhang
+: > "$RUN/state/peer-slow-peerbox"
+HANG_START="$(date +%s)"
+set +e
+P_HANG="$(ROTA_PEER_TIMEOUT=1 ROTA_PEERS=peerbox "$SCRIPT" usage --json 2>>"$ERRLOG")"
+HANG_RC=$?
+set -e
+HANG_SECS=$(( $(date +%s) - HANG_START ))
+[ "$HANG_RC" -eq 0 ] && [ "$HANG_SECS" -lt 15 ] \
+  && ok "hanging peer → killed at the bound and the run finishes on its own (${HANG_SECS}s)" \
+  || bad "hanging peer → must be bounded (rc=$HANG_RC, took ${HANG_SECS}s)"
+[ "$(jq -r '.accounts[] | select(.email=="remote@example.com") | .quota_data' <<<"$P_HANG")" = none ] \
+  && ok "hanging peer → and the row falls back to the honest blank, not a half-read payload" \
+  || bad "hanging peer → row must stay empty (got: $P_HANG)"
+
+# THE BOUND IS ON THE STEP, NOT ON THE DIAL. With the watchdog inside peer_ssh
+# (one call per host) three hanging peers cost 3 × PEER_TIMEOUT: measured at 7s
+# with ROTA_PEER_TIMEOUT=2, which is ~30s at the default while the operator sits
+# at a prompt. config/peers.example invites a list, so this is reachable as
+# shipped. The assertion is on TOTAL WALL TIME, because a per-dial assertion is
+# exactly what passed while the step was unbounded.
+peer_fixture peerhang3
+: > "$RUN/state/peer-slow-hangA"; : > "$RUN/state/peer-slow-hangB"; : > "$RUN/state/peer-slow-hangC"
+H3_START="$(date +%s)"
+set +e
+ROTA_PEER_TIMEOUT=2 ROTA_PEERS="hangA hangB hangC" "$SCRIPT" usage --json >/dev/null 2>&1
+H3_RC=$?
+set -e
+H3_SECS=$(( $(date +%s) - H3_START ))
+[ "$H3_RC" -eq 0 ] && [ "$H3_SECS" -le 4 ] \
+  && ok "step deadline → THREE hanging peers cost one 2s budget between them, not 2s each (${H3_SECS}s)" \
+  || bad "step deadline → the whole step must be bounded (rc=$H3_RC, took ${H3_SECS}s for 3 peers at 2s)"
+[ "$(ssh_count)" -eq 1 ] \
+  && ok "step deadline → and the peers behind the spent budget are skipped, not dialled" \
+  || bad "step deadline → expected 1 dial once the budget was gone, got $(ssh_count)"
+
+# NEGATIVE CACHING. Caching only successes meant an unreachable peer was
+# re-dialled on every single invocation, so for as long as ballito was asleep
+# every `cdt accounts` on the laptop stalled for the full bound. That is a worse
+# daily experience than the blank table this feature exists to fix.
+peer_fixture peerfailcache
+: > "$RUN/state/peer-slow-peerbox"
+NC_START="$(date +%s)"
+for _ in 1 2 3; do
+  ROTA_PEER_TIMEOUT=2 ROTA_PEERS=peerbox "$SCRIPT" usage --json >/dev/null 2>&1 || true
+done
+NC_SECS=$(( $(date +%s) - NC_START ))
+[ "$(ssh_count)" -eq 1 ] \
+  && ok "failure cache → a dead peer is dialled ONCE across three runs, not three times" \
+  || bad "failure cache → expected 1 dial across three runs, got $(ssh_count)"
+[ "$NC_SECS" -le 4 ] \
+  && ok "failure cache → so runs 2 and 3 cost nothing at all (${NC_SECS}s for all three)" \
+  || bad "failure cache → runs after the first must not stall (took ${NC_SECS}s)"
+[ "$(jq -r '.peerbox.failed' "$RUN/cfg/peer-usage-cache.json" 2>/dev/null)" = true ] \
+  && ok "failure cache → the failure is recorded with its own stamp, next to the payload entries" \
+  || bad "failure cache → nothing written to peer-usage-cache.json: $(cat "$RUN/cfg/peer-usage-cache.json" 2>/dev/null)"
+# ...and it is a COOLING-OFF WINDOW, never a blacklist: with the window at zero
+# every run tries again, which is what lets a woken box come back on its own.
+peer_fixture peerfailttl
+: > "$RUN/state/peer-slow-peerbox"
+for _ in 1 2; do
+  ROTA_PEER_FAIL_TTL=0 ROTA_PEER_TIMEOUT=1 ROTA_PEERS=peerbox "$SCRIPT" usage --json >/dev/null 2>&1 || true
+done
+[ "$(ssh_count)" -eq 2 ] \
+  && ok "failure cache → it is a cooling-off window, not a blacklist: TTL=0 retries every run" \
+  || bad "failure cache → TTL=0 must re-dial each run, got $(ssh_count) dial(s)"
+# a suppressed failure must still render exactly the no-peer table
+peer_fixture peerfailquiet
+: > "$RUN/state/peer-slow-peerbox"
+ROTA_PEER_TIMEOUT=1 ROTA_PEERS=peerbox "$SCRIPT" usage >/dev/null 2>&1 || true
+FQ_NOPEER="$("$SCRIPT" usage 2>>"$ERRLOG" | norm_peer)"
+FQ_CACHED="$(ROTA_PEERS=peerbox "$SCRIPT" usage 2>"$RUN/fq.err" | norm_peer)"
+[ "$FQ_NOPEER" = "$FQ_CACHED" ] && [ ! -s "$RUN/fq.err" ] \
+  && ok "failure cache → a suppressed peer still renders byte-identical no-peer output, silently" \
+  || bad "failure cache → suppressed peer output drifted: $(diff <(printf '%s\n' "$FQ_NOPEER") <(printf '%s\n' "$FQ_CACHED") || true)"
+
+# --- 53f2. A HOSTILE PAYLOAD: peer percentages are untrusted input --------------
+# Reproduced 2026-08-27 against the unvalidated arithmetic that shipped in the
+# first draft of this feature:
+#   "n/a"                      → `n: unbound variable`, exit 1, no table AND no
+#                                JSON, breaking both the degrade-quietly contract
+#                                and `usage --json`'s always-one-object promise
+#   "U_WKX[$(touch FILE)0]"    → exit 0, a normal-looking table, and the command
+#                                RAN: bash evaluates array subscripts inside
+#                                $(( )), and `set -u` only blocks the undefined
+#                                -array spelling, not a name that exists
+#   "85%" / "1e3" / true       → each one aborted the whole command
+# The peer is semi-trusted at best (accept-new means a re-imaged box's key is
+# taken silently), and one command as Cédric is a categorically different grant
+# from reading percentages off a machine.
+peer_fixture peerhostile
+PWN="$RUN/state/PWNED"     # ⚠️ no dot in the path: ${v%.*} would truncate the probe
+for VAL in '"n/a"' 'true' '"85%"' '"1e3"' "\"U_WKX[\$(touch $PWN)0]\""; do
+  rm -f "$RUN/cfg/peer-usage-cache.json" "$PWN"
+  jq -n --argjson wk "$(jq -n --arg v "$VAL" '$v' >/dev/null 2>&1 && printf '%s' "$VAL" || printf 'null')" \
+     --arg g "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" --arg m "$(iso_at -30S)" \
+     --arg wr "$(iso_in +3d)" --arg sr "$(iso_in +2H)" \
+     '{generated_at:$g, peer:null, accounts:[{account:"remote@example.com",alias:"remotealias",
+        weekly_left_pct:$wk, weekly_resets_at:$wr, five_hour_left_pct:88,
+        five_hour_resets_at:$sr, quota_data:"cached", quota_source:null,
+        quota_measured_at:$m}]}' > "$RUN/state/peer-peerbox.json"
+  # FAKE_NEW_EMAIL pins the auth-status stub to the account ~/.claude.json claims;
+  # without it the run prints the (correct, unrelated) identity WARNING to stderr
+  # and the capture stops being the one parseable object under test.
+  set +e
+  HOSTILE_OUT="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
+  HOSTILE_RC=$?
+  set -e
+  [ "$HOSTILE_RC" -eq 0 ] && jq -e 'type=="object"' <<<"$HOSTILE_OUT" >/dev/null 2>&1 \
+    && ok "hostile payload → weekly_left_pct=$VAL still answers one parseable object, exit 0" \
+    || bad "hostile payload → $VAL broke the command (rc=$HOSTILE_RC): $(head -1 <<<"$HOSTILE_OUT")"
+  [ "$(jq -r '.accounts[] | select(.email=="remote@example.com") | .weekly.remaining_pct' <<<"$HOSTILE_OUT" 2>/dev/null)" = null ] \
+    && ok "hostile payload → $VAL is treated as 'the peer supplied nothing', never guessed at" \
+    || bad "hostile payload → $VAL produced a weekly number: $(jq -c '.accounts[]|select(.email=="remote@example.com")|.weekly' <<<"$HOSTILE_OUT" 2>/dev/null)"
+done
+[ ! -e "$PWN" ] \
+  && ok "hostile payload → NO command ran: a peer cannot execute anything on this box" \
+  || bad "hostile payload → the peer executed a command (created $PWN)"
+# both windows hostile → the row falls through entirely, as if the peer had no row
+rm -f "$RUN/cfg/peer-usage-cache.json"
+jq -n --arg g "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" --arg m "$(iso_at -30S)" \
+  '{generated_at:$g, peer:null, accounts:[{account:"remote@example.com",
+     weekly_left_pct:"n/a", five_hour_left_pct:"n/a", quota_data:"cached",
+     quota_measured_at:$m}]}' > "$RUN/state/peer-peerbox.json"
+HOSTILE_BOTH="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
+[ "$(jq -r '.accounts[] | select(.email=="remote@example.com") | .quota_data' <<<"$HOSTILE_BOTH")" = none ] \
+  && ok "hostile payload → a row with NO usable number at all is not claimed as a peer row" \
+  || bad "hostile payload → both-windows-garbage must fall through (got: $HOSTILE_BOTH)"
+
+# --- 53f3. the `rota usage --json` fallback shape --------------------------------
+# The peer is asked for `rota accounts --json` first, but that needs a billing.json
+# on the peer; without one the same ssh falls back to `rota usage --json`, whose
+# field names are entirely different (email / weekly.remaining_pct rather than
+# account / weekly_left_pct). Both shapes are accepted precisely so a peer without
+# a billing file still contributes, and until now only one of them was exercised.
+peer_fixture peerenginshape
+jq -n --arg g "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" --arg m "$(iso_at -30S)" \
+   --arg wr "$(iso_in +3d)" --arg sr "$(iso_in +2H)" \
+  '{generated_at:$g, peer:null, accounts:[{label:"remote@example.com",
+     email:"remote@example.com", alias:"remotealias", data:"cached",
+     quota_data:"cached", quota_source:null, quota_measured_at:$m,
+     weekly:{remaining_pct:64, resets_at:$wr},
+     five_hour:{remaining_pct:91, resets_at:$sr}}]}' > "$RUN/state/peer-peerbox.json"
+P_ENG="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
+P_ENG_ROW="$(prow remote@example.com "$P_ENG")"
+[ "$(jq -r '.quota_data' <<<"$P_ENG_ROW")" = peer ] \
+  && [ "$(jq -r '.weekly.remaining_pct' <<<"$P_ENG_ROW")" = 64 ] \
+  && [ "$(jq -r '.five_hour.remaining_pct' <<<"$P_ENG_ROW")" = 91 ] \
+  && ok "engine-shaped payload → a peer with no billing.json still fills the row" \
+  || bad "engine-shaped payload → both windows must parse (got: $P_ENG_ROW)"
+[ "$(jq -r '.five_hour.resets_at' <<<"$P_ENG_ROW")" != null ] \
+  && ok "engine-shaped payload → and it carries the 5h reset the billing shape used to drop" \
+  || bad "engine-shaped payload → 5h resets_at parsed (got: $P_ENG_ROW)"
+
+# --- 53f4. MULTIPLE PEERS: first useful answer wins, and only then stop ----------
+# R2 is "one ssh per peer, in configured order, stopping at the FIRST that answers
+# usefully". Usefully is the load-bearing word: a peer that answers with nothing
+# this box is missing must NOT end the search, or one healthy-but-irrelevant box
+# in front of the right one silently disables the feature.
+peer_fixture peerfirstwins
+peer_json "$(iso_at -30S)" remotealias remote@example.com:73:88 > "$RUN/state/peer-boxA.json"
+peer_json "$(iso_at -30S)" remotealias remote@example.com:11:11 > "$RUN/state/peer-boxB.json"
+P_MULTI="$(ROTA_PEERS="boxA boxB" FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
+[ "$(jq -r '.peer.host' <<<"$P_MULTI")" = boxA ] \
+  && [ "$(jq -r '.accounts[]|select(.email=="remote@example.com")|.weekly.remaining_pct' <<<"$P_MULTI")" = 73 ] \
+  && ok "multi-peer → the FIRST peer that answers usefully wins, in configured order" \
+  || bad "multi-peer → boxA must win (got: $(jq -c '.peer' <<<"$P_MULTI"))"
+[ "$(ssh_count)" -eq 1 ] \
+  && ok "multi-peer → and boxB is never dialled at all once boxA has answered" \
+  || bad "multi-peer → expected 1 dial, got $(ssh_count)"
+
+peer_fixture peeruseless
+# boxA is up and healthy but knows nothing about the seat this box is missing
+peer_json "$(iso_at -30S)" other other@example.com:99:99 > "$RUN/state/peer-boxA.json"
+peer_json "$(iso_at -30S)" remotealias remote@example.com:41:55 > "$RUN/state/peer-boxB.json"
+P_USELESS="$(ROTA_PEERS="boxA boxB" FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
+[ "$(jq -r '.peer.host' <<<"$P_USELESS")" = boxB ] \
+  && [ "$(jq -r '.accounts[]|select(.email=="remote@example.com")|.weekly.remaining_pct' <<<"$P_USELESS")" = 41 ] \
+  && ok "multi-peer → a peer that answers UNUSEFULLY does not end the search" \
+  || bad "multi-peer → boxB must be consulted after a useless boxA (got: $(jq -c '.peer' <<<"$P_USELESS"))"
+[ "$(ssh_count)" -eq 2 ] \
+  && ok "multi-peer → both were dialled, once each, in order" \
+  || bad "multi-peer → expected 2 dials, got $(ssh_count)"
+
+# --- 53f5. a corrupt peer cache SELF-HEALS -------------------------------------
+# Same rule cache_flush already lives by: a truncated write must never poison
+# every later run. Half a JSON object on disk has to cost one re-dial, not the
+# feature.
+peer_fixture peercorrupt
+peer_json "$(iso_at -30S)" remotealias remote@example.com:73:88 > "$RUN/state/peer-peerbox.json"
+printf '{"peerbox": {"at": 17562900' > "$RUN/cfg/peer-usage-cache.json"   # truncated mid-write
+set +e
+P_CORRUPT="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>"$RUN/corrupt.err")"
+CORRUPT_RC=$?
+set -e
+[ "$CORRUPT_RC" -eq 0 ] && [ ! -s "$RUN/corrupt.err" ] \
+  && ok "corrupt peer cache → exit 0 and silent, exactly as a corrupt usage cache is" \
+  || bad "corrupt peer cache → must degrade quietly (rc=$CORRUPT_RC: $(cat "$RUN/corrupt.err"))"
+[ "$(jq -r '.accounts[]|select(.email=="remote@example.com")|.quota_data' <<<"$P_CORRUPT")" = peer ] \
+  && ok "corrupt peer cache → the run re-dials and the row still fills" \
+  || bad "corrupt peer cache → the row must still fill (got: $P_CORRUPT)"
+jq -e . "$RUN/cfg/peer-usage-cache.json" >/dev/null 2>&1 \
+  && ok "corrupt peer cache → and the junk is replaced with a valid file, not appended to" \
+  || bad "corrupt peer cache → the file is still corrupt: $(cat "$RUN/cfg/peer-usage-cache.json")"
+
+# --- 53g. --no-refresh performs NO peer call ------------------------------------
+# "no network" is the whole promise of the flag, and ssh is network.
+peer_fixture peernorefresh
+peer_json "$(iso_at -30S)" remotealias remote@example.com:73:88 > "$RUN/state/peer-peerbox.json"
+ROTA_PEERS=peerbox "$SCRIPT" usage --no-refresh --json >/dev/null 2>&1 || true
+[ "$(ssh_count)" -eq 0 ] \
+  && ok "--no-refresh → not one ssh call: an explicit 'no network' outranks a peer" \
+  || bad "--no-refresh → made $(ssh_count) ssh call(s)"
+
+# --- 53h. matching is on EMAIL, never on alias ----------------------------------
+# An alias is a per-box DIRECTORY NAME. Two boxes can both call a seat `remote`
+# and mean two different logins; cross-matching would print one seat's numbers on
+# another seat's line, which is the one failure worse than a blank row.
+peer_fixture peeralias
+peer_json "$(iso_at -30S)" remoteseat someone-else@example.com:73:88 > "$RUN/state/peer-peerbox.json"
+P_JSON="$(ROTA_PEERS=peerbox "$SCRIPT" usage --json 2>>"$ERRLOG")"
+[ "$(jq -r '.accounts[] | select(.email=="remote@example.com") | .quota_data' <<<"$P_JSON")" = none ] \
+  && ok "alias collision → a peer row whose ALIAS matches but whose email does not is ignored" \
+  || bad "alias collision → must not cross-match (got: $P_JSON)"
+[ "$(jq -r '.peer' <<<"$P_JSON")" = null ] \
+  && ok "alias collision → and no peer is claimed, because none was usable" \
+  || bad "alias collision → peer must stay null (got: $(jq -c '.peer' <<<"$P_JSON"))"
+
+# --- 53i. the peers FILE, and never dialling yourself ---------------------------
+peer_fixture peerfile
+peer_json "$(iso_at -30S)" remotealias remote@example.com:73:88 > "$RUN/state/peer-peerbox.json"
+printf '# boxes that hold what this one does not\n\n  peerbox  \n' > "$RUN/cfg/peers"
+P_JSON="$("$SCRIPT" usage --json 2>>"$ERRLOG")"
+[ "$(jq -r '.accounts[] | select(.email=="remote@example.com") | .quota_data' <<<"$P_JSON")" = peer ] \
+  && ok "peers file → read from \$CFG_DIR/peers, with comments and blank lines ignored" \
+  || bad "peers file → the file is read (got: $P_JSON)"
+
+peer_fixture peerself
+SELF_HOST="$(hostname -s 2>/dev/null || echo unknown)"
+peer_json "$(iso_at -30S)" remotealias remote@example.com:73:88 > "$RUN/state/peer-$SELF_HOST.json"
+ROTA_PEERS="$SELF_HOST" "$SCRIPT" usage --json >/dev/null 2>&1 || true
+[ "$(ssh_count)" -eq 0 ] \
+  && ok "self as peer → skipped, never a round trip to our own sshd for numbers we have" \
+  || bad "self as peer → dialled itself $(ssh_count) time(s)"
+
+# ...INCLUDING the fully-qualified spelling, which is the case the $HOSTNAME
+# comparison was added for and the one it was getting wrong: only the SELF side
+# was truncated at the first dot, so HOSTNAME=peerbox.local plus `peerbox.local`
+# in the peers file matched nothing and the box dialled its own sshd. The fixture
+# is armed, so a failure to skip fills the row and is visible twice over.
+peer_fixture peerselffqdn
+peer_json "$(iso_at -30S)" remotealias remote@example.com:73:88 > "$RUN/state/peer-peerbox.local.json"
+P_FQDN="$(HOSTNAME=peerbox.local ROTA_PEERS=peerbox.local "$SCRIPT" usage --json 2>>"$ERRLOG")"
+[ "$(ssh_count)" -eq 0 ] \
+  && ok "self as peer → the FQDN spelling is skipped too (HOSTNAME=peerbox.local vs peerbox.local)" \
+  || bad "self as peer → dialled its own FQDN $(ssh_count) time(s)"
+[ "$(jq -r '.peer' <<<"$P_FQDN")" = null ] \
+  && ok "self as peer → and no peer is claimed, so the row stays this box's own answer" \
+  || bad "self as peer → peer must stay null (got: $(jq -c '.peer' <<<"$P_FQDN"))"
+
+# --- 53j. R6 in the switch path: peer rides with cached, in both directions -----
+# switch-auto's STRICT first pass demands live rows and must refuse a peer row
+# exactly as it refuses a cached one; its SECOND pass (the cached fallback that
+# exists so a bare `rota switch` never dead-ends) must then accept it, and say
+# out loud that the pick was not measured here.
+peer_fixture peerswitch 98      # the active seat is down to 2% weekly left
+peer_json "$(iso_at -30S)" remotealias remote@example.com:73:88 > "$RUN/state/peer-peerbox.json"
+set +e
+SW_OUT="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" switch-auto --dry-run 2>&1)"
+SW_RC=$?
+set -e
+[ "$SW_RC" -eq 0 ] && ok "peer (R6) → switch-auto --dry-run exits 0" || bad "peer (R6) → switch-auto exits 0 (got $SW_RC: $SW_OUT)"
+grep -q 'optimizer pick: remote@example.com' <<<"$SW_OUT" \
+  && ok "peer (R6) → the cached-fallback pass picks the peer row, exactly as it would a cached one" \
+  || bad "peer (R6) → the fallback pass picks the peer seat (got: $SW_OUT)"
+grep -q 'no account returned LIVE numbers this run' <<<"$SW_OUT" \
+  && ok "peer (R6) → and it says the strict live-only pass found nothing first" \
+  || bad "peer (R6) → the fallback says why it fell back (got: $SW_OUT)"
+grep -q 'not a live measurement: via peerbox' <<<"$SW_OUT" \
+  && ok "peer (R6) → the pick line names the box that measured it, not a borrowed 'cached' age" \
+  || bad "peer (R6) → the pick names its source (got: $SW_OUT)"
+
+# --- 54. UNMEASURED × peer: the two changes composed ---------------------------
+#
+# These two landed independently and answer the same operator question from
+# opposite ends, so the interesting cases are the ones NEITHER suite had:
+#   the SEAT's lifecycle  (2026-08-25) - unknown quota is not spent quota, and a
+#                                        cancelled seat is not a dead seat
+#   the PEER fallback     (2026-08-27) - a box with no credential for a seat
+#                                        borrows that seat's numbers over ssh
+# The bucket rule they have to agree on is one sentence: a row is UNMEASURED when
+# THIS REPORT has no number for the window you would spend right now. Not "this
+# box failed to fetch" - after a peer fill those are different facts.
+
+# --- 54a. a peer row whose window has ROLLED is UNMEASURED, not spent -----------
+# The whole 2026-08-21 harm, arriving by ssh instead of out of the local cache:
+# the number describes a window that no longer exists, so it must not render as a
+# figure, must not read as an obituary, and must still say WHOSE measurement it
+# was and how old.
+peer_fixture peerrolled
+peer_json "$(iso_at -2d)" remotealias remote@example.com:73:88 \
+  | jq -c --arg wr "$(iso_in -2d)" '.accounts[0].weekly_resets_at=$wr' \
+  > "$RUN/state/peer-peerbox.json"
+jq -n --arg ends "$(date -u -v+5d '+%Y-%m-%d')" \
+  '{accounts:{"remote@example.com":{plan:"Max 20x",status:"cancelled",ends:$ends}}}' \
+  > "$RUN/billing.json"
+set +e
+PU_OUT="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com \
+          CLAUDE_BILLING_JSON="$RUN/billing.json" "$SCRIPT" usage 2>>"$ERRLOG")"
+PU_JSON="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com \
+           CLAUDE_BILLING_JSON="$RUN/billing.json" "$SCRIPT" usage --json 2>>"$ERRLOG")"
+set -e
+PU_REMOTE="$(prow remote@example.com "$PU_JSON")"
+grep -q 'remote@example.com' <<<"$(unmeasured_block <<<"$PU_OUT")" \
+  && ok "peer × unmeasured → a peer row whose window rolled lands in UNMEASURED" \
+  || bad "peer × unmeasured → belongs in UNMEASURED (got: $PU_OUT)"
+! grep -q 'remote@example.com' <<<"$(unavail_block <<<"$PU_OUT")" \
+  && ok "peer × unmeasured → and NOT in UNAVAILABLE: a rolled window is not a dead seat" \
+  || bad "peer × unmeasured → must not be UNAVAILABLE (got: $PU_OUT)"
+grep -q 'via peerbox' <<<"$(unmeasured_block <<<"$PU_OUT")" \
+  && ok "peer × unmeasured → the UNMEASURED row still names the box that measured it" \
+  || bad "peer × unmeasured → the row keeps its provenance (got: $PU_OUT)"
+grep -q 'cancelled, quota until' <<<"$(unmeasured_block <<<"$PU_OUT")" \
+  && ok "peer × unmeasured → and still names the seat-end deadline that ranks it" \
+  || bad "peer × unmeasured → names its end date (got: $PU_OUT)"
+[ "$(jq -r '.unmeasured' <<<"$PU_REMOTE")" = true ] \
+  && [ "$(jq -r '.quota_data' <<<"$PU_REMOTE")" = peer ] \
+  && [ "$(jq -r '.weekly.remaining_pct' <<<"$PU_REMOTE")" = null ] \
+  && ok "peer × unmeasured (json) → unmeasured:true, quota_data:peer, and no stale figure" \
+  || bad "peer × unmeasured (json) → wrong shape (got: $PU_REMOTE)"
+
+# --- 54b. a peer row with a CURRENT window is MEASURED, whatever this box's own
+#          probe did -----------------------------------------------------------
+# ⚠️ THE REGRESSION THIS FILE EXISTS FOR. weekly_unknown was written before peer
+# rows existed and asked U_WHY, which answers "why did THIS box fail to fetch".
+# After a peer fill a row can carry a 429 in U_WHY *and* a real current-window
+# number measured over ssh: asking U_WHY alone filed that number under
+# UNMEASURED, a bucket that prints no number at all and tells the operator to go
+# and read one off the vendor's page. That is the exact inversion the UNMEASURED
+# bucket exists to prevent, pointing the other way.
+#
+# It is also R6: a `peer` row must answer this question exactly as a `cached` one
+# would, so the fix is to ask the ROW ("is there a number for the current
+# window") rather than the probe.
+peer_fixture peer429
+cred_json TOK-REMOTE > "$RUN/.claude-pool/remoteseat/.credentials.json"
+printf '429' > "$RUN/state/usage-TOK-REMOTE.code"
+peer_json "$(iso_at -30S)" remotealias remote@example.com:73:88 > "$RUN/state/peer-peerbox.json"
+set +e
+P4_OUT="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
+P4_JSON="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
+set -e
+P4_REMOTE="$(prow remote@example.com "$P4_JSON")"
+[ "$(jq -r '.quota_data' <<<"$P4_REMOTE")" = peer ] \
+  && [ "$(jq -r '.weekly.remaining_pct' <<<"$P4_REMOTE")" = 73 ] \
+  && ok "peer × 429 → the local 429 is rescued by the peer, the row carries 73% left" \
+  || bad "peer × 429 → the peer must fill the 429'd row (got: $P4_REMOTE)"
+[ "$(jq -r '.unmeasured' <<<"$P4_REMOTE")" = false ] \
+  && ok "peer × 429 → and it is NOT unmeasured: a number exists for the current window" \
+  || bad "peer × 429 → a filled row is measured, whatever the local probe did (got: $P4_REMOTE)"
+! grep -q 'remote@example.com' <<<"$(unmeasured_block <<<"$P4_OUT")" \
+  && ok "peer × 429 → the table does not park a borrowed number under UNMEASURED" \
+  || bad "peer × 429 → must not be UNMEASURED (got: $P4_OUT)"
+
+# --- 54c. R6 on the bucket rule: cached answers it identically to peer ----------
+# The same fixture with the number in the LOCAL cache instead of on the peer. If
+# these two ever disagree, `peer` has grown an exemption `cached` does not have,
+# which is precisely what R6 forbids.
+peer_fixture cached429
+cred_json TOK-REMOTE > "$RUN/.claude-pool/remoteseat/.credentials.json"
+printf '429' > "$RUN/state/usage-TOK-REMOTE.code"
+jq -n --arg wr "$(iso_in +3d)" --arg sr "$(iso_in +2H)" --arg te "$(( $(date +%s) - 600 ))" \
+  '{"remote@example.com":{wk_u:"27",wk_r:$wr,se_u:"12",se_r:$sr,ts:"ten minutes ago",ts_epoch:$te}}' \
+  > "$RUN/cfg/usage-cache.json"
+set +e
+C4_OUT="$(FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
+C4_JSON="$(FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
+set -e
+C4_REMOTE="$(prow remote@example.com "$C4_JSON")"
+[ "$(jq -r '.quota_data' <<<"$C4_REMOTE")" = cached ] \
+  && [ "$(jq -r '.unmeasured' <<<"$C4_REMOTE")" = false ] \
+  && ok "cached × 429 (R6) → a ten-minute-old cached number is measured too, not UNMEASURED" \
+  || bad "cached × 429 (R6) → cached must answer as peer does (got: $C4_REMOTE)"
+! grep -q 'remote@example.com' <<<"$(unmeasured_block <<<"$C4_OUT")" \
+  && ok "cached × 429 (R6) → and the table agrees, byte for byte with the peer case" \
+  || bad "cached × 429 (R6) → must not be UNMEASURED (got: $C4_OUT)"
+
+# ⚠️ AND IT MUST BE ABLE TO FAIL. Same 429, same fixture, NO number from anywhere:
+# that row IS unmeasured, and this is the case the 429 arm was written for.
+peer_fixture nonum429
+cred_json TOK-REMOTE > "$RUN/.claude-pool/remoteseat/.credentials.json"
+printf '429' > "$RUN/state/usage-TOK-REMOTE.code"
+set +e
+N4_OUT="$(FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
+N4_JSON="$(FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
+set -e
+[ "$(jq -r '.unmeasured' <<<"$(prow remote@example.com "$N4_JSON")")" = true ] \
+  && ok "429 with no number at all → still UNMEASURED, the case that arm was written for" \
+  || bad "429 with nothing → must stay unmeasured (got: $(prow remote@example.com "$N4_JSON"))"
+grep -q 'remote@example.com' <<<"$(unmeasured_block <<<"$N4_OUT")" \
+  && ok "429 with no number at all → and the table files it under UNMEASURED" \
+  || bad "429 with nothing → belongs in UNMEASURED (got: $N4_OUT)"
+
+# --- 54d. `--record` versus a peer: the NEWER MEASUREMENT wins ------------------
+# `--record` predates peers, so this is the precedence the merge had to decide. A
+# hand reading is a measurement like any other: no privilege for having been
+# typed, and no demotion for it either. It reaches peer_fill already adopted into
+# the `cached` slot with its read_at_epoch, so R4 arbitrates it with no special
+# case. Both directions, because a rule that only ever prefers one side is not a
+# comparison.
+peer_fixture recordbeatspeer
+printf '%s' '{"accounts":{}}' > "$RUN/cfg/human-usage.json"
+jq --arg wr "$(iso_in +3d)" --argjson te "$(date +%s)" \
+   '.accounts["remote@example.com"]={weekly_used:8,weekly_resets_at:$wr,five_hour_used:null,
+                                     five_hour_resets_at:null,read_at:"just now",read_at_epoch:$te,
+                                     source:"vendor usage page, read by hand"}' \
+   "$RUN/cfg/human-usage.json" > "$RUN/cfg/hu.json" && mv "$RUN/cfg/hu.json" "$RUN/cfg/human-usage.json"
+peer_json "$(iso_at -2d)" remotealias remote@example.com:73:88 > "$RUN/state/peer-peerbox.json"
+R1_JSON="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com \
+           CLAUDE_HUMAN_USAGE="$RUN/cfg/human-usage.json" "$SCRIPT" usage --json 2>>"$ERRLOG")"
+R1_REMOTE="$(prow remote@example.com "$R1_JSON")"
+[ "$(jq -r '.weekly.remaining_pct' <<<"$R1_REMOTE")" = 92 ] \
+  && [ "$(jq -r '.quota_data' <<<"$R1_REMOTE")" = cached ] \
+  && ok "--record × peer → a reading typed just now beats a two-day-old peer row" \
+  || bad "--record × peer → the fresh hand reading must win (got: $R1_REMOTE)"
+
+peer_fixture peerbeatsrecord
+printf '%s' '{"accounts":{}}' > "$RUN/cfg/human-usage.json"
+jq --arg wr "$(iso_in +3d)" --argjson te "$(( $(date +%s) - 259200 ))" \
+   '.accounts["remote@example.com"]={weekly_used:8,weekly_resets_at:$wr,five_hour_used:null,
+                                     five_hour_resets_at:null,read_at:"three days ago",read_at_epoch:$te,
+                                     source:"vendor usage page, read by hand"}' \
+   "$RUN/cfg/human-usage.json" > "$RUN/cfg/hu.json" && mv "$RUN/cfg/hu.json" "$RUN/cfg/human-usage.json"
+peer_json "$(iso_at -30S)" remotealias remote@example.com:73:88 > "$RUN/state/peer-peerbox.json"
+R2_JSON="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com \
+           CLAUDE_HUMAN_USAGE="$RUN/cfg/human-usage.json" "$SCRIPT" usage --json 2>>"$ERRLOG")"
+R2_REMOTE="$(prow remote@example.com "$R2_JSON")"
+[ "$(jq -r '.weekly.remaining_pct' <<<"$R2_REMOTE")" = 73 ] \
+  && [ "$(jq -r '.quota_data' <<<"$R2_REMOTE")" = peer ] \
+  && ok "--record × peer → a peer that measured 30s ago beats a three-day-old reading" \
+  || bad "--record × peer → the fresher peer must win (got: $R2_REMOTE)"
+
+# ⚠️ AND A LIVE LOCAL FETCH STILL BEATS BOTH. The one rule `--record` shipped
+# with ("it never displaces a live fetch") must survive the peer precedence being
+# layered under it.
+peer_fixture recordneverbeatslive
+printf '%s' '{"accounts":{}}' > "$RUN/cfg/human-usage.json"
+jq --arg wr "$(iso_in +3d)" --argjson te "$(date +%s)" \
+   '.accounts["local@example.com"]={weekly_used:99,weekly_resets_at:$wr,five_hour_used:null,
+                                    five_hour_resets_at:null,read_at:"just now",read_at_epoch:$te,
+                                    source:"vendor usage page, read by hand"}' \
+   "$RUN/cfg/human-usage.json" > "$RUN/cfg/hu.json" && mv "$RUN/cfg/hu.json" "$RUN/cfg/human-usage.json"
+R3_JSON="$(FAKE_NEW_EMAIL=local@example.com CLAUDE_HUMAN_USAGE="$RUN/cfg/human-usage.json" \
+           "$SCRIPT" usage --json 2>>"$ERRLOG")"
+R3_LOCAL="$(prow local@example.com "$R3_JSON")"
+[ "$(jq -r '.quota_data' <<<"$R3_LOCAL")" = live ] \
+  && [ "$(jq -r '.weekly.remaining_pct' <<<"$R3_LOCAL")" = 90 ] \
+  && ok "--record × live → a typed 99% used never displaces this run's own measurement" \
+  || bad "--record × live → the live fetch must win (got: $R3_LOCAL)"
+
+# --- 57. an EXPIRED access token the API answers 429 for is NOT "shared by live sessions"
+# Measured on the pool host 2026-08-30 09:43-09:46: with no live session on the seat
+# and 150s of quiet before each call, GET /api/oauth/usage answered 429 to a real
+# access token whose expiresAt lay five days in the past, and 401 ("OAuth access
+# token is invalid") to a garbage token. So a 429 on a seat whose stored token is
+# ALREADY EXPIRED is the vendor refusing an expired token, not per-token rate
+# limiting from panes that share it: nothing can be sharing a token that expired
+# days ago. The engine used to take the 429 at face value, skip the one refresh
+# path it has (the haiku nudge, which makes the CLI rotate the credential), and
+# tell the operator to "retry in ~1 min", which never came true. Four of five seats
+# sat UNMEASURED for up to five days for exactly this reason.
+new_run expiredtoken
+mkdir -p "$RUN/.claude-pool/live" "$RUN/.claude-pool/expired" "$RUN/.claude-pool/limited"
+cred_json TOK-X-LIVE > "$RUN/.claude/.credentials.json"
+cp "$RUN/.claude/.credentials.json" "$RUN/.claude-pool/live/.credentials.json"
+printf '{"oauthAccount":{"emailAddress":"live@example.com"}}' > "$RUN/.claude-pool/live/.claude.json"
+printf '{"oauthAccount":{"emailAddress":"live@example.com"}}' > "$RUN/.claude.json"
+# expired: a COMPLETE credential (refresh token in date) whose ACCESS token expired
+# five days ago; the API answers 429 to it, the real shape measured above
+printf '{"claudeAiOauth":{"accessToken":"TOK-X-EXPIRED","refreshToken":"RT-TOK-X-EXPIRED","expiresAt":%s000,"refreshTokenExpiresAt":%s000,"scopes":["user:inference"],"subscriptionType":"max"}}' \
+  "$(date -u -v-5d +%s)" "$RT_FUTURE" > "$RUN/.claude-pool/expired/.credentials.json"
+printf '{"oauthAccount":{"emailAddress":"expired@example.com"}}' > "$RUN/.claude-pool/expired/.claude.json"
+printf '429' > "$RUN/state/usage-TOK-X-EXPIRED.code"
+# limited: a token still in date that the API 429s WHILE a live session is
+# pinned to the seat, the genuine shared-token rate-limit case, must keep its
+# old behaviour byte for byte (no nudge, "retry in ~1 min"). The pin is what
+# says "shared" since the dormant-wake arm (scenario 59): an in-date 429 with
+# NO pin and nothing current in the cache gets one wake instead.
+cred_json TOK-X-LIMITED > "$RUN/.claude-pool/limited/.credentials.json"
+printf '{"oauthAccount":{"emailAddress":"limited@example.com"}}' > "$RUN/.claude-pool/limited/.claude.json"
+printf '429' > "$RUN/state/usage-TOK-X-LIMITED.code"
+printf 'PID TT STAT TIME COMMAND\n  71 s001  S+   0:00.10 claude CLAUDE_CONFIG_DIR=%s/.claude-pool/limited\n' "$RUN" > "$RUN/state/pool-ps.txt"
+cat > "$RUN/cfg/accounts" <<EOF
+live@example.com|$RUN/.claude-pool/live
+expired@example.com|$RUN/.claude-pool/expired
+limited@example.com|$RUN/.claude-pool/limited
+EOF
+printf '{"seven_day":{"utilization":10,"resets_at":"%s"},"five_hour":{"utilization":10,"resets_at":"%s"}}' \
+  "$(iso_in +2d)" "$(iso_in +2H)" > "$RUN/state/usage-TOK-X-LIVE.json"
+run_usage
+X_JSON="$(FAKE_NEW_EMAIL=live@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
+X_EXPIRED="$(prow expired@example.com "$X_JSON")"
+X_LIMITED="$(prow limited@example.com "$X_JSON")"
+[ "$(grep -c '^expired$' "$RUN/state/nudges" 2>/dev/null || echo 0)" -ge 1 ] \
+  && ok "expired token × 429 → the seat IS nudged (the CLI is the only thing that rotates a stored token)" \
+  || bad "expired token × 429 → must nudge (nudges: $(cat "$RUN/state/nudges" 2>/dev/null || echo none))"
+! grep -q '^limited$' "$RUN/state/nudges" 2>/dev/null \
+  && ok "expired token × 429 → an in-date token that 429s under a live pin is NOT nudged (real shared-token rate limiting, unchanged)" \
+  || bad "expired token × 429 → pinned in-date 429 must not nudge (nudges: $(cat "$RUN/state/nudges"))"
+grep -q 'access token expired' <<<"$(jq -r '.stale_reason' <<<"$X_EXPIRED")" \
+  && ! grep -q 'live sessions share' <<<"$(jq -r '.stale_reason' <<<"$X_EXPIRED")" \
+  && ok "expired token × 429 → the reason names the EXPIRED token, never 'live sessions share this token'" \
+  || bad "expired token × 429 → honest reason (got: $(jq -r '.stale_reason' <<<"$X_EXPIRED"))"
+grep -q 'live sessions share' <<<"$(jq -r '.stale_reason' <<<"$X_LIMITED")" \
+  && ok "expired token × 429 → the in-date 429 keeps its 'retry in ~1 min' reason" \
+  || bad "expired token × 429 → in-date reason unchanged (got: $(jq -r '.stale_reason' <<<"$X_LIMITED"))"
+grep -qE '^  \? expired@example\.com +stored token stale' <<<"$(unmeasured_block <<<"$OUT")" \
+  && ok "expired token × 429 → the table reads 'stored token stale' under UNMEASURED (quota unknown, seat fine), not 'usage API rate-limited'" \
+  || bad "expired token × 429 → table row (got: $(unmeasured_block <<<"$OUT"))"
+[ "$(jq -r '.unmeasured' <<<"$X_EXPIRED")" = true ] \
+  && ok "expired token × 429 → the JSON row is unmeasured, not spent" \
+  || bad "expired token × 429 → JSON unmeasured (got: $X_EXPIRED)"
+# and the probe itself now goes out under the keeper's User-Agent: under curl's
+# default UA the vendor answered 429 to an expired token, under claude-code/2.x
+# it answered 401 "OAuth access token has expired" (2026-08-30), which is the
+# code the whole stale-token branch was written for
+[ "$(cat "$RUN/state/ua-TOK-X-LIVE" 2>/dev/null)" = "claude-code/2.x" ] \
+  && ok "usage_fetch → probes with the keeper's User-Agent (claude-code/2.x), one probe shape for both" \
+  || bad "usage_fetch → User-Agent (got: $(cat "$RUN/state/ua-TOK-X-LIVE" 2>/dev/null || echo none))"
+
+# --- 58. a RESERVED seat is never nudged from this box, expired token or not
+# gmail is the Airmond runner's seat and tommy is Joe's: each of those refresh
+# chains is ALSO held on the owner's machine, and a nudge from the pool host
+# rotates the chain out from under that copy (measured 2026-08-30: gmail had
+# already been rotated on both sides once). So scenario 57's nudge must not fire
+# for a reserved seat, on either of billing's two reservation sources, and the
+# row must say who answers it instead. ROTA_NUDGE_RESERVED=1 is the override.
+new_run reservedseat
+mkdir -p "$RUN/.claude-pool/live" "$RUN/.claude-pool/marked" "$RUN/.claude-pool/listed"
+cred_json TOK-R-LIVE > "$RUN/.claude/.credentials.json"
+cp "$RUN/.claude/.credentials.json" "$RUN/.claude-pool/live/.credentials.json"
+printf '{"oauthAccount":{"emailAddress":"live@example.com"}}' > "$RUN/.claude-pool/live/.claude.json"
+printf '{"oauthAccount":{"emailAddress":"live@example.com"}}' > "$RUN/.claude.json"
+for seat in marked listed; do
+  printf '{"claudeAiOauth":{"accessToken":"TOK-R-%s","refreshToken":"RT-TOK-R-%s","expiresAt":%s000,"refreshTokenExpiresAt":%s000,"scopes":["user:inference"],"subscriptionType":"max"}}' \
+    "$seat" "$seat" "$(date -u -v-5d +%s)" "$RT_FUTURE" > "$RUN/.claude-pool/$seat/.credentials.json"
+  printf '{"oauthAccount":{"emailAddress":"%s@example.com"}}' "$seat" > "$RUN/.claude-pool/$seat/.claude.json"
+  printf '429' > "$RUN/state/usage-TOK-R-$seat.code"
+done
+touch "$RUN/.claude-pool/marked/RESERVED"                         # source 1: the marker file
+printf 'listed runner  pushed to the runner\n' > "$RUN/cfg/reserved"   # source 2: the config line
+cat > "$RUN/cfg/accounts" <<EOF
+live@example.com|$RUN/.claude-pool/live
+marked@example.com|$RUN/.claude-pool/marked
+listed@example.com|$RUN/.claude-pool/listed
+EOF
+printf '{"seven_day":{"utilization":10,"resets_at":"%s"},"five_hour":{"utilization":10,"resets_at":"%s"}}' \
+  "$(iso_in +2d)" "$(iso_in +2H)" > "$RUN/state/usage-TOK-R-LIVE.json"
+run_usage
+R_JSON="$(FAKE_NEW_EMAIL=live@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
+! grep -qE '^(marked|listed)$' "$RUN/state/nudges" 2>/dev/null \
+  && ok "reserved seat → neither reservation source is nudged, expired token or not" \
+  || bad "reserved seat → must not nudge (nudges: $(cat "$RUN/state/nudges" 2>/dev/null || echo none))"
+for seat in marked listed; do
+  R_ROW="$(prow "$seat@example.com" "$R_JSON")"
+  grep -q 'reserved seat' <<<"$(jq -r '.stale_reason' <<<"$R_ROW")" \
+    && grep -q 'access token expired' <<<"$(jq -r '.stale_reason' <<<"$R_ROW")" \
+    && grep -q "rota usage --record $seat" <<<"$(jq -r '.stale_reason' <<<"$R_ROW")" \
+    && ok "reserved seat ($seat) → the reason says reserved, names the expired token and the --record command that answers it" \
+    || bad "reserved seat ($seat) → honest reason (got: $(jq -r '.stale_reason' <<<"$R_ROW"))"
+  [ "$(jq -r '.unmeasured' <<<"$R_ROW")" = true ] \
+    && ok "reserved seat ($seat) → the JSON row is unmeasured, not spent" \
+    || bad "reserved seat ($seat) → JSON unmeasured (got: $R_ROW)"
+done
+grep -qE '^  \? marked@example\.com +reserved seat' <<<"$(unmeasured_block <<<"$OUT")" \
+  && grep -qE '^  \? listed@example\.com +reserved seat' <<<"$(unmeasured_block <<<"$OUT")" \
+  && ok "reserved seat → the table files both under UNMEASURED as 'reserved seat', not 'stored token stale' or 'rate-limited'" \
+  || bad "reserved seat → table label (got: $(unmeasured_block <<<"$OUT"))"
+: > "$RUN/state/nudges"
+ROTA_NUDGE_RESERVED=1 run_usage
+grep -q '^marked$' "$RUN/state/nudges" 2>/dev/null && grep -q '^listed$' "$RUN/state/nudges" 2>/dev/null \
+  && ok "reserved seat → ROTA_NUDGE_RESERVED=1 overrides and both are nudged like any expired seat" \
+  || bad "reserved seat → override must nudge (nudges: $(cat "$RUN/state/nudges" 2>/dev/null || echo none))"
+
+# --- 59. THE UNTOUCHED WEEKLY WINDOW STILL HAS A RESET, AND THIS BOX KNOWS IT ---
+# Measured 2026-09-04: the usage API answers `resets_at: null` for every window
+# whose utilization is exactly 0.0, i.e. for the seat with a whole untouched week
+# in it, while the reset instant itself is on a fixed 7-day cadence per seat. The
+# cache then OVERWROTE the last known instant with that empty value, so `cl
+# --list` printed "weekly reset unknown", sorted the healthiest seat LAST among
+# usable ones, and at 22:34 `cl` said USE NEXT: cs (resets Mon) while `cdt
+# accounts` said tommy (resets Sat 13:00) - two surfaces, one pool, two answers.
+#
+# The whole chain is pinned here: the cache REMEMBERS (wk_r_seen, never
+# overwritten by an empty, backfilled from an older row's wk_r), the engine
+# PROJECTS from it, the projection is published under its own key and never
+# blended into resets_at, it RANKS, and it renders with a `~` plus one legend.
+#
+# Instants are built from an epoch this scenario computes, not from iso_in, so
+# the expected projection is exact arithmetic rather than a second call to a
+# clock that has moved on.
+proj_fixture() {  # proj_fixture <name> <seen-iso-or-empty> [extra-cache-fields-json]
+  new_run "$1"
+  mkdir -p "$RUN/.claude-pool/fresh"
+  printf '{"claudeAiOauth":{"accessToken":"TOK-PROJ"}}' > "$RUN/.claude/.credentials.json"
+  cp "$RUN/.claude/.credentials.json" "$RUN/.claude-pool/fresh/.credentials.json"
+  printf '{"oauthAccount":{"emailAddress":"fresh@example.com"}}' > "$RUN/.claude-pool/fresh/.claude.json"
+  printf '{"oauthAccount":{"emailAddress":"fresh@example.com"}}' > "$RUN/.claude.json"
+  cat > "$RUN/cfg/accounts" <<EOF
+fresh@example.com|$RUN/.claude-pool/fresh
+EOF
+  # the row a PREVIOUS run left behind: a real weekly instant in wk_r and NO
+  # wk_r_seen, which is every row on disk the day this ships
+  jq -n --arg wr "${2:-}" \
+    '{"fresh@example.com":{wk_u:"12",wk_r:$wr,se_u:"5",se_r:"",ts:"Sep 01 09:00",ts_epoch:"1"}}' \
+    > "$RUN/cfg/usage-cache.json"
+  # the live answer for an untouched window, verbatim from the vendor
+  printf '{"five_hour":{"utilization":0.0,"resets_at":null},
+ "seven_day":{"utilization":0.0,"resets_at":null},
+ "seven_day_opus":null,"seven_day_sonnet":null,
+ "limits":[{"kind":"session","group":"session","percent":0,"resets_at":null,"scope":null},
+   {"kind":"weekly_all","group":"weekly","percent":0,"resets_at":null,"scope":null},
+   {"kind":"weekly_scoped","group":"weekly","percent":0,"resets_at":null,
+    "scope":{"model":{"id":null,"display_name":"Fable"}}}]}' \
+    > "$RUN/state/usage-TOK-PROJ.json"
+}
+
+# (a) a cache row that HAS an instant → project it forward a week at a time
+PROJ_SEEN_EPOCH=$(( $(date -u '+%s') - 3 * 86400 ))
+PROJ_SEEN="$(date -u -r "$PROJ_SEEN_EPOCH" '+%Y-%m-%dT%H:%M:%S.123456+00:00')"
+PROJ_WANT="$(date -u -r $(( PROJ_SEEN_EPOCH + 604800 )) '+%Y-%m-%dT%H:%M:%S+00:00')"
+proj_fixture projected "$PROJ_SEEN"
+set +e
+OUT="$(FAKE_NEW_EMAIL=fresh@example.com "$SCRIPT" usage --no-color 2>>"$ERRLOG")"
+VOUT="$(FAKE_NEW_EMAIL=fresh@example.com "$SCRIPT" usage --no-color --verbose 2>>"$ERRLOG")"
+JSON_OUT="$(FAKE_NEW_EMAIL=fresh@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
+RC=$?
+set -e
+PJ_ROW="$(prow "fresh@example.com" "$JSON_OUT")"
+[ "$RC" -eq 0 ] && ok "projection → usage --json exits 0" || bad "projection → exits 0 (got $RC: $JSON_OUT)"
+[ "$(jq -r '.weekly.resets_at' <<<"$PJ_ROW")" = "null" ] \
+  && ok "projection → weekly.resets_at stays NULL: the vendor said nothing and the published field must not pretend otherwise" \
+  || bad "projection → resets_at must stay null (got: $(jq -c '.weekly' <<<"$PJ_ROW"))"
+[ "$(jq -r '.weekly.resets_at_projected' <<<"$PJ_ROW")" = "$PROJ_WANT" ] \
+  && ok "projection → resets_at_projected is the seen instant rolled forward whole weeks past now" \
+  || bad "projection → resets_at_projected (want $PROJ_WANT, got: $(jq -c '.weekly' <<<"$PJ_ROW"))"
+[ "$(jq -r '.weekly.projected_from' <<<"$PJ_ROW")" = "$PROJ_SEEN" ] \
+  && ok "projection → projected_from names the instant it was computed from, so the claim is checkable" \
+  || bad "projection → projected_from (want $PROJ_SEEN, got: $(jq -c '.weekly' <<<"$PJ_ROW"))"
+[ "$(jq -r '.weekly.fresh' <<<"$PJ_ROW")" = "true" ] \
+  && ok "projection → the window is still FRESH: a projection describes it, it does not change what it is" \
+  || bad "projection → the window stays fresh (got: $(jq -c '.weekly' <<<"$PJ_ROW"))"
+# ⚠️ THE MEMORY ITSELF. wk_r goes empty (that is what the API said) and wk_r_seen
+# keeps the instant, seeded from the pre-existing row: scenario (f) of the same fix.
+[ "$(jq -r '."fresh@example.com".wk_r_seen' "$RUN/cfg/usage-cache.json")" = "$PROJ_SEEN" ] \
+  && ok "projection → the cache KEEPS the last non-empty reset in wk_r_seen (backfilled from the old row's wk_r)" \
+  || bad "projection → wk_r_seen kept (got: $(cat "$RUN/cfg/usage-cache.json"))"
+[ "$(jq -r '."fresh@example.com".wk_r' "$RUN/cfg/usage-cache.json")" = "" ] \
+  && ok "projection → wk_r still records what THIS fetch said (empty), so the two fields cannot be confused" \
+  || bad "projection → wk_r holds this run's answer (got: $(cat "$RUN/cfg/usage-cache.json"))"
+grep -q 'resets ~in ' <<<"$OUT" \
+  && ok "projection → the ACTIVE weekly row prints the countdown with a leading ~" \
+  || bad "projection → the ~ countdown renders (got: $OUT)"
+grep -q "~ projected: window untouched since it rolled" <<<"$OUT" \
+  && ok "projection → ONE legend line under the table explains the ~" \
+  || bad "projection → the legend renders (got: $OUT)"
+grep -q 'resets  weekly resets ~' <<<"$VOUT" \
+  && ok "projection → --verbose names the projected instant, marked, instead of 'no active window yet'" \
+  || bad "projection → verbose detail (got: $VOUT)"
+
+# (b) nothing ever seen for this seat → NO projection, and no ~ anywhere
+proj_fixture noseen ""
+set +e
+OUT="$(FAKE_NEW_EMAIL=fresh@example.com "$SCRIPT" usage --no-color 2>>"$ERRLOG")"
+JSON_OUT="$(FAKE_NEW_EMAIL=fresh@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
+set -e
+NS_ROW="$(prow "fresh@example.com" "$JSON_OUT")"
+[ "$(jq -r '[.weekly.resets_at, .weekly.resets_at_projected, .weekly.projected_from] | @csv' <<<"$NS_ROW")" = ',,' ] \
+  && ok "no seen instant → all three reset fields are null: an unknown cadence is not guessed" \
+  || bad "no seen instant → nothing is invented (got: $(jq -c '.weekly' <<<"$NS_ROW"))"
+grep -q 'no active window yet (starts on first use)' <<<"$OUT" \
+  && ok "no seen instant → the row keeps the honest FRESH phrase" \
+  || bad "no seen instant → keeps the fresh phrase (got: $OUT)"
+! grep -q '~ projected' <<<"$OUT" \
+  && ok "no seen instant → no legend for a mark that is not on the page" \
+  || bad "no seen instant → legend must be absent (got: $OUT)"
+
+# (c) an EXPIRED cached window is UNMEASURED, and must not be given a deadline.
+# Its number describes a window that no longer exists, so there is nothing to
+# project FROM: inventing a reset here would put a confident deadline on a row
+# whose whole point is "go and look, this may be full".
+#
+# ⚠️ THIS IS THE ROW-LEVEL BEHAVIOUR, NOT THE GUARD. A fixture cannot reach
+# project_weekly's U_WKX guard: an expired flag only ever comes from
+# window_expired on the very stamp that is then in U_WKR, which the first guard
+# catches. The guard itself is pinned directly in case (g) below, so deleting it
+# reds the suite.
+proj_fixture expiredproj "$PROJ_SEEN"
+rm -f "$RUN/state/usage-TOK-PROJ.json"          # no live answer: the cache is all there is
+jq -n --arg wr "$(iso_in -2d)" \
+  '{"fresh@example.com":{wk_u:"40",wk_r:$wr,se_u:"5",se_r:"",ts:"Sep 01 09:00",ts_epoch:"1",wk_r_seen:$wr}}' \
+  > "$RUN/cfg/usage-cache.json"
+set +e
+JSON_OUT="$(FAKE_NEW_EMAIL=fresh@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
+set -e
+EX_ROW="$(prow "fresh@example.com" "$JSON_OUT")"
+[ "$(jq -r '.weekly.expired' <<<"$EX_ROW")" = "true" ] \
+  && ok "expired window → still expired (the fixture is doing what it claims)" \
+  || bad "expired window → fixture (got: $(jq -c '.weekly' <<<"$EX_ROW"))"
+[ "$(jq -r '.weekly.resets_at_projected' <<<"$EX_ROW")" = "null" ] \
+  && ok "expired window → NO projection: an unmeasured row must not be handed a deadline" \
+  || bad "expired window → no projection (got: $(jq -c '.weekly' <<<"$EX_ROW"))"
+[ "$(jq -r '.unmeasured' <<<"$EX_ROW")" = "true" ] \
+  && ok "expired window → the row is still UNMEASURED, not quietly rescued by the projection" \
+  || bad "expired window → stays unmeasured (got: $EX_ROW)"
+
+# (d) THE RANKING. The projected seat loses its whole week on Saturday; the seat
+# with a real reset loses its on Thursday-week. Ranking the projected one as
+# "nothing expiring" (which is what an empty deadline does) sends the operator to
+# the wrong seat, which is the live defect this whole change exists to fix.
+new_run projrank
+mkdir -p "$RUN/.claude-pool/primary" "$RUN/.claude-pool/proj" "$RUN/.claude-pool/later"
+printf '{"claudeAiOauth":{"accessToken":"TOK-PR-PRIMARY"}}' > "$RUN/.claude/.credentials.json"
+cp "$RUN/.claude/.credentials.json" "$RUN/.claude-pool/primary/.credentials.json"
+printf '{"claudeAiOauth":{"accessToken":"TOK-PR-PROJ"}}'  > "$RUN/.claude-pool/proj/.credentials.json"
+printf '{"claudeAiOauth":{"accessToken":"TOK-PR-LATER"}}' > "$RUN/.claude-pool/later/.credentials.json"
+for a in primary proj later; do
+  printf '{"oauthAccount":{"emailAddress":"%s@example.com"}}' "$a" > "$RUN/.claude-pool/$a/.claude.json"
+done
+printf '{"oauthAccount":{"emailAddress":"primary@example.com"}}' > "$RUN/.claude.json"
+cat > "$RUN/cfg/accounts" <<EOF
+primary@example.com|$RUN/.claude-pool/primary
+proj@example.com|$RUN/.claude-pool/proj
+later@example.com|$RUN/.claude-pool/later
+EOF
+PR_SEEN_EPOCH=$(( $(date -u '+%s') - 5 * 86400 ))
+PR_SEEN="$(date -u -r "$PR_SEEN_EPOCH" '+%Y-%m-%dT%H:%M:%S.000000+00:00')"
+PR_WANT="$(date -u -r $(( PR_SEEN_EPOCH + 604800 )) '+%Y-%m-%dT%H:%M:%S+00:00')"   # ~2d out
+jq -n --arg wr "$PR_SEEN" \
+  '{"proj@example.com":{wk_u:"18",wk_r:$wr,se_u:"5",se_r:"",ts:"Sep 01 09:00",ts_epoch:"1",wk_r_seen:$wr}}' \
+  > "$RUN/cfg/usage-cache.json"
+printf '{"seven_day":{"utilization":0.0,"resets_at":null},"five_hour":{"utilization":0.0,"resets_at":null}}' \
+  > "$RUN/state/usage-TOK-PR-PROJ.json"
+printf '{"seven_day":{"utilization":30,"resets_at":"%s"},"five_hour":{"utilization":10,"resets_at":"%s"}}' \
+  "$(iso_in +5d)" "$(iso_in +2H)" > "$RUN/state/usage-TOK-PR-LATER.json"
+printf '{"seven_day":{"utilization":99,"resets_at":"%s"},"five_hour":{"utilization":15,"resets_at":"%s"}}' \
+  "$(iso_in +4d)" "$(iso_in +1H)" > "$RUN/state/usage-TOK-PR-PRIMARY.json"
+set +e
+JSON_OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
+set -e
+[ "$(jq -r '.recommendation.email' <<<"$JSON_OUT")" = "proj@example.com" ] \
+  && ok "projected ranking → the seat that loses its untouched week FIRST is the pick, not the one resetting later" \
+  || bad "projected ranking → picks proj (got: $(jq -c '.recommendation' <<<"$JSON_OUT"))"
+[ "$(jq -r '.recommendation.deadline_at' <<<"$JSON_OUT")" = "$PR_WANT" ] \
+  && ok "projected ranking → the published deadline IS the projected instant, so the sentence and the order agree" \
+  || bad "projected ranking → deadline_at (want $PR_WANT, got: $(jq -c '.recommendation' <<<"$JSON_OUT"))"
+[ "$(jq -r '.recommendation.deadline_kind' <<<"$JSON_OUT")" = "reset" ] \
+  && ok "projected ranking → the deadline is named a reset, which is what it is" \
+  || bad "projected ranking → deadline_kind (got: $(jq -c '.recommendation' <<<"$JSON_OUT"))"
+
+# (e) THE SECOND ROUTE TO THE SAME BLANK. weekly_binding picks the highest weekly
+# `limits` entry; the SCOPED one carries resets_at: null while its utilization is
+# 0 and weekly_all carries the instant. When the scoped entry binds, the row used
+# to publish no reset at all even with real weekly usage on the seat.
+new_run scopednullreset
+mkdir -p "$RUN/.claude-pool/solo"
+printf '{"claudeAiOauth":{"accessToken":"TOK-SCOPED-NULL"}}' > "$RUN/.claude/.credentials.json"
+cp "$RUN/.claude/.credentials.json" "$RUN/.claude-pool/solo/.credentials.json"
+printf '{"oauthAccount":{"emailAddress":"solo@example.com"}}' > "$RUN/.claude-pool/solo/.claude.json"
+printf '{"oauthAccount":{"emailAddress":"solo@example.com"}}' > "$RUN/.claude.json"
+cat > "$RUN/cfg/accounts" <<EOF
+solo@example.com|$RUN/.claude-pool/solo
+EOF
+SN_ALL_R="$(iso_in +3d)"; SN_FIVE_R="$(iso_in +2H)"
+printf '{"five_hour":{"utilization":10.0,"resets_at":"%s"},
+ "seven_day":{"utilization":21.0,"resets_at":"%s"},
+ "limits":[{"kind":"session","group":"session","percent":10,"resets_at":"%s","scope":null},
+   {"kind":"weekly_all","group":"weekly","percent":21,"resets_at":"%s","scope":null},
+   {"kind":"weekly_scoped","group":"weekly","percent":47,"resets_at":null,
+    "scope":{"model":{"id":null,"display_name":"Fable"}}}]}' \
+  "$SN_FIVE_R" "$SN_ALL_R" "$SN_FIVE_R" "$SN_ALL_R" > "$RUN/state/usage-TOK-SCOPED-NULL.json"
+set +e
+JSON_OUT="$(FAKE_NEW_EMAIL=solo@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
+set -e
+SN_ROW="$(prow "solo@example.com" "$JSON_OUT")"
+[ "$(jq -r '[.weekly.kind, (.weekly.used_pct|tostring)] | join(" ")' <<<"$SN_ROW")" = "weekly_scoped 47" ] \
+  && ok "scoped null reset → the scoped entry BINDS and its 47% is the weekly figure (the fixture exercises the real path)" \
+  || bad "scoped null reset → scoped binds (got: $(jq -c '.weekly' <<<"$SN_ROW"))"
+[ "$(jq -r '.weekly.resets_at' <<<"$SN_ROW")" = "$SN_ALL_R" ] \
+  && ok "scoped null reset → weekly_all's instant fills in: a scoped cap shares the seat's weekly cadence" \
+  || bad "scoped null reset → weekly_all's instant is used (want $SN_ALL_R, got: $(jq -c '.weekly' <<<"$SN_ROW"))"
+[ "$(jq -r '.weekly.resets_at_projected' <<<"$SN_ROW")" = "null" ] \
+  && ok "scoped null reset → and it is a MEASURED instant, so nothing is projected" \
+  || bad "scoped null reset → no projection needed (got: $(jq -c '.weekly' <<<"$SN_ROW"))"
+
+# (f) the other half of the memory: a NON-EMPTY reading always updates wk_r_seen,
+# so the field tracks the seat's cadence forward instead of freezing on the first
+# instant this box ever saw.
+proj_fixture seenupdates "$PROJ_SEEN"
+SU_NEW_R="$(iso_in +4d)"
+printf '{"seven_day":{"utilization":30,"resets_at":"%s"},"five_hour":{"utilization":10,"resets_at":"%s"}}' \
+  "$SU_NEW_R" "$(iso_in +2H)" > "$RUN/state/usage-TOK-PROJ.json"
+set +e
+JSON_OUT="$(FAKE_NEW_EMAIL=fresh@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
+set -e
+SU_ROW="$(prow "fresh@example.com" "$JSON_OUT")"
+[ "$(jq -r '."fresh@example.com".wk_r_seen' "$RUN/cfg/usage-cache.json")" = "$SU_NEW_R" ] \
+  && ok "seen updates → a non-empty reading overwrites wk_r_seen, so the remembered cadence follows the seat" \
+  || bad "seen updates → wk_r_seen follows the newest instant (got: $(cat "$RUN/cfg/usage-cache.json"))"
+[ "$(jq -r '.weekly.resets_at_projected' <<<"$SU_ROW")" = "null" ] \
+  && ok "seen updates → with a real reset in hand nothing is projected" \
+  || bad "seen updates → no projection alongside a real reset (got: $(jq -c '.weekly' <<<"$SU_ROW"))"
+
+# (g) project_weekly's GUARDS, asserted on the function itself.
+#
+# Every guard but one is reachable through a fixture; the U_WKX one is not,
+# because an expired flag always travels with the stamp that produced it. A test
+# that cannot fail is worse than no test - it reports that a deleted guard is
+# still there - so this calls the function directly with the arrays set by hand,
+# which is also the only way to state what each guard is FOR.
+GUARD_CACHE="$ROOT/guard-cache.json"
+jq -n --arg wr "$PROJ_SEEN" \
+  '{"seen@example.com":{wk_u:"0.0",wk_r:"",se_u:"0.0",se_r:"",ts:"x",ts_epoch:"1",wk_r_seen:$wr}}' \
+  > "$GUARD_CACHE"
+# <weekly-used> <weekly-reset> <expired> -> the projected instant, or ""
+guard_case() {  # guard_case <wk_u> <wk_r> <wk_x>
+  bash -c '
+    source "$1" >/dev/null 2>&1
+    USAGE_CACHE="$2"
+    U_EMAIL=(seen@example.com); U_WKU=("$3"); U_WKR=("$4"); U_WKX=("$5")
+    project_weekly 0
+    printf "%s" "${U_WKP[0]}"
+  ' _ "$LIB" "$GUARD_CACHE" "$1" "$2" "$3" 2>/dev/null
+}
+[ "$(guard_case "0.0" "" 0)" = "$PROJ_WANT" ] \
+  && ok "guards → the control case DOES project (so a failure below is the guard, not the fixture)" \
+  || bad "guards → control projects (got: $(guard_case "0.0" "" 0), want $PROJ_WANT)"
+[ -z "$(guard_case "0.0" "" 1)" ] \
+  && ok "guards → an EXPIRED window is never projected: its number describes a window that no longer exists" \
+  || bad "guards → expired window projects (got: $(guard_case "0.0" "" 1))"
+[ -z "$(guard_case "0.0" "$(iso_in +3d)" 0)" ] \
+  && ok "guards → a MEASURED reset is never overwritten by an inference" \
+  || bad "guards → measured reset survives (got: $(guard_case "0.0" "$(iso_in +3d)" 0))"
+[ -z "$(guard_case "" "" 0)" ] \
+  && ok "guards → an INCOMPLETE window (no parseable utilization) is left unknown, not projected" \
+  || bad "guards → incomplete window projects (got: $(guard_case "" "" 0))"
+
+# --- 60. THE PROJECTED INSTANT IS MARKED WHEREVER IT IS PRINTED ---------------
+# recommendation_text's output is published VERBATIM as recommendation.reason in
+# `usage --json`, which cl and pocketmux read, so an unmarked projected instant
+# in that sentence is the same lie on the machine surface as on the human one -
+# and worse, because a parser cannot see the table's legend. Same for the
+# optimizer-pick line switch-auto prints, which is the only record of why an
+# unattended switch happened.
+#
+# It also pins the pair of fields that must AGREE: recommendation.weekly_fresh
+# and the picked row's own weekly.fresh. They stopped agreeing the moment the
+# projection gave an untouched window a deadline, because weekly_fresh was
+# derived from the deadline rather than from the window.
+new_run projreason
+mkdir -p "$RUN/.claude-pool/primary" "$RUN/.claude-pool/proj"
+printf '{"claudeAiOauth":{"accessToken":"TOK-PJ-PRIMARY"}}' > "$RUN/.claude/.credentials.json"
+cp "$RUN/.claude/.credentials.json" "$RUN/.claude-pool/primary/.credentials.json"
+printf '{"claudeAiOauth":{"accessToken":"TOK-PJ-PROJ"}}' > "$RUN/.claude-pool/proj/.credentials.json"
+printf '{"oauthAccount":{"emailAddress":"primary@example.com"}}' > "$RUN/.claude-pool/primary/.claude.json"
+printf '{"oauthAccount":{"emailAddress":"proj@example.com"}}'    > "$RUN/.claude-pool/proj/.claude.json"
+printf '{"oauthAccount":{"emailAddress":"primary@example.com"}}' > "$RUN/.claude.json"
+cat > "$RUN/cfg/accounts" <<EOF
+primary@example.com|$RUN/.claude-pool/primary
+proj@example.com|$RUN/.claude-pool/proj
+EOF
+jq -n --arg wr "$PROJ_SEEN" \
+  '{"proj@example.com":{wk_u:"18",wk_r:$wr,se_u:"5",se_r:"",ts:"x",ts_epoch:"1",wk_r_seen:$wr}}' \
+  > "$RUN/cfg/usage-cache.json"
+# primary: comfortable (so the mode is `floor` and the pick is a SWITCH), and a
+# real reset LATER than proj's projected one
+printf '{"seven_day":{"utilization":40,"resets_at":"%s"},"five_hour":{"utilization":10,"resets_at":"%s"}}' \
+  "$(iso_in +6d)" "$(iso_in +2H)" > "$RUN/state/usage-TOK-PJ-PRIMARY.json"
+printf '{"seven_day":{"utilization":0.0,"resets_at":null},"five_hour":{"utilization":0.0,"resets_at":null}}' \
+  > "$RUN/state/usage-TOK-PJ-PROJ.json"
+set +e
+OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --no-color 2>>"$ERRLOG")"
+JSON_OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
+SA_OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" switch-auto --dry-run 2>&1)"
+set -e
+PJ_REASON="$(jq -r '.recommendation.reason' <<<"$JSON_OUT")"
+[ "$(jq -r '.recommendation.email' <<<"$JSON_OUT")" = "proj@example.com" ] \
+  && ok "marked reason → the projected seat is the pick (the fixture is exercising the right branch)" \
+  || bad "marked reason → picks proj (got: $(jq -c '.recommendation' <<<"$JSON_OUT"))"
+grep -q 'weekly window has not started yet' <<<"$PJ_REASON" \
+  && ok "marked reason → the sentence KEEPS the fact that the window has not started" \
+  || bad "marked reason → keeps the fresh fact (got: $PJ_REASON)"
+grep -qE 'lost ~[0-9]{2}:[0-9]{2}' <<<"$PJ_REASON" \
+  && ok "marked reason → and names the projected deadline with a leading ~, never bare" \
+  || bad "marked reason → marks the instant (got: $PJ_REASON)"
+# ⚠️ SCOPED TO THE PICK'S OWN CLAUSE. The sentence also states the ACTIVE
+# account's standing, and that instant is a real measurement which must stay
+# unmarked - marking everything would be as wrong as marking nothing.
+PJ_PICK_CLAUSE="${PJ_REASON%% The active account*}"
+! grep -qE '(^|[^~])[0-9]{2}:[0-9]{2} [A-Za-z]{3} ' <<<"$PJ_PICK_CLAUSE" \
+  && ok "marked reason → no UNMARKED instant survives in the clause about the pick itself" \
+  || bad "marked reason → an unmarked instant is still in the pick clause (got: $PJ_PICK_CLAUSE)"
+grep -qE 'resets [0-9]{2}:[0-9]{2} [A-Za-z]{3} ' <<<"${PJ_REASON#*The active account}" \
+  && ok "marked reason → the ACTIVE account's own real reset stays UNMARKED (a measurement is not an inference)" \
+  || bad "marked reason → the active account's real reset must not be marked (got: $PJ_REASON)"
+[ "$(jq -r '.recommendation.deadline_projected' <<<"$JSON_OUT")" = "true" ] \
+  && ok "marked reason (json) → deadline_projected says the instant is an inference" \
+  || bad "marked reason (json) → deadline_projected (got: $(jq -c '.recommendation' <<<"$JSON_OUT"))"
+[ "$(jq -r '.recommendation.weekly_fresh' <<<"$JSON_OUT")" = "true" ] \
+  && ok "marked reason (json) → weekly_fresh stays TRUE: a projection describes the window, it does not start it" \
+  || bad "marked reason (json) → weekly_fresh (got: $(jq -c '.recommendation' <<<"$JSON_OUT"))"
+[ "$(jq -r '.recommendation.weekly_fresh' <<<"$JSON_OUT")" \
+  = "$(jq -r '.accounts[] | select(.email=="proj@example.com") | .weekly.fresh' <<<"$JSON_OUT")" ] \
+  && ok "marked reason (json) → recommendation.weekly_fresh AGREES with the picked row's own weekly.fresh" \
+  || bad "marked reason (json) → the two fresh fields disagree about one window"
+grep -q 'lost ~' <<<"$OUT" \
+  && ok "marked reason → the human table prints the same marked sentence" \
+  || bad "marked reason → human table (got: $OUT)"
+grep -qE 'optimizer pick: proj@example\.com .*weekly resets ~[0-9]{4}-' <<<"$SA_OUT" \
+  && ok "marked reason → switch-auto's pick line marks it too (the only record of an unattended switch)" \
+  || bad "marked reason → switch-auto pick line (got: $SA_OUT)"
+
+# --- 61. THE LEGEND FOLLOWS THE PAGE, NOT THE POOL ----------------------------
+# The default table prints a weekly reset for the ACTIVE row only: an
+# ALTERNATIVES or UNAVAILABLE row prints no reset at all. So a pool whose IDLE
+# seat projects while the ACTIVE seat has a real instant has no `~` anywhere on
+# the page, and a legend explaining one is noise that trains the reader to skip
+# legends. --verbose is the case where every row can show its own mark.
+new_run projlegend
+mkdir -p "$RUN/.claude-pool/primary" "$RUN/.claude-pool/idle"
+printf '{"claudeAiOauth":{"accessToken":"TOK-PL-PRIMARY"}}' > "$RUN/.claude/.credentials.json"
+cp "$RUN/.claude/.credentials.json" "$RUN/.claude-pool/primary/.credentials.json"
+printf '{"claudeAiOauth":{"accessToken":"TOK-PL-IDLE"}}' > "$RUN/.claude-pool/idle/.credentials.json"
+printf '{"oauthAccount":{"emailAddress":"primary@example.com"}}' > "$RUN/.claude-pool/primary/.claude.json"
+printf '{"oauthAccount":{"emailAddress":"idle@example.com"}}'    > "$RUN/.claude-pool/idle/.claude.json"
+printf '{"oauthAccount":{"emailAddress":"primary@example.com"}}' > "$RUN/.claude.json"
+cat > "$RUN/cfg/accounts" <<EOF
+primary@example.com|$RUN/.claude-pool/primary
+idle@example.com|$RUN/.claude-pool/idle
+EOF
+jq -n --arg wr "$PROJ_SEEN" \
+  '{"idle@example.com":{wk_u:"18",wk_r:$wr,se_u:"5",se_r:"",ts:"x",ts_epoch:"1",wk_r_seen:$wr}}' \
+  > "$RUN/cfg/usage-cache.json"
+printf '{"seven_day":{"utilization":40,"resets_at":"%s"},"five_hour":{"utilization":10,"resets_at":"%s"}}' \
+  "$(iso_in +2d)" "$(iso_in +2H)" > "$RUN/state/usage-TOK-PL-PRIMARY.json"
+printf '{"seven_day":{"utilization":0.0,"resets_at":null},"five_hour":{"utilization":0.0,"resets_at":null}}' \
+  > "$RUN/state/usage-TOK-PL-IDLE.json"
+set +e
+OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --no-color 2>>"$ERRLOG")"
+VOUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --no-color --verbose 2>>"$ERRLOG")"
+JSON_OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
+set -e
+[ "$(jq -r '.accounts[] | select(.email=="idle@example.com") | .weekly.resets_at_projected' <<<"$JSON_OUT")" != "null" ] \
+  && ok "legend gate → the idle seat really does project (the fixture is doing what it claims)" \
+  || bad "legend gate → idle seat projects (got: $JSON_OUT)"
+! grep -q '~ projected' <<<"$OUT" \
+  && ok "legend gate → the DEFAULT table prints no legend: its only reset row (the active one) is measured" \
+  || bad "legend gate → default table must not print a legend for a mark it never rendered (got: $OUT)"
+! grep -q '~' <<<"$(active_block <<<"$OUT")" \
+  && ok "legend gate → and there is indeed no ~ on the page to explain" \
+  || bad "legend gate → the active block carries a ~ (got: $(active_block <<<"$OUT"))"
+grep -q '~ projected' <<<"$VOUT" \
+  && ok "legend gate → --verbose DOES print it, because that is where every row shows its own reset" \
+  || bad "legend gate → verbose legend (got: $VOUT)"
+[ "$(grep -c '~ projected' <<<"$VOUT")" = 1 ] \
+  && ok "legend gate → exactly ONE legend line, however many rows project" \
+  || bad "legend gate → one legend line (got $(grep -c '~ projected' <<<"$VOUT"))"
+
+# --- 62. the SHARED cache-row merge, and its failure being audible ------------
+# rota_cache_merge_row lives in rota-ranking.sh because there are TWO writers
+# (rota-engine.sh's cache_flush, rota-keeper.sh's per-tick write) and a copy in
+# each is how they come to disagree about a field - which matters most for the
+# keeper, running every minute, because it would win every race.
+merge() { bash -c 'source "$1"; shift; rota_cache_merge_row "$@"' _ "$ROOT/rota-ranking.sh" "$@"; }
+M_EMPTY='{}'
+M1="$(merge "$M_EMPTY" a@example.com 10 "2026-09-01T10:00:00+00:00" 5 "" ts 1 fa)"
+[ "$(jq -r '."a@example.com".wk_r_seen' <<<"$M1")" = "2026-09-01T10:00:00+00:00" ] \
+  && ok "merge → a non-empty reading is remembered in wk_r_seen" \
+  || bad "merge → remembers a real instant (got: $M1)"
+M2="$(merge "$M1" a@example.com 0 "" 0 "" ts 2 fa)"
+[ "$(jq -r '."a@example.com".wk_r_seen' <<<"$M2")" = "2026-09-01T10:00:00+00:00" ] \
+  && [ "$(jq -r '."a@example.com".wk_r' <<<"$M2")" = "" ] \
+  && ok "merge → an EMPTY reading updates wk_r and leaves wk_r_seen standing" \
+  || bad "merge → empty reading must not erase the memory (got: $M2)"
+M3="$(merge '{"a@example.com":{"wk_u":"9","wk_r":"2026-08-30T09:00:00+00:00"}}' \
+      a@example.com 0 "" 0 "" ts 3 fa)"
+[ "$(jq -r '."a@example.com".wk_r_seen' <<<"$M3")" = "2026-08-30T09:00:00+00:00" ] \
+  && ok "merge → a pre-field row SEEDS wk_r_seen from its own wk_r (the backfill)" \
+  || bad "merge → backfill from wk_r (got: $M3)"
+M4="$(merge '{}' a@example.com 0 "" 0 "" ts 4 fa)"
+[ "$(jq -r '."a@example.com" | has("wk_r_seen")' <<<"$M4")" = "false" ] \
+  && ok "merge → nothing ever seen means NO key, never an empty string standing in for one" \
+  || bad "merge → absent key when nothing seen (got: $M4)"
+! merge 'not json at all {{{' a@example.com 0 "" 0 "" ts 5 fa >/dev/null 2>&1 \
+  && ok "merge → refuses (non-zero) rather than answering with something it did not merge" \
+  || bad "merge → must fail on unparseable input"
+[ -z "$(merge 'not json at all {{{' a@example.com 0 "" 0 "" ts 5 fa 2>/dev/null)" ] \
+  && ok "merge → and prints NOTHING on failure, so a caller cannot mistake junk for a merge" \
+  || bad "merge → silent on failure"
+# ⚠️ A FROZEN CACHE MUST NOT BE A SILENT ONE. If jq ever rejects the merge, every
+# field stops updating, not just the new one, and the numbers keep rendering as
+# though they were current. Once per run, naming the file.
+WARN_OUT="$(bash -c 'source "$1" >/dev/null 2>&1; USAGE_CACHE=/tmp/rota-test-cache.json; cache_merge_warn; cache_merge_warn' _ "$LIB" 2>&1 >/dev/null)"
+[ "$(grep -c 'could NOT update the usage cache' <<<"$WARN_OUT")" = 1 ] \
+  && ok "merge → a failed merge warns on stderr exactly ONCE per run, not once per account" \
+  || bad "merge → one warning per run (got: $WARN_OUT)"
+grep -q '/tmp/rota-test-cache.json' <<<"$WARN_OUT" \
+  && ok "merge → and the warning names the file, so the next step is obvious" \
+  || bad "merge → warning names the cache file (got: $WARN_OUT)"
+
+# --- 60. dormant seat × 429: the wake the operator used to have to remember -----
+# tommy, 2026-08-25 → 09-01: nothing touched the seat after its weekly window
+# rolled, the usage API 429'd its in-date token six days straight, the skip
+# filed it under "live sessions share this token", and the row sat UNMEASURED
+# until a human ran `CLAUDE_CONFIG_DIR=~/.claude-pool/tommy claude -p … "ok"`
+# by hand — which cured it instantly. The engine now spends that wake itself
+# when the "shared" theory is uncorroborated: in-date 429, NO live pin on the
+# dir, nothing current in the cache. Once per WAKE_STAMP_TTL per seat, so a
+# stuck seat costs one call, not one per keeper tick (the unbounded version of
+# this is what got KEEPALIVE killed on 2026-08-16).
+new_run dormantwake
+mkdir -p "$RUN/.claude-pool/live" "$RUN/.claude-pool/dormant" "$RUN/.claude-pool/stuck" "$RUN/.claude-pool/parked"
+cred_json TOK-DW-LIVE > "$RUN/.claude/.credentials.json"
+cp "$RUN/.claude/.credentials.json" "$RUN/.claude-pool/live/.credentials.json"
+printf '{"oauthAccount":{"emailAddress":"live@example.com"}}' > "$RUN/.claude-pool/live/.claude.json"
+printf '{"oauthAccount":{"emailAddress":"live@example.com"}}' > "$RUN/.claude.json"
+printf '{"seven_day":{"utilization":10,"resets_at":"%s"},"five_hour":{"utilization":10,"resets_at":"%s"}}' \
+  "$(iso_in +2d)" "$(iso_in +2H)" > "$RUN/state/usage-TOK-DW-LIVE.json"
+# dormant: in-date 429, no pin, no cache → ONE wake; the wake rotates the
+# credential (rotate-<base>, the healthy CLI behaviour) and the refetch with
+# the rotated token answers 200, so the row comes back LIVE in the same run
+cred_json TOK-DW-DORMANT > "$RUN/.claude-pool/dormant/.credentials.json"
+printf '{"oauthAccount":{"emailAddress":"dormant@example.com"}}' > "$RUN/.claude-pool/dormant/.claude.json"
+printf '429' > "$RUN/state/usage-TOK-DW-DORMANT.code"
+cred_json TOK-DW-WOKE > "$RUN/state/rotate-dormant"
+printf '{"seven_day":{"utilization":0,"resets_at":"%s"},"five_hour":{"utilization":0,"resets_at":"%s"}}' \
+  "$(iso_in +4d)" "$(iso_in +5H)" > "$RUN/state/usage-TOK-DW-WOKE.json"
+# stuck: same dormant shape but the wake cures nothing (still 429) → woken
+# ONCE, the reason says a wake was spent, and the stamp stops the next run
+cred_json TOK-DW-STUCK > "$RUN/.claude-pool/stuck/.credentials.json"
+printf '{"oauthAccount":{"emailAddress":"stuck@example.com"}}' > "$RUN/.claude-pool/stuck/.claude.json"
+printf '429' > "$RUN/state/usage-TOK-DW-STUCK.code"
+# parked: the dormant shape on a RESERVED seat → never woken from this box
+cred_json TOK-DW-PARKED > "$RUN/.claude-pool/parked/.credentials.json"
+printf '{"oauthAccount":{"emailAddress":"parked@example.com"}}' > "$RUN/.claude-pool/parked/.claude.json"
+printf '429' > "$RUN/state/usage-TOK-DW-PARKED.code"
+touch "$RUN/.claude-pool/parked/RESERVED"
+cat > "$RUN/cfg/accounts" <<EOF
+live@example.com|$RUN/.claude-pool/live
+dormant@example.com|$RUN/.claude-pool/dormant
+stuck@example.com|$RUN/.claude-pool/stuck
+parked@example.com|$RUN/.claude-pool/parked
+EOF
+run_usage
+[ "$(grep -c '^dormant$' "$RUN/state/nudges" 2>/dev/null || echo 0)" -eq 1 ] \
+  && ok "dormant × 429 → the unpinned in-date seat IS woken, exactly once" \
+  || bad "dormant × 429 → must wake once (nudges: $(cat "$RUN/state/nudges" 2>/dev/null || echo none))"
+DW_JSON="$(FAKE_NEW_EMAIL=live@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
+DW_DORMANT="$(prow dormant@example.com "$DW_JSON")"
+[ "$(jq -r '.quota_data' <<<"$DW_DORMANT")" = "live" ] \
+  && ok "dormant × 429 → after the wake the row is measured LIVE in the same run, no human in the loop" \
+  || bad "dormant × 429 → row must be live (got: $DW_DORMANT)"
+[ "$(grep -c '^stuck$' "$RUN/state/nudges" 2>/dev/null || echo 0)" -eq 1 ] \
+  && ok "dormant × 429 → a seat the wake does not cure is still only woken once" \
+  || bad "dormant × 429 → stuck must be woken once (nudges: $(cat "$RUN/state/nudges" 2>/dev/null || echo none))"
+# the --json call is itself a fresh collect, so by now the stamp is set and the
+# reason reads "already spent"; either wording is honest, the banned one is the
+# uncorroborated "live sessions share this token"
+DW_STUCK="$(prow stuck@example.com "$DW_JSON")"
+grep -q 'wake' <<<"$(jq -r '.stale_reason' <<<"$DW_STUCK")" \
+  && ! grep -q 'live sessions share' <<<"$(jq -r '.stale_reason' <<<"$DW_STUCK")" \
+  && ok "dormant × 429 → the stuck reason names the spent wake, never 'live sessions share this token' with nothing pinned" \
+  || bad "dormant × 429 → honest stuck reason (got: $(jq -r '.stale_reason' <<<"$DW_STUCK"))"
+! grep -q '^parked$' "$RUN/state/nudges" 2>/dev/null \
+  && ok "dormant × 429 → a reserved seat in the dormant shape is still never woken from this box" \
+  || bad "dormant × 429 → reserved must not wake (nudges: $(cat "$RUN/state/nudges"))"
+# stamps are keyed by the seat's LABEL (its email in the accounts file), the
+# same key dead-refresh markers use
+[ -f "$RUN/cfg/wake-stamp/dormant@example.com" ] && [ -f "$RUN/cfg/wake-stamp/stuck@example.com" ] \
+  && [ ! -f "$RUN/cfg/wake-stamp/parked@example.com" ] \
+  && ok "dormant × 429 → wake stamps exist for the two woken seats and only those" \
+  || bad "dormant × 429 → stamps (got: $(ls "$RUN/cfg/wake-stamp" 2>/dev/null || echo none))"
+# second run inside the TTL: dormant now measures live off its rotated token,
+# stuck is NOT woken again, and its reason says a wake was already spent
+run_usage
+[ "$(grep -c '^stuck$' "$RUN/state/nudges" 2>/dev/null || echo 0)" -eq 1 ] \
+  && [ "$(grep -c '^dormant$' "$RUN/state/nudges" 2>/dev/null || echo 0)" -eq 1 ] \
+  && ok "dormant × 429 → a second run within the TTL spends NO further wake on either seat" \
+  || bad "dormant × 429 → no re-wake within TTL (nudges: $(cat "$RUN/state/nudges" 2>/dev/null || echo none))"
+DW_JSON2="$(FAKE_NEW_EMAIL=live@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
+DW_STUCK2="$(prow stuck@example.com "$DW_JSON2")"
+grep -q 'already spent' <<<"$(jq -r '.stale_reason' <<<"$DW_STUCK2")" \
+  && ok "dormant × 429 → the second run's stuck reason says the wake was already spent, with the TTL" \
+  || bad "dormant × 429 → stamped reason (got: $(jq -r '.stale_reason' <<<"$DW_STUCK2"))"
 
 restore_home
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
