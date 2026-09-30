@@ -767,6 +767,89 @@ KP="$(keeper_pick)"
   && ok "one ranking → and the log calls it a reset when the reset is what bound it" \
   || bad "one ranking → reset-bound pick must not claim a seat end (log: $(grep auto-switch "$RUN/cfg/keeper.log" | tail -1))"
 
+# ── 5d. A SEAT THAT HAS ALREADY ENDED IS NOT A TARGET, IT IS THE TOP-RANKED ONE ─
+#
+# ⚠️ THE ORDERING TURNS THIS SHAPE INTO ITS OWN WORST CASE, WHICH IS WHY IT NEEDS
+# ITS OWN GUARD RATHER THAN "the deadline handles it". min(weekly reset, seat
+# end) means a seat whose end date is in the PAST carries the earliest deadline
+# in the pool, so both pickers rank it FIRST, most urgent - use-it-or-lose-it
+# aimed at a seat nobody can use. Nothing else in either eligibility list catches
+# it: the credential is complete, the refresh chain is alive, and the row can
+# still report quota.
+#
+# LIVE ON THE REAL POOL, 2026-09-07. thea.hawk@tomahawk.vc ended 6 Sep. On the
+# 7th `rota billing` printed "USE NEXT rota switch thea ... its weekly window
+# resets first", and all six live tmux panes on ballito were restarted onto a
+# seat that answers every request with "Your organization has disabled Claude
+# subscription access for Claude Code".
+#
+# The fixture makes the two rules disagree by construction. wk ended YESTERDAY
+# and its weekly window resets LAST; team resets in 3 days and never ends. On the
+# deadline alone wk wins outright; eligible-only, the pick has to fall to team.
+mk_pool kended
+pair_fixture alpha   91 50 "$(iso_in +2H)" "$(iso_in +4d)"   # the claim, over the wall
+pair_fixture wk      40 10 "$(iso_in +2H)" "$(iso_in +6d)"   # ENDED yesterday, resets last
+pair_fixture team    40 10 "$(iso_in +2H)" "$(iso_in +3d)"   # the only real candidate
+pair_fixture primary 40 10 "$(iso_in +2H)" "$(iso_in +5d)"
+seat_fixture "wk:cancelled:$(date -u -v-1d '+%Y-%m-%d')"
+EP="$(engine_pick)"
+run_keeper "${keeper_env[@]}"
+KP="$(keeper_pick)"
+[ "$EP" != wk ] && [ "$KP" != wk ] \
+  && ok "ended seat → neither picker offers a seat whose end date has passed, though it ranks soonest" \
+  || bad "ended seat → must never be picked (engine: ${EP:-none}, keeper: ${KP:-none})"
+[ "$EP" = team ] && [ "$KP" = team ] \
+  && ok "ended seat → and both fall through to the soonest ELIGIBLE seat, in agreement" \
+  || bad "ended seat → both should pick team (engine: ${EP:-none}, keeper: ${KP:-none})"
+
+# ⚠️ AND THE END DATE IS THE SEAT'S LAST WORKING DAY, NOT ITS FIRST DEAD ONE.
+# Measured on the same incident: thea served requests through 6 Sep, its stated
+# end date, and refused them on the 7th. So the compare is STRICTLY before today;
+# a seat ending TODAY is both eligible and the most urgent thing in the pool,
+# and retiring it a day early throws away the one window that cannot be had back.
+mk_pool kendstoday
+pair_fixture alpha   91 50 "$(iso_in +2H)" "$(iso_in +4d)"
+pair_fixture wk      40 10 "$(iso_in +2H)" "$(iso_in +6d)"   # ends TODAY, resets last
+pair_fixture team    40 10 "$(iso_in +2H)" "$(iso_in +3d)"
+pair_fixture primary 40 10 "$(iso_in +2H)" "$(iso_in +5d)"
+seat_fixture "wk:cancelled:$(date '+%Y-%m-%d')"
+EP="$(engine_pick)"
+run_keeper "${keeper_env[@]}"
+KP="$(keeper_pick)"
+[ "$EP" = wk ] && [ "$KP" = wk ] \
+  && ok "ended seat → a seat ending TODAY is still spendable, and still the most urgent" \
+  || bad "ended seat → ends-today must stay eligible (engine: ${EP:-none}, keeper: ${KP:-none})"
+
+# ── 5e. THE CLAIM ITSELF ENDED: a wall no percentage can express ─────────────
+#
+# ⚠️ REFUSING TO PICK AN ENDED SEAT DOES NOT COVER THIS. The seat was picked
+# while it was alive and ended UNDERNEATH the claim, which is the actual
+# 2026-09-07 sequence - thea was the active account on the 6th and simply stopped
+# working on the 7th. The keeper's trigger is "the claim's utilization ≥ 90%",
+# and an ended seat does not report 100%: it reports NOTHING, so the trigger was
+# never evaluated and the pool held a dead claim tick after tick while every pane
+# pinned to it failed.
+#
+# The fixture withholds alpha's usage entirely - no numbers at all, the shape an
+# ended seat really has - so the ONLY thing that can fire the switch is the end
+# date. team resets soonest among the eligible, so it is the target.
+mk_pool kclaimended
+pair_fixture wk      40 10 "$(iso_in +2H)" "$(iso_in +6d)"
+pair_fixture team    40 10 "$(iso_in +2H)" "$(iso_in +3d)"
+pair_fixture primary 40 10 "$(iso_in +2H)" "$(iso_in +5d)"
+seat_fixture "alpha:cancelled:$(date -u -v-1d '+%Y-%m-%d')"
+run_keeper "${keeper_env[@]}"
+KP="$(keeper_pick)"
+[ -n "$KP" ] && [ "$KP" != alpha ] \
+  && ok "ended claim → the keeper switches off a claim whose seat ended, with no utilization to trigger on" \
+  || bad "ended claim → must switch away from an ended claim (keeper: ${KP:-none})"
+[ "$KP" = team ] \
+  && ok "ended claim → and it lands on the soonest-expiring eligible seat" \
+  || bad "ended claim → target should be team (keeper: ${KP:-none})"
+grep -q 'ENDED' "$RUN/cfg/keeper.log" \
+  && ok "ended claim → the log names the end date, not a threshold the claim never hit" \
+  || bad "ended claim → log must name the real trigger (log: $(grep auto-switch "$RUN/cfg/keeper.log" | tail -1))"
+
 # ⚠️ THE "NOTHING IS EXPIRING" SENTINEL MUST RANK LAST, NEVER FIRST. It is the
 # empty string, and an empty string sorts BEFORE every real ISO timestamp under
 # a string compare, so the healthiest seat in the pool would otherwise be
