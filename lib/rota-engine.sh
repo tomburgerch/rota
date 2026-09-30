@@ -529,7 +529,10 @@
 #                                     accounts). With NO accounts file it prints how to
 #                                     create one (config/accounts.example is the
 #                                     template) and exits 2. Creates and touches NO
-#                                     credential.
+#                                     credential. Also adds Claude Code's first-run
+#                                     state to each seat's .claude.json (onboarding
+#                                     done, release notes seen, ~/code trusted) when
+#                                     missing, so a seat opens straight on the prompt.
 #   rota failover roster              Print the roster (the accounts file), one
 #                                     "email|dir" per line. Read-only; the pool
 #                                     keeper's displaced-login detection consumes it.
@@ -1120,6 +1123,30 @@ refresh_known_dead() {  # refresh_known_dead <label> <credentials-json-file>
   [[ -f "$m" ]] || return 1
   fp="$(cred_fingerprint "${2:-}")" || return 1
   [[ -n "$fp" && "$fp" == "$(cat "$m" 2>/dev/null || true)" ]]
+}
+
+# ── dormant-seat wake stamps ─────────────────────────────────────────────────
+# A seat nobody has used since its weekly window rolled answers the usage API
+# with a 429 on a token the file says is in date, and used to sit UNMEASURED
+# until a human remembered the manual haiku wake (tommy, 2026-08-25 → 09-01:
+# six days of "not measured this run"). collect_usage now spends that wake
+# itself — but at most once per seat per WAKE_STAMP_TTL, so a keeper ticking
+# every few minutes can never machine-gun nudges at a seat that stays stuck.
+# Unbounded periodic nudging is exactly what got the keeper's KEEPALIVE killed
+# on 2026-08-16 (it husked credentials and rotated nothing); the stamp is the
+# difference between "wake it once and look" and that.
+WAKE_STAMP_TTL="${ROTA_WAKE_STAMP_TTL:-21600}"   # seconds; 6h
+wake_stamp() { printf '%s' "$CFG_DIR/wake-stamp/$1"; }
+wake_stamp_fresh() {  # wake_stamp_fresh <label> → 0 when a wake ran within the TTL
+  local m mt; m="$(wake_stamp "${1:-}")"
+  [[ -f "$m" ]] || return 1
+  mt="$(stat -f %m "$m" 2>/dev/null || stat -c %Y "$m" 2>/dev/null)" || return 1
+  (( $(date +%s) - mt < WAKE_STAMP_TTL ))
+}
+wake_stamp_put() {  # wake_stamp_put <label>
+  local m; m="$(wake_stamp "${1:-}")"
+  mkdir -p "$(dirname "$m")" 2>/dev/null || return 0
+  : > "$m" 2>/dev/null || true
 }
 
 # ── self-heal on read ────────────────────────────────────────────────────────
@@ -1851,6 +1878,92 @@ then re-run: rota pool-init
 EOF
 }
 
+# ── first-run state: a seat must start straight into the prompt (t_wvsjwh) ──
+# A pool dir that was only ever logged in (never started interactively) makes
+# the next `claude` open on Claude Code's first-run screens: the theme picker,
+# the onboarding, "do you trust this folder", "what's new". Harmless at a desk,
+# a dead end from Dazzle on a phone. Measured on durban 2026-09-25: all three
+# seats opened on the theme picker until exactly these keys were added (copied
+# from ballito's seats, which start clean), and nothing else was needed:
+#   hasCompletedOnboarding = true
+#   lastOnboardingVersion, lastReleaseNotesSeen = the installed claude version
+#   projects[<dir>].hasTrustDialogAccepted = true  for each ROTA_TRUST_DIRS dir
+# Only MISSING keys are added, so a seat that already starts clean is not
+# rewritten at all, and oauthAccount / credentials are never read or touched.
+# The theme itself lives in the shared settings.json, not here.
+# ROTA_TRUST_DIRS: colon-separated dirs to pre-trust (default ~/code, when it
+# exists). ROTA_CLAUDE_VERSION overrides the version lookup (tests).
+# The version is READ off the install, never by running claude: pool-init must
+# not start a claude process (the keeper suite pins "no claude call on an empty
+# pool"). Native installs keep one dir per version; npm/Homebrew installs carry
+# it in package.json. Unknown → the version keys are skipped, the rest is set.
+first_run_claude_version() {
+  local v="${ROTA_CLAUDE_VERSION:-}" pkg p
+  if [[ -z "$v" && -d "$HOME/.local/share/claude/versions" ]]; then
+    v="$(find "$HOME/.local/share/claude/versions" -mindepth 1 -maxdepth 1 -exec basename {} \; 2>/dev/null \
+      | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)" || v=""
+  fi
+  if [[ -z "$v" ]]; then
+    for p in /opt/homebrew /usr/local; do
+      pkg="$p/lib/node_modules/@anthropic-ai/claude-code/package.json"
+      [[ -f "$pkg" ]] || continue
+      v="$(sed -n 's/^[[:space:]]*"version":[[:space:]]*"\([0-9.]*\)".*/\1/p' "$pkg" | head -1)"
+      [[ -n "$v" ]] && break
+    done
+  fi
+  [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && printf '%s' "$v"
+  return 0
+}
+
+# seed_first_run <pool dir> <version or ""> → prints what it set, or nothing.
+seed_first_run() {
+  local dir="$1" version="$2"
+  command -v python3 >/dev/null 2>&1 || return 0
+  python3 - "$dir/.claude.json" "$version" "${ROTA_TRUST_DIRS-$HOME/code}" <<'PY'
+import json, os, sys, tempfile
+path, version, trust = sys.argv[1], sys.argv[2], sys.argv[3]
+data = {}
+if os.path.exists(path):
+    with open(path) as f:
+        text = f.read()
+    try:
+        data = json.loads(text) if text.strip() else {}
+    except ValueError:
+        print(f"note: {path} is not valid JSON, left alone", file=sys.stderr)
+        sys.exit(0)
+changed = []
+def put(key, value):
+    if data.get(key) in (None, False, ""):
+        data[key] = value
+        changed.append(key)
+put("hasCompletedOnboarding", True)
+if version:
+    put("lastOnboardingVersion", version)
+    put("lastReleaseNotesSeen", version)
+projects = data.setdefault("projects", {})
+for d in [d for d in trust.split(":") if d and os.path.isdir(d)]:
+    entry = projects.setdefault(d, {})
+    if entry.get("hasTrustDialogAccepted") is not True:
+        entry["hasTrustDialogAccepted"] = True
+        changed.append(f"trust {d}")
+if not changed:
+    sys.exit(0)
+mode = os.stat(path).st_mode & 0o777 if os.path.exists(path) else 0o600
+fd, tmp = tempfile.mkstemp(prefix=".claude.json.seed.", dir=os.path.dirname(path))
+try:
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+except BaseException:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+    raise
+print(", ".join(changed))
+PY
+}
+
 cmd_pool_init() {
   [[ $# -eq 0 ]] || die "usage: rota failover pool-init"
   if [[ ! -f "$ACCOUNTS_FILE" ]]; then
@@ -1858,10 +1971,12 @@ cmd_pool_init() {
     exit 2
   fi
   load_accounts
-  local made=0 linked=0 seats=0
+  local made=0 linked=0 seats=0 seeded=0
   mkdir -p "$CFG_DIR" "$POOL_ROOT" "$HOME/.claude"
+  local version
+  version="$(first_run_claude_version)"
 
-  local i dir label t src dst
+  local i dir label t src dst set_keys
   for i in "${!DIRS[@]}"; do
     dir="${DIRS[$i]}"; label="${LABELS[$i]}"
     # the shared ~/.claude is the pointer slot, not a seat: a row that maps an
@@ -1896,14 +2011,19 @@ cmd_pool_init() {
         linked=$((linked + 1))
       fi
     done
+    set_keys="$(seed_first_run "$dir" "$version")"
+    if [[ -n "$set_keys" ]]; then
+      seeded=$((seeded + 1))
+      printf 'first-run state for %s: %s\n' "$label" "$set_keys"
+    fi
   done
 
-  if (( made + linked == 0 )); then
-    printf 'pool-init: already initialized: %d pool dir(s) from %s, links healthy. Nothing changed.\n' \
+  if (( made + linked + seeded == 0 )); then
+    printf 'pool-init: already initialized: %d pool dir(s) from %s, links healthy, first-run state set. Nothing changed.\n' \
       "$seats" "$(tilde "$ACCOUNTS_FILE")"
   else
-    printf 'pool-init: %d dir(s) created, %d link(s) made for %d seat(s) in %s. No credentials were created or touched.\n' \
-      "$made" "$linked" "$seats" "$(tilde "$ACCOUNTS_FILE")"
+    printf 'pool-init: %d dir(s) created, %d link(s) made, %d seat(s) given first-run state, for %d seat(s) in %s. No credentials were created or touched.\n' \
+      "$made" "$linked" "$seeded" "$seats" "$(tilde "$ACCOUNTS_FILE")"
     printf 'Next: `rota adopt-shared` moves this box'"'"'s shared login into its pool dir; every OTHER seat needs one browser login: rota login <seat>\n'
   fi
   return 0
@@ -2104,10 +2224,15 @@ usage_field() { printf '%s' "$1" | jq -r "$2 // empty" 2>/dev/null || true; }
 # WB_ALL_RESET is separate on purpose: the identity fingerprint compares weekly reset
 # MINUTES across accounts, which is only meaningful between the same kind of window, so
 # it keeps using seven_day/weekly_all rather than whatever kind happens to bind.
-WB_PCT=""; WB_RESET=""; WB_KIND=""; WB_SCOPE=""; WB_ALL_RESET=""
+#
+# WB_ALL_PCT is the weekly_all entry's own percent (2026-09-26). The binding stays the
+# max, which is right for the ranking, but a SCOPED binding at 100% (the Fable cap
+# spent) says nothing about the all-model allowance: the seat still runs Opus. Display
+# surfaces need that second number to say so instead of calling the seat spent.
+WB_PCT=""; WB_RESET=""; WB_KIND=""; WB_SCOPE=""; WB_ALL_RESET=""; WB_ALL_PCT=""
 weekly_binding() {  # weekly_binding <usage-json>
   local json="${1:-}" row
-  WB_PCT=""; WB_RESET=""; WB_KIND=""; WB_SCOPE=""; WB_ALL_RESET=""
+  WB_PCT=""; WB_RESET=""; WB_KIND=""; WB_SCOPE=""; WB_ALL_RESET=""; WB_ALL_PCT=""
   [[ -n "$json" ]] || return 0
   command -v jq >/dev/null 2>&1 || return 0
   # `try … catch null` guards a scope that is present but not the expected object shape
@@ -2125,10 +2250,11 @@ weekly_binding() {  # weekly_binding <usage-json>
         (if $b == null then "" else
            (((try $b.scope.model.display_name catch null)
              // (try $b.scope.name catch null)) // "") end),
-        (($all.resets_at) // "") ]
+        (($all.resets_at) // ""),
+        (if $all == null then "" else ($all.percent|tostring) end) ]
     | join("\u001f")' 2>/dev/null || true)"
   [[ -n "$row" ]] || return 0
-  IFS=$'\x1f' read -r WB_PCT WB_RESET WB_KIND WB_SCOPE WB_ALL_RESET <<<"$row"
+  IFS=$'\x1f' read -r WB_PCT WB_RESET WB_KIND WB_SCOPE WB_ALL_RESET WB_ALL_PCT <<<"$row"
 }
 
 # "  (binding: Opus)" for a SCOPED binding limit, "" otherwise, so a weekly number that
@@ -2902,7 +3028,7 @@ peer_fill() {
       U_WKR[i]="$p_wkr"; U_SER[i]="$p_ser"; U_SDR[i]="$p_wkr"
       # the peer publishes the binding NUMBER but not which limit produced it, so
       # the row carries no scope annotation rather than a borrowed or invented one
-      U_WKK[i]=""; U_WKS[i]=""
+      U_WKK[i]=""; U_WKS[i]=""; U_WAU[i]=""; U_WAR[i]=""
       U_WKX[i]=0; U_SEX[i]=0
       window_expired "$p_wkr" && U_WKX[i]=1
       window_expired "$p_ser" && U_SEX[i]=1
@@ -2938,6 +3064,10 @@ peer_fill() {
 #               seven_day when the response carries no usable `limits` array.
 #   U_WKK/U_WKS[i]               the binding weekly limit's kind and scope name, both
 #               empty on the seven_day fallback and on an unscoped binding limit
+#   U_WAU/U_WAR[i]               the ALL-MODEL weekly (weekly_all, else seven_day)
+#               utilization + resets_at, LIVE rows only; empty on cached/peer rows,
+#               which never carried it. Display-only: when the binding is a scoped
+#               per-model cap it says what the seat can still run on other models
 #   U_SDR[i]    seven_day/weekly_all resets_at, kept RAW for the identity fingerprint,
 #               that comparison is only meaningful between the same kind of window, so
 #               it must not follow whichever kind happens to bind
@@ -2972,13 +3102,15 @@ seat_field() { rota_seat_field "$BILLING_JSON" "${1:-}" "${2:-}"; }
 # Has the seat itself ENDED? This is the ONLY one of the three states that means
 # "this account is finished", and it is a date comparison, never an inference
 # from a stale number.
+#
+# ⚠️ THE COMPARISON IS NOT WRITTEN HERE ANY MORE. rota_seat_ended
+# (rota-ranking.sh) owns it, for the same reason rota_seat_deadline owns the
+# ordering: rota-keeper.sh's unattended picker has to refuse exactly the seats
+# this surface refuses. It did not, and on 2026-09-07 that cost the box a day -
+# see the comment on rota_seat_ended. Do not re-inline the date compare.
 seat_ended() {  # seat_ended <slot-index>
   load_seats
-  local e="${U_EMAIL[$1]:-}" ends
-  [[ -n "$e" ]] || return 1
-  ends="$(seat_field "$e" 2)"
-  [[ -n "$ends" ]] || return 1
-  [[ "$ends" < "$(date '+%Y-%m-%d')" ]]
+  rota_seat_ended "$BILLING_JSON" "${U_EMAIL[$1]:-}"
 }
 
 # Temporary limit changes the vendor announces on its own site and no API
@@ -3174,7 +3306,7 @@ COLLECTED=0
 COLLECTED_NET=0            # was the completed collection allowed to use the network?
 SHARED_TWIN_SLOT=-1        # slot whose credential bytes are identical to the shared one
 S_JSON=""; S_HTTP=""; S_WKU=""; S_WKR=""; S_SEU=""; S_SER=""
-S_WKK=""; S_WKS=""; S_SDR=""
+S_WKK=""; S_WKS=""; S_SDR=""; S_WAU=""; S_WAR=""
 collect_usage() {
   (( COLLECTED )) && return 0
   COLLECTED=1
@@ -3192,12 +3324,12 @@ collect_usage() {
   PEER_HOST=""; PEER_GENERATED=""
   U_EMAIL=(); U_STATE=(); U_WKU=(); U_WKR=(); U_SEU=(); U_SER=()
   U_WKX=(); U_SEX=(); U_WHY=(); U_TS=(); U_VIA=(); U_DUP=()
-  U_WKK=(); U_WKS=(); U_SDR=(); U_SRC=(); U_MEAS=(); U_WKP=(); U_WKPF=()
+  U_WKK=(); U_WKS=(); U_SDR=(); U_SRC=(); U_MEAS=(); U_WKP=(); U_WKPF=(); U_WAU=(); U_WAR=()
   for i in "${!DIRS[@]}"; do
     U_EMAIL[i]=""; U_STATE[i]="none"; U_WKU[i]=""; U_WKR[i]=""; U_SEU[i]=""; U_SER[i]=""
     U_WKX[i]=0; U_SEX[i]=0; U_WHY[i]=""; U_TS[i]=""; U_VIA[i]=""; U_DUP[i]=-1
     U_WKK[i]=""; U_WKS[i]=""; U_SDR[i]=""; U_AGE[i]=""; U_SRC[i]=""; U_MEAS[i]=""
-    U_WKP[i]=""; U_WKPF[i]=""
+    U_WKP[i]=""; U_WKPF[i]=""; U_WAU[i]=""; U_WAR[i]=""
   done
 
   # the shared credential FIRST: it is both the identity fingerprint and the row
@@ -3211,6 +3343,7 @@ collect_usage() {
       S_SEU="$(usage_field "$S_JSON" '.five_hour.utilization')"
       S_SER="$(usage_field "$S_JSON" '.five_hour.resets_at')"
       S_SDR="$S_WKR"
+      S_WAU="$S_WKU"; S_WAR="$S_WKR"
       weekly_binding "$S_JSON"
       if [[ -n "$WB_PCT" ]]; then
         S_WKU="$WB_PCT"; S_WKR="$WB_RESET"; S_WKK="$WB_KIND"; S_WKS="$WB_SCOPE"
@@ -3218,6 +3351,7 @@ collect_usage() {
         [[ -n "$S_WKR" ]] || S_WKR="$WB_ALL_RESET"
         [[ -n "$S_SDR" ]] || S_SDR="$WB_ALL_RESET"
       fi
+      [[ -n "$WB_ALL_PCT" ]] && { S_WAU="$WB_ALL_PCT"; S_WAR="$WB_ALL_RESET"; }
     fi
   fi
 
@@ -3241,6 +3375,8 @@ collect_usage() {
 
     local json="" http="" token="" credfile="$adir/.credentials.json"
     local tok_expired_ago=""   # reset per slot: it feeds the reason below, whichever branch ran
+    local wake_dormant=0       # reset per slot: 1 = this run decided to wake a dormant seat
+    local wake_recent=0        # reset per slot: 1 = a wake was already spent within the TTL
     token="$(cred_token "$adir")"
     if [[ -z "$token" ]]; then
       # NAME THE REAL DEFECT. On 2026-08-07 a gutted file reported "no stored
@@ -3275,7 +3411,29 @@ collect_usage() {
       # 08-30) while the row promised "retry in ~1 min". The nudge is the one path
       # that rotates a stored token, and it is exactly what an expired one needs.
       tok_expired_ago="$(cred_token_expired_ago "$credfile")"
-      if [[ -z "$json" ]] && { [[ "$http" != "429" ]] || [[ -n "$tok_expired_ago" ]]; }; then
+      # ⚠️ A 429 ON AN IN-DATE TOKEN CAN ALSO BE A DORMANT SEAT, NOT RATE
+      # LIMITING. tommy, 2026-08-25 → 09-01: no session had touched the seat
+      # since its weekly window rolled, the API 429'd its stored token six days
+      # straight, the skip below filed it under "live sessions share this
+      # token", and the row sat UNMEASURED until a human ran the manual haiku
+      # wake — which cured it instantly. Nothing was sharing that token, and
+      # this box can SEE that: pids_pinned_to_dir knows whether any live
+      # session holds the dir. So when the 429 lands on an in-date token, no
+      # live session is pinned to the seat, the cache has nothing current to
+      # say (empty, or its weekly window has rolled), and no wake was already
+      # spent within WAKE_STAMP_TTL, the "shared token" theory is
+      # uncorroborated and one wake is worth spending. A 429 with a live pin
+      # keeps today's behaviour exactly: that IS per-token rate limiting.
+      if [[ -z "$json" && "$http" == "429" && -z "$tok_expired_ago" ]] \
+         && [[ -z "$(pids_pinned_to_dir "$adir")" ]]; then
+        if wake_stamp_fresh "$alabel"; then
+          wake_recent=1
+        else
+          cache_get "$email"
+          if [[ -z "$C_WKU$C_SEU" ]] || window_expired "$C_WKR"; then wake_dormant=1; fi
+        fi
+      fi
+      if [[ -z "$json" ]] && { [[ "$http" != "429" ]] || [[ -n "$tok_expired_ago" ]] || (( wake_dormant )); }; then
         # a stored token only rotates when a session USES the account, so spend one
         # haiku token, the CLI refreshes + persists the credential itself. cwd=/ plus
         # this exact prompt marks the run as a synthetic session, so anything that
@@ -3303,6 +3461,11 @@ collect_usage() {
           # again cannot succeed and CAN destroy it; the answer is a re-login.
           U_WHY[i]="refresh already rejected, this stored credential is dead and needs a re-login: CLAUDE_CONFIG_DIR=$(tilde "$adir") claude"
         else
+          # stamp BEFORE the call, and only the dormant arm: a stuck seat must
+          # not be re-woken by every run for WAKE_STAMP_TTL, while the
+          # expired-token nudge keeps its own guards (dead-refresh marker)
+          # and its existing cadence unchanged.
+          (( wake_dormant )) && wake_stamp_put "$alabel"
           (cd / && CLAUDE_CONFIG_DIR="$adir" claude -p "Reply with exactly the word: ok" --model claude-haiku-4-5-20251001 >/dev/null 2>&1) || true
           if (( pre_complete )) && ! cred_is_complete "$credfile"; then
             # complete going in, gutted coming out: the refresh was rejected and the
@@ -3325,6 +3488,8 @@ collect_usage() {
       U_SEU[i]="$(usage_field "$json" '.five_hour.utilization')"
       U_SER[i]="$(usage_field "$json" '.five_hour.resets_at')"
       U_SDR[i]="${U_WKR[$i]}"
+      # seven_day IS the all-model weekly; a weekly_all entry in `limits` overrides it
+      U_WAU[i]="${U_WKU[$i]}"; U_WAR[i]="${U_WKR[$i]}"
       # the BINDING weekly limit wins over seven_day whenever `limits` yields one, a
       # scoped per-model cap above weekly_all is the wall you actually hit
       weekly_binding "$json"
@@ -3340,6 +3505,7 @@ collect_usage() {
         [[ -n "${U_WKR[$i]}" ]] || U_WKR[i]="$WB_ALL_RESET"
         [[ -n "${U_SDR[$i]}" ]] || U_SDR[i]="$WB_ALL_RESET"
       fi
+      [[ -n "$WB_ALL_PCT" ]] && { U_WAU[i]="$WB_ALL_PCT"; U_WAR[i]="$WB_ALL_RESET"; }
       if [[ -z "${U_WKU[$i]}${U_SEU[$i]}" ]]; then
         # schema differs from expectation, surface the real keys (usage data is not secret)
         echo "  [$alabel] unexpected usage schema; top-level keys: $(printf '%s' "$json" | jq -r 'keys|join(",")' 2>/dev/null)" >&2
@@ -3365,7 +3531,16 @@ collect_usage() {
         # which just ran) rotates it. "retry in ~1 min" was never going to come true.
         U_WHY[i]="stored token is stale (access token expired ${tok_expired_ago} ago, usage API answered HTTP ${http:-none}), nothing rotates it while no session runs on this seat"
       elif [[ "$http" == "429" ]]; then
-        U_WHY[i]="usage API 429, retry in ~1 min, live sessions share this token"
+        if (( wake_dormant )); then
+          # a wake was just spent on it and the API still refuses: say that,
+          # never "live sessions share this token" about a seat this box can
+          # see nothing is pinned to
+          U_WHY[i]="usage API 429 even after a wake call (no live session is pinned to this seat), retry in ~1 min"
+        elif (( wake_recent )); then
+          U_WHY[i]="usage API 429, a wake was already spent on it within the last $((WAKE_STAMP_TTL / 3600))h (no live session is pinned to this seat), retry in ~1 min"
+        else
+          U_WHY[i]="usage API 429, retry in ~1 min, live sessions share this token"
+        fi
       else
         U_WHY[i]="stored token is stale (HTTP ${http:-none}), the CLI only rotates it when a session uses this account"
       fi
@@ -3410,7 +3585,7 @@ collect_usage() {
       U_WKU[i]="$C_WKU"; U_WKR[i]="$C_WKR"; U_SEU[i]="$C_SEU"; U_SER[i]="$C_SER"
       # the cache stores the binding NUMBER but not which limit produced it, so a cached
       # row carries no scope annotation rather than a stale or invented one
-      U_WKK[i]=""; U_WKS[i]=""; U_SDR[i]="$C_WKR"
+      U_WKK[i]=""; U_WKS[i]=""; U_SDR[i]="$C_WKR"; U_WAU[i]=""; U_WAR[i]=""
       U_TS[i]="$C_TS$(cache_age "$C_TE")"
       U_AGE[i]="$C_TE"
       # ts_epoch is when the number was MEASURED, which is the only honest answer
@@ -3702,6 +3877,7 @@ adopt_shared_numbers() {
   # the binding limit's identity travels with its number, or the row would annotate the
   # shared credential's scoped figure with the slot's own (now discarded) provenance
   U_WKK[SHARED_SLOT]="$S_WKK"; U_WKS[SHARED_SLOT]="$S_WKS"; U_SDR[SHARED_SLOT]="$S_SDR"
+  U_WAU[SHARED_SLOT]="$S_WAU"; U_WAR[SHARED_SLOT]="$S_WAR"
   U_WKX[SHARED_SLOT]=0; U_SEX[SHARED_SLOT]=0
   U_STATE[SHARED_SLOT]="live"
   # a LIVE local fetch outranks anything borrowed, so a peer row for this slot is
@@ -3943,6 +4119,15 @@ compute_recommendation() {  # compute_recommendation <exclude_active 0|1> <requi
     fi
     if (( need_pool )) && [[ "${DIRS[$i]}" -ef "$HOME/.claude" ]]; then
       U_REASON[i]="its home IS the shared ~/.claude, nothing to swap in"; continue
+    fi
+    # ⚠️ BEFORE THE NUMBERS, because an ended seat is not a measurement problem.
+    # Every filter below this line asks how much quota a row has left; this one
+    # asks whether the account still exists, and the answer outranks any number
+    # attached to it. Put it after the live/cached gate instead and a CACHED row
+    # for a dead seat is recommended on 19-hour-old numbers, which is precisely
+    # what "USE NEXT rota switch thea" was on 2026-09-07 (rota_seat_ended).
+    if seat_ended "$i"; then
+      U_REASON[i]="the seat itself ended $(seat_ends_on "$i"); quota it still reports cannot be spent"; continue
     fi
     if [[ "${U_STATE[$i]}" != "live" ]]; then
       # `peer` rides with `cached`, in BOTH directions: it is admitted only on the
@@ -4275,6 +4460,16 @@ render_unavail_row() {  # render_unavail_row <slot-index> <email-width>
 # U_WHY behind it) rather than re-judged here, so the short form can never say
 # something the full sentence under --verbose contradicts.
 scope_short() { [[ -n "${1:-}" ]] && printf ' (%s)' "$1"; return 0; }
+# " · all models 40% left" when slot <i>'s binding weekly is a SCOPED cap and the
+# all-model weekly is known, "" otherwise. A spent Fable cap does not stop Opus, so a
+# row that says "weekly spent (Fable)" must also say what the seat can still run.
+all_models_note() {  # all_models_note <slot-index>
+  local i="$1" al
+  [[ "${U_WKK[$i]:-}" == "weekly_scoped" && -n "${U_WKS[$i]:-}" ]] || return 0
+  al="$(remaining "${U_WAU[$i]:-}")"
+  [[ -n "$al" ]] || return 0
+  printf ' · all models %s%% left' "$al"
+}
 short_reason() {  # short_reason <slot-index>
   # two `local` statements, not one: an index assigned in the SAME `local` is not
   # reliably visible to a later subscript in that statement (shellcheck SC2318)
@@ -4286,8 +4481,8 @@ short_reason() {  # short_reason <slot-index>
   wkl="$(remaining "${U_WKU[$i]}")"; sel="$(remaining "${U_SEU[$i]}")"
   case "$r" in
     weekly*)
-      if [[ "$wkl" == "0" ]]; then printf 'weekly spent%s' "$(scope_short "${U_WKS[$i]}")"
-      else printf 'weekly %s%% left%s' "$wkl" "$(scope_short "${U_WKS[$i]}")"; fi ;;
+      if [[ "$wkl" == "0" ]]; then printf 'weekly spent%s%s' "$(scope_short "${U_WKS[$i]}")" "$(all_models_note "$i")"
+      else printf 'weekly %s%% left%s%s' "$wkl" "$(scope_short "${U_WKS[$i]}")" "$(all_models_note "$i")"; fi ;;
     5h*)
       if [[ "$sel" == "0" ]]; then printf '5h window spent'
       else printf '5h %s%% left' "$sel"; fi ;;
@@ -4381,7 +4576,10 @@ render_verbose_detail() {  # render_verbose_detail <slot-index>
   local i="$1" pfx='      '
   printf '%s\n' "$(paint "$CLR_DIM" "${pfx}slot    ${LABELS[$i]} · $(tilde "${DIRS[$i]}")")"
   if [[ "${U_STATE[$i]}" != "dup" ]]; then
-    printf '%s\n' "$(paint "$CLR_DIM" "${pfx}resets  weekly $(weekly_reset_phrase "$i") · 5h $(reset_phrase "${U_SER[$i]}")")"
+    local all_reset=""
+    [[ -n "$(all_models_note "$i")" && -n "${U_WAR[$i]:-}" ]] \
+      && all_reset=" · all models $(reset_phrase "${U_WAR[$i]}")"
+    printf '%s\n' "$(paint "$CLR_DIM" "${pfx}resets  weekly $(weekly_reset_phrase "$i")${all_reset} · 5h $(reset_phrase "${U_SER[$i]}")")"
   fi
   [[ -n "${U_VIA[$i]}" ]] && printf '%s\n' "$(paint "$CLR_DIM" "${pfx}note    ${U_VIA[$i]}")"
   [[ "${U_STATE[$i]}" != "live" && -n "${U_WHY[$i]}" ]] \
@@ -5477,9 +5675,9 @@ render_usage() {
 # Same data, machine-readable, so a future consumer never has to parse columns.
 json_usage() {
   local i rows="" wk se wk_used se_used wk_fresh se_fresh
-  local wk_in se_in logged_in is_live is_stale
+  local wk_in se_in logged_in is_live is_stale wa wa_used
   for i in "${!DIRS[@]}"; do
-    wk="null"; se="null"; wk_used="null"; se_used="null"
+    wk="null"; se="null"; wk_used="null"; se_used="null"; wa="null"; wa_used="null"
     # `fresh` is what lets a consumer tell the two null-resets_at cases apart without
     # guessing: fresh=true is "100% left, the window has not started" (remaining_pct
     # is 100, used_pct 0), fresh=false with a null resets_at and null percentages is
@@ -5509,6 +5707,12 @@ json_usage() {
       && { wk="$(remaining "${U_WKU[$i]}")"; wk_used="$(used "${U_WKU[$i]}")"; }
     [[ -n "$(remaining "${U_SEU[$i]}")" ]] && (( U_SEX[i] == 0 )) \
       && { se="$(remaining "${U_SEU[$i]}")"; se_used="$(used "${U_SEU[$i]}")"; }
+    # weekly_all (2026-09-26), ADDITIVE: the all-model weekly, whatever binds. Null
+    # (the whole object) when this row never measured it: cached, peer, recorded.
+    # Same expiry gate as weekly, a lapsed window's percentage is not a fact.
+    if [[ -n "$(remaining "${U_WAU[$i]:-}")" ]] && ! window_expired "${U_WAR[$i]:-}"; then
+      wa="$(remaining "${U_WAU[$i]}")"; wa_used="$(used "${U_WAU[$i]}")"
+    fi
     # ── the camelCase view, ADDITIVE (2026-08-06) ────────────────────────────
     # A phone renderer needs three things this object did not carry: whether the
     # account can be switched to at all (loggedIn, the same rule `status` prints,
@@ -5567,6 +5771,8 @@ json_usage() {
       --arg se_reset "${U_SER[$i]}" \
       --arg wk_kind "${U_WKK[$i]}" \
       --arg wk_scope "${U_WKS[$i]}" \
+      --arg wa_reset "${U_WAR[$i]:-}" \
+      --argjson wa "$wa" --argjson wa_used "$wa_used" \
       --arg cached_at "${U_TS[$i]}" \
       --arg src "${U_SRC[$i]:-}" \
       --arg meas "${U_MEAS[$i]:-}" \
@@ -5596,6 +5802,9 @@ json_usage() {
                 resetsInSeconds:$wk_in,
                 resets_at_projected:(if $wk_proj=="" then null else $wk_proj end),
                 projected_from:(if $wk_proj_from=="" then null else $wk_proj_from end)},
+        weekly_all:(if $wa == null then null else
+                    {used_pct:$wa_used, remaining_pct:$wa,
+                     resets_at:(if $wa_reset=="" then null else $wa_reset end)} end),
         five_hour:{remaining_pct:$se, used_pct:$se_used, resets_at:(if $se_reset=="" then null else $se_reset end), expired:($se_exp==1), fresh:$se_fresh},
         session:{leftPct:$se, usedPct:$se_used,
                  resetsAt:(if $se_reset=="" then null else $se_reset end),

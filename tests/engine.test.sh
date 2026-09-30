@@ -91,6 +91,12 @@ if [ "${1:-}" = "-p" ] && [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
     printf '{"claudeAiOauth":{"accessToken":"","refreshToken":"","refreshTokenExpiresAt":%s000,"scopes":["user:inference"],"subscriptionType":"max"}}' \
       "$(cat "$FAKE_STATE/deadrefresh-$base")" > "$CLAUDE_CONFIG_DIR/.credentials.json"
   fi
+  # the HEALTHY rotation, the opposite of the husk: when a nudged seat's refresh
+  # token is alive the real CLI installs a fresh credential; a scenario stages
+  # that by putting the post-rotation credential in $FAKE_STATE/rotate-<base>
+  if [ -f "$FAKE_STATE/rotate-$base" ]; then
+    cat "$FAKE_STATE/rotate-$base" > "$CLAUDE_CONFIG_DIR/.credentials.json"
+  fi
 fi
 n=$(cat "$FAKE_STATE/authcalls" 2>/dev/null || echo 0)
 n=$((n + 1))
@@ -1860,6 +1866,82 @@ BF_PROSE="$(left_first_prose <<<"$OUT")"
   && ok "binding floor → no SENTENCE in a multi-account report leads with left either" \
   || bad "binding floor → a sentence leads with left (got: $BF_PROSE)"
 
+# --- 24b. a SCOPED cap spent is not a spent SEAT: weekly_all travels too -------
+# Fable's per-model weekly at 100% binds (and must keep excluding the seat from the
+# pick), but weekly_all at 60% used means the seat still runs every other model. The
+# engine publishes that all-model figure as weekly_all{used_pct,remaining_pct,
+# resets_at} and the short reason says so. Two controls: a limits array with no
+# scoped entry, and no limits key at all (weekly_all then IS seven_day).
+new_run scopedspent
+mkdir -p "$RUN/.claude-pool/alpha" "$RUN/.claude-pool/fable" "$RUN/.claude-pool/nosc" "$RUN/.claude-pool/plain"
+printf '{"claudeAiOauth":{"accessToken":"TOK-SS-ALPHA"}}' > "$RUN/.claude/.credentials.json"
+cp "$RUN/.claude/.credentials.json" "$RUN/.claude-pool/alpha/.credentials.json"
+printf '{"oauthAccount":{"emailAddress":"alpha@example.com"}}' > "$RUN/.claude-pool/alpha/.claude.json"
+printf '{"oauthAccount":{"emailAddress":"alpha@example.com"}}' > "$RUN/.claude.json"
+for n in fable nosc plain; do
+  printf '{"claudeAiOauth":{"accessToken":"TOK-SS-%s"}}' "$n" > "$RUN/.claude-pool/$n/.credentials.json"
+  printf '{"oauthAccount":{"emailAddress":"%s@example.com"}}' "$n" > "$RUN/.claude-pool/$n/.claude.json"
+done
+cat > "$RUN/cfg/accounts" <<EOF
+alpha@example.com|$RUN/.claude-pool/alpha
+fable@example.com|$RUN/.claude-pool/fable
+nosc@example.com|$RUN/.claude-pool/nosc
+plain@example.com|$RUN/.claude-pool/plain
+EOF
+SS_ALL_R="$(iso_in +6d)"; SS_SCOPED_R="$(iso_in +2d)"; SS_SE_R="$(iso_in +2H)"
+printf '{"seven_day":{"utilization":18,"resets_at":"%s"},"five_hour":{"utilization":23,"resets_at":"%s"}}' \
+  "$(iso_in +3d)" "$SS_SE_R" > "$RUN/state/usage-TOK-SS-ALPHA.json"
+printf '{"five_hour":{"utilization":16,"resets_at":"%s"},"seven_day":{"utilization":60,"resets_at":"%s"},
+ "limits":[{"kind":"session","group":"session","percent":16,"resets_at":"%s","scope":null},
+   {"kind":"weekly_all","group":"weekly","percent":60,"resets_at":"%s","scope":null},
+   {"kind":"weekly_scoped","group":"weekly","percent":100,"resets_at":"%s",
+    "scope":{"model":{"id":null,"display_name":"Fable"}}}]}' \
+  "$SS_SE_R" "$SS_ALL_R" "$SS_SE_R" "$SS_ALL_R" "$SS_SCOPED_R" \
+  > "$RUN/state/usage-TOK-SS-fable.json"
+printf '{"five_hour":{"utilization":5,"resets_at":"%s"},"seven_day":{"utilization":30,"resets_at":"%s"},
+ "limits":[{"kind":"weekly_all","group":"weekly","percent":30,"resets_at":"%s","scope":null}]}' \
+  "$SS_SE_R" "$SS_ALL_R" "$SS_ALL_R" > "$RUN/state/usage-TOK-SS-nosc.json"
+printf '{"five_hour":{"utilization":5,"resets_at":"%s"},"seven_day":{"utilization":45,"resets_at":"%s"}}' \
+  "$SS_SE_R" "$SS_ALL_R" > "$RUN/state/usage-TOK-SS-plain.json"
+set +e
+OUT="$(FAKE_NEW_EMAIL=alpha@example.com "$SCRIPT" usage 2>/dev/null)"
+VOUT="$(FAKE_NEW_EMAIL=alpha@example.com "$SCRIPT" usage --verbose 2>/dev/null)"
+JSON_OUT="$(FAKE_NEW_EMAIL=alpha@example.com "$SCRIPT" usage --json 2>/dev/null)"
+RC=$?
+set -e
+[ "$RC" -eq 0 ] && ok "scoped spent → usage exits 0" || bad "scoped spent → usage exits 0 (got $RC: $OUT)"
+ss_row="$(jq -c '.accounts[] | select(.email=="fable@example.com")' <<<"$JSON_OUT" 2>/dev/null)"
+[ "$(jq -r '.weekly | [.used_pct,.remaining_pct,.kind,.scope] | @csv' <<<"$ss_row" 2>/dev/null)" = '100,0,"weekly_scoped","Fable"' ] \
+  && ok "scoped spent (json) → weekly is still the binding Fable cap, unchanged" \
+  || bad "scoped spent (json) → weekly unchanged (got: $(jq -c '.weekly' <<<"$ss_row" 2>/dev/null))"
+[ "$(jq -r '.weekly_all | [.used_pct,.remaining_pct,.resets_at] | @csv' <<<"$ss_row" 2>/dev/null)" = "60,40,\"$SS_ALL_R\"" ] \
+  && ok "scoped spent (json) → weekly_all carries the all-model 60 used / 40 left and its own reset" \
+  || bad "scoped spent (json) → weekly_all (got: $(jq -c '.weekly_all' <<<"$ss_row" 2>/dev/null))"
+[ "$(jq -r '.recommendable' <<<"$ss_row" 2>/dev/null)" = "false" ] \
+  && ok "scoped spent (json) → the ranking still excludes the seat (display-only change)" \
+  || bad "scoped spent (json) → still excluded (got: $ss_row)"
+grep -qE '^  ✗ fable@example\.com +weekly spent \(Fable\) · all models 40% left' <<<"$(unavail_block <<<"$OUT")" \
+  && ok "scoped spent → the short reason names the spent Fable cap AND the all-model headroom" \
+  || bad "scoped spent → short reason with all-model figure (got: $(unavail_block <<<"$OUT"))"
+grep -qE 'resets  weekly .* · all models .* · 5h ' <<<"$VOUT" \
+  && ok "scoped spent → --verbose reset line carries the all-model reset too" \
+  || bad "scoped spent → --verbose all-model reset (got: $VOUT)"
+[ "$(jq -r '.accounts[] | select(.email=="nosc@example.com") | .weekly_all | [.used_pct,.remaining_pct] | @csv' <<<"$JSON_OUT" 2>/dev/null)" = '30,70' ] \
+  && ok "no scoped entry (json) → weekly_all is the weekly_all entry" \
+  || bad "no scoped entry (json) → weekly_all (got: $(jq -c '.accounts[] | select(.email=="nosc@example.com") | .weekly_all' <<<"$JSON_OUT" 2>/dev/null))"
+[ "$(jq -r '.accounts[] | select(.email=="plain@example.com") | [.weekly.kind, .weekly_all.used_pct, .weekly_all.remaining_pct] | @csv' <<<"$JSON_OUT" 2>/dev/null)" = ',45,55' ] \
+  && ok "no limits key (json) → weekly_all falls back to seven_day, kind stays null" \
+  || bad "no limits key (json) → weekly_all from seven_day (got: $(jq -c '.accounts[] | select(.email=="plain@example.com")' <<<"$JSON_OUT" 2>/dev/null))"
+! grep -qE '(nosc|plain)@example\.com.*all models' <<<"$OUT" \
+  && ok "unscoped rows → no all-models note where nothing is scoped" \
+  || bad "unscoped rows → no all-models note (got: $OUT)"
+set +e
+SS_CACHED_JSON="$("$SCRIPT" usage --no-refresh --json 2>/dev/null)"
+set -e
+[ "$(jq -r '.accounts[] | select(.email=="fable@example.com") | .weekly_all' <<<"$SS_CACHED_JSON" 2>/dev/null)" = "null" ] \
+  && ok "scoped spent (json) → a cached row leaves weekly_all null, never invented" \
+  || bad "scoped spent (json) → cached weekly_all null (got: $(jq -c '.accounts[] | select(.email=="fable@example.com")' <<<"$SS_CACHED_JSON" 2>/dev/null))"
+
 # --- 25. switch-auto must never dead-end merely because the data was old -------
 # The 2026-08-05 defect. `rota switch` with no argument exists so the operator never has to
 # name an account, yet with every stored token stale (curl answers 000 here, the
@@ -2794,7 +2876,10 @@ EX_JSON_PATHS="$(jq -S -r 'paths | join(".")' <<<"$EX_JSON" | sed -E 's/\.[0-9]+
 #               bare instant cannot say whether the vendor reported it or this box
 #               inferred it. The human surfaces mark that with `~`; a parser gets
 #               the boolean.
-EX_JSON_PATHS_WANT="accounts accounts.N accounts.N.active accounts.N.alias accounts.N.cached_at accounts.N.config_dir accounts.N.current accounts.N.data accounts.N.email accounts.N.five_hour accounts.N.five_hour.expired accounts.N.five_hour.fresh accounts.N.five_hour.remaining_pct accounts.N.five_hour.resets_at accounts.N.five_hour.used_pct accounts.N.label accounts.N.live accounts.N.loggedIn accounts.N.note accounts.N.quota_data accounts.N.quota_measured_at accounts.N.quota_source accounts.N.reason accounts.N.recommendable accounts.N.seat accounts.N.seat.ended accounts.N.seat.ends accounts.N.seat.status accounts.N.session accounts.N.session.expired accounts.N.session.fresh accounts.N.session.leftPct accounts.N.session.resetsAt accounts.N.session.resetsInSeconds accounts.N.session.usedPct accounts.N.stale accounts.N.stale_reason accounts.N.unmeasured accounts.N.weekly accounts.N.weekly.expired accounts.N.weekly.fresh accounts.N.weekly.kind accounts.N.weekly.leftPct accounts.N.weekly.projected_from accounts.N.weekly.remaining_pct accounts.N.weekly.resetsAt accounts.N.weekly.resetsInSeconds accounts.N.weekly.resets_at accounts.N.weekly.resets_at_projected accounts.N.weekly.scope accounts.N.weekly.usedPct accounts.N.weekly.used_pct active active.auth_status active.auth_warning active.email active.fingerprint active.nested_config_warning active.source active.warning activeEmail floors floors.comfortable_pct floors.exhausted_pct floors.session_pct floors.weekly_pct peer recommendation recommendation.action recommendation.alias recommendation.best_alternative recommendation.best_alternative.email recommendation.best_alternative.weekly_left_pct recommendation.burn_down_hold recommendation.deadline_at recommendation.deadline_kind recommendation.deadline_projected recommendation.email recommendation.from_cached_numbers recommendation.label recommendation.mode recommendation.mode_forced recommendation.reason recommendation.weekly_fresh "
+#   2026-09-26  ADDITIVE: `accounts.N.weekly_all{used_pct,remaining_pct,resets_at}`,
+#               the all-model weekly, null when the row never measured it. A spent
+#               SCOPED cap (Fable) binds `weekly` but the seat still runs Opus.
+EX_JSON_PATHS_WANT="accounts accounts.N accounts.N.active accounts.N.alias accounts.N.cached_at accounts.N.config_dir accounts.N.current accounts.N.data accounts.N.email accounts.N.five_hour accounts.N.five_hour.expired accounts.N.five_hour.fresh accounts.N.five_hour.remaining_pct accounts.N.five_hour.resets_at accounts.N.five_hour.used_pct accounts.N.label accounts.N.live accounts.N.loggedIn accounts.N.note accounts.N.quota_data accounts.N.quota_measured_at accounts.N.quota_source accounts.N.reason accounts.N.recommendable accounts.N.seat accounts.N.seat.ended accounts.N.seat.ends accounts.N.seat.status accounts.N.session accounts.N.session.expired accounts.N.session.fresh accounts.N.session.leftPct accounts.N.session.resetsAt accounts.N.session.resetsInSeconds accounts.N.session.usedPct accounts.N.stale accounts.N.stale_reason accounts.N.unmeasured accounts.N.weekly accounts.N.weekly.expired accounts.N.weekly.fresh accounts.N.weekly.kind accounts.N.weekly.leftPct accounts.N.weekly.projected_from accounts.N.weekly.remaining_pct accounts.N.weekly.resetsAt accounts.N.weekly.resetsInSeconds accounts.N.weekly.resets_at accounts.N.weekly.resets_at_projected accounts.N.weekly.scope accounts.N.weekly.usedPct accounts.N.weekly.used_pct accounts.N.weekly_all accounts.N.weekly_all.remaining_pct accounts.N.weekly_all.resets_at accounts.N.weekly_all.used_pct active active.auth_status active.auth_warning active.email active.fingerprint active.nested_config_warning active.source active.warning activeEmail floors floors.comfortable_pct floors.exhausted_pct floors.session_pct floors.weekly_pct peer recommendation recommendation.action recommendation.alias recommendation.best_alternative recommendation.best_alternative.email recommendation.best_alternative.weekly_left_pct recommendation.burn_down_hold recommendation.deadline_at recommendation.deadline_kind recommendation.deadline_projected recommendation.email recommendation.from_cached_numbers recommendation.label recommendation.mode recommendation.mode_forced recommendation.reason recommendation.weekly_fresh "
 [ "$EX_JSON_PATHS" = "$EX_JSON_PATHS_WANT" ] \
   && ok "json byte-identity → every published key path is exactly what the dashboard was promised" \
   || bad "json byte-identity → key paths drifted:
@@ -4714,11 +4799,15 @@ printf '{"claudeAiOauth":{"accessToken":"TOK-X-EXPIRED","refreshToken":"RT-TOK-X
   "$(date -u -v-5d +%s)" "$RT_FUTURE" > "$RUN/.claude-pool/expired/.credentials.json"
 printf '{"oauthAccount":{"emailAddress":"expired@example.com"}}' > "$RUN/.claude-pool/expired/.claude.json"
 printf '429' > "$RUN/state/usage-TOK-X-EXPIRED.code"
-# limited: a token still in date that the API 429s, the genuine rate-limit case, must
-# keep its old behaviour byte for byte (no nudge, "retry in ~1 min")
+# limited: a token still in date that the API 429s WHILE a live session is
+# pinned to the seat, the genuine shared-token rate-limit case, must keep its
+# old behaviour byte for byte (no nudge, "retry in ~1 min"). The pin is what
+# says "shared" since the dormant-wake arm (scenario 59): an in-date 429 with
+# NO pin and nothing current in the cache gets one wake instead.
 cred_json TOK-X-LIMITED > "$RUN/.claude-pool/limited/.credentials.json"
 printf '{"oauthAccount":{"emailAddress":"limited@example.com"}}' > "$RUN/.claude-pool/limited/.claude.json"
 printf '429' > "$RUN/state/usage-TOK-X-LIMITED.code"
+printf 'PID TT STAT TIME COMMAND\n  71 s001  S+   0:00.10 claude CLAUDE_CONFIG_DIR=%s/.claude-pool/limited\n' "$RUN" > "$RUN/state/pool-ps.txt"
 cat > "$RUN/cfg/accounts" <<EOF
 live@example.com|$RUN/.claude-pool/live
 expired@example.com|$RUN/.claude-pool/expired
@@ -4734,8 +4823,8 @@ X_LIMITED="$(prow limited@example.com "$X_JSON")"
   && ok "expired token × 429 → the seat IS nudged (the CLI is the only thing that rotates a stored token)" \
   || bad "expired token × 429 → must nudge (nudges: $(cat "$RUN/state/nudges" 2>/dev/null || echo none))"
 ! grep -q '^limited$' "$RUN/state/nudges" 2>/dev/null \
-  && ok "expired token × 429 → a token still in date that 429s is NOT nudged (real rate limiting, unchanged)" \
-  || bad "expired token × 429 → in-date 429 must not nudge (nudges: $(cat "$RUN/state/nudges"))"
+  && ok "expired token × 429 → an in-date token that 429s under a live pin is NOT nudged (real shared-token rate limiting, unchanged)" \
+  || bad "expired token × 429 → pinned in-date 429 must not nudge (nudges: $(cat "$RUN/state/nudges"))"
 grep -q 'access token expired' <<<"$(jq -r '.stale_reason' <<<"$X_EXPIRED")" \
   && ! grep -q 'live sessions share' <<<"$(jq -r '.stale_reason' <<<"$X_EXPIRED")" \
   && ok "expired token × 429 → the reason names the EXPIRED token, never 'live sessions share this token'" \
@@ -5236,6 +5325,91 @@ WARN_OUT="$(bash -c 'source "$1" >/dev/null 2>&1; USAGE_CACHE=/tmp/rota-test-cac
 grep -q '/tmp/rota-test-cache.json' <<<"$WARN_OUT" \
   && ok "merge → and the warning names the file, so the next step is obvious" \
   || bad "merge → warning names the cache file (got: $WARN_OUT)"
+
+# --- 60. dormant seat × 429: the wake the operator used to have to remember -----
+# tommy, 2026-08-25 → 09-01: nothing touched the seat after its weekly window
+# rolled, the usage API 429'd its in-date token six days straight, the skip
+# filed it under "live sessions share this token", and the row sat UNMEASURED
+# until a human ran `CLAUDE_CONFIG_DIR=~/.claude-pool/tommy claude -p … "ok"`
+# by hand — which cured it instantly. The engine now spends that wake itself
+# when the "shared" theory is uncorroborated: in-date 429, NO live pin on the
+# dir, nothing current in the cache. Once per WAKE_STAMP_TTL per seat, so a
+# stuck seat costs one call, not one per keeper tick (the unbounded version of
+# this is what got KEEPALIVE killed on 2026-08-16).
+new_run dormantwake
+mkdir -p "$RUN/.claude-pool/live" "$RUN/.claude-pool/dormant" "$RUN/.claude-pool/stuck" "$RUN/.claude-pool/parked"
+cred_json TOK-DW-LIVE > "$RUN/.claude/.credentials.json"
+cp "$RUN/.claude/.credentials.json" "$RUN/.claude-pool/live/.credentials.json"
+printf '{"oauthAccount":{"emailAddress":"live@example.com"}}' > "$RUN/.claude-pool/live/.claude.json"
+printf '{"oauthAccount":{"emailAddress":"live@example.com"}}' > "$RUN/.claude.json"
+printf '{"seven_day":{"utilization":10,"resets_at":"%s"},"five_hour":{"utilization":10,"resets_at":"%s"}}' \
+  "$(iso_in +2d)" "$(iso_in +2H)" > "$RUN/state/usage-TOK-DW-LIVE.json"
+# dormant: in-date 429, no pin, no cache → ONE wake; the wake rotates the
+# credential (rotate-<base>, the healthy CLI behaviour) and the refetch with
+# the rotated token answers 200, so the row comes back LIVE in the same run
+cred_json TOK-DW-DORMANT > "$RUN/.claude-pool/dormant/.credentials.json"
+printf '{"oauthAccount":{"emailAddress":"dormant@example.com"}}' > "$RUN/.claude-pool/dormant/.claude.json"
+printf '429' > "$RUN/state/usage-TOK-DW-DORMANT.code"
+cred_json TOK-DW-WOKE > "$RUN/state/rotate-dormant"
+printf '{"seven_day":{"utilization":0,"resets_at":"%s"},"five_hour":{"utilization":0,"resets_at":"%s"}}' \
+  "$(iso_in +4d)" "$(iso_in +5H)" > "$RUN/state/usage-TOK-DW-WOKE.json"
+# stuck: same dormant shape but the wake cures nothing (still 429) → woken
+# ONCE, the reason says a wake was spent, and the stamp stops the next run
+cred_json TOK-DW-STUCK > "$RUN/.claude-pool/stuck/.credentials.json"
+printf '{"oauthAccount":{"emailAddress":"stuck@example.com"}}' > "$RUN/.claude-pool/stuck/.claude.json"
+printf '429' > "$RUN/state/usage-TOK-DW-STUCK.code"
+# parked: the dormant shape on a RESERVED seat → never woken from this box
+cred_json TOK-DW-PARKED > "$RUN/.claude-pool/parked/.credentials.json"
+printf '{"oauthAccount":{"emailAddress":"parked@example.com"}}' > "$RUN/.claude-pool/parked/.claude.json"
+printf '429' > "$RUN/state/usage-TOK-DW-PARKED.code"
+touch "$RUN/.claude-pool/parked/RESERVED"
+cat > "$RUN/cfg/accounts" <<EOF
+live@example.com|$RUN/.claude-pool/live
+dormant@example.com|$RUN/.claude-pool/dormant
+stuck@example.com|$RUN/.claude-pool/stuck
+parked@example.com|$RUN/.claude-pool/parked
+EOF
+run_usage
+[ "$(grep -c '^dormant$' "$RUN/state/nudges" 2>/dev/null || echo 0)" -eq 1 ] \
+  && ok "dormant × 429 → the unpinned in-date seat IS woken, exactly once" \
+  || bad "dormant × 429 → must wake once (nudges: $(cat "$RUN/state/nudges" 2>/dev/null || echo none))"
+DW_JSON="$(FAKE_NEW_EMAIL=live@example.com "$SCRIPT" usage --json 2>/dev/null)"
+DW_DORMANT="$(prow dormant@example.com "$DW_JSON")"
+[ "$(jq -r '.quota_data' <<<"$DW_DORMANT")" = "live" ] \
+  && ok "dormant × 429 → after the wake the row is measured LIVE in the same run, no human in the loop" \
+  || bad "dormant × 429 → row must be live (got: $DW_DORMANT)"
+[ "$(grep -c '^stuck$' "$RUN/state/nudges" 2>/dev/null || echo 0)" -eq 1 ] \
+  && ok "dormant × 429 → a seat the wake does not cure is still only woken once" \
+  || bad "dormant × 429 → stuck must be woken once (nudges: $(cat "$RUN/state/nudges" 2>/dev/null || echo none))"
+# the --json call is itself a fresh collect, so by now the stamp is set and the
+# reason reads "already spent"; either wording is honest, the banned one is the
+# uncorroborated "live sessions share this token"
+DW_STUCK="$(prow stuck@example.com "$DW_JSON")"
+grep -q 'wake' <<<"$(jq -r '.stale_reason' <<<"$DW_STUCK")" \
+  && ! grep -q 'live sessions share' <<<"$(jq -r '.stale_reason' <<<"$DW_STUCK")" \
+  && ok "dormant × 429 → the stuck reason names the spent wake, never 'live sessions share this token' with nothing pinned" \
+  || bad "dormant × 429 → honest stuck reason (got: $(jq -r '.stale_reason' <<<"$DW_STUCK"))"
+! grep -q '^parked$' "$RUN/state/nudges" 2>/dev/null \
+  && ok "dormant × 429 → a reserved seat in the dormant shape is still never woken from this box" \
+  || bad "dormant × 429 → reserved must not wake (nudges: $(cat "$RUN/state/nudges"))"
+# stamps are keyed by the seat's LABEL (its email in the accounts file), the
+# same key dead-refresh markers use
+[ -f "$RUN/cfg/wake-stamp/dormant@example.com" ] && [ -f "$RUN/cfg/wake-stamp/stuck@example.com" ] \
+  && [ ! -f "$RUN/cfg/wake-stamp/parked@example.com" ] \
+  && ok "dormant × 429 → wake stamps exist for the two woken seats and only those" \
+  || bad "dormant × 429 → stamps (got: $(ls "$RUN/cfg/wake-stamp" 2>/dev/null || echo none))"
+# second run inside the TTL: dormant now measures live off its rotated token,
+# stuck is NOT woken again, and its reason says a wake was already spent
+run_usage
+[ "$(grep -c '^stuck$' "$RUN/state/nudges" 2>/dev/null || echo 0)" -eq 1 ] \
+  && [ "$(grep -c '^dormant$' "$RUN/state/nudges" 2>/dev/null || echo 0)" -eq 1 ] \
+  && ok "dormant × 429 → a second run within the TTL spends NO further wake on either seat" \
+  || bad "dormant × 429 → no re-wake within TTL (nudges: $(cat "$RUN/state/nudges" 2>/dev/null || echo none))"
+DW_JSON2="$(FAKE_NEW_EMAIL=live@example.com "$SCRIPT" usage --json 2>/dev/null)"
+DW_STUCK2="$(prow stuck@example.com "$DW_JSON2")"
+grep -q 'already spent' <<<"$(jq -r '.stale_reason' <<<"$DW_STUCK2")" \
+  && ok "dormant × 429 → the second run's stuck reason says the wake was already spent, with the TTL" \
+  || bad "dormant × 429 → stamped reason (got: $(jq -r '.stale_reason' <<<"$DW_STUCK2"))"
 
 restore_home
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

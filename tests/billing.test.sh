@@ -85,6 +85,30 @@ ERR="$(CLAUDE_FAILOVER_HOME="$TMP/empty" "$LIB/rota-billing.sh" 2>&1 >/dev/null)
 check "missing billing.json: exit 2"          '[ "$RC" -eq 2 ]'
 check "missing billing.json: tells how to create it from the example" 'grep -q "billing.example.json" <<<"$ERR"'
 
+# --- the pool host can live in a FILE, not only the environment ---------------
+# A laptop's pool host is a property of the machine; an env var only reaches the
+# shell that exported it, so the same command answered differently in a terminal
+# and under launchd. The file sits beside `accounts` and `peers`.
+printf '# the always-on box\nballito\n' > "$CFG/pool-host"
+# The reachability probe silences its own stderr, so the evidence that routing
+# happened is the fall-through warning, which names the host it could not reach.
+ERR="$("$LIB/rota-billing.sh" 2>&1 >/dev/null)"; RC=$?
+check "pool-host file: routes to the named box" 'grep -q "ballito unreachable" <<<"$ERR"'
+OUT="$("$LIB/rota-billing.sh" --local 2>"$TMP/err")"; RC=$?
+check "pool-host file: --local still reads this box"  '[ "$RC" -eq 0 ]'
+check "pool-host file: --local attempts no ssh"       '! grep -q "ssh must not be called" "$TMP/err"'
+ERR="$(ROTA_POOL_HOST=testbox "$LIB/rota-billing.sh" 2>&1 >/dev/null)"; RC=$?
+check "pool-host file: the environment wins over it"  '! grep -q "ssh must not be called" <<<"$ERR"'
+printf '  ballito  \nextra-host\n' > "$CFG/pool-host"
+ERR="$("$LIB/rota-billing.sh" 2>&1 >/dev/null)"
+check "pool-host file: first host only, whitespace stripped" 'grep -q "ballito unreachable" <<<"$ERR"'
+check "pool-host file: a second line is ignored, never dialled" '! grep -q "extra-host" <<<"$ERR"'
+printf '# only a comment\n\n' > "$CFG/pool-host"
+OUT="$("$LIB/rota-billing.sh" 2>"$TMP/err")"; RC=$?
+check "pool-host file: comments-only reads as unset"  '[ "$RC" -eq 0 ]'
+check "pool-host file: comments-only attempts no ssh" '! grep -q "ssh must not be called" "$TMP/err"'
+rm -f "$CFG/pool-host"
+
 # --- --local with a POOL_HOST set must not ssh --------------------------------
 OUT="$(ROTA_POOL_HOST=some-other-box "$LIB/rota-billing.sh" --local 2>"$TMP/err")"; RC=$?
 check "--local: exit 0 with POOL_HOST set"    '[ "$RC" -eq 0 ]'
@@ -557,6 +581,194 @@ check "measured: no ~ anywhere in the table" '! grep -q "~" <<<"$OUT"'
 check "measured: no legend line either"      '! grep -q "~ projected" <<<"$OUT"'
 check "measured: the flag is false for every row" \
   '[ "$(python3 -c "import json,sys;print(any(a[\"weekly_resets_projected\"] for a in json.loads(sys.argv[1])[\"accounts\"]))" "$JOUT")" = False ]'
+
+# --- A SEAT THAT HAS ALREADY ENDED IS NEVER A RECOMMENDATION -------------------
+# ⚠️ THE FAILURE THIS PREVENTS, measured on ballito the evening of 2026-09-07.
+# `rota billing` printed `USE NEXT rota switch thea` for a subscription that had
+# ended on the 6th, one line under a row reading `CANCELLED, ends 6 Sep`: the
+# table and the recommendation contradicting each other about the same seat. A
+# session launched onto it does not get 60% of a week, it gets an auth failure.
+#
+# loses_at() is min(next reset, seat end), so a seat whose end date is in the PAST
+# is keyed on a moment that has already gone by, and that sorts it FIRST - the
+# most-about-to-be-lost seat in the pool. The key was never wrong; the dead seat
+# had no business being in the ranked list.
+#
+# ⚠️ THE FIXTURE CARRIES A CANCELLED-BUT-LIVE SEAT ON PURPOSE (`soon`, ending
+# before its next reset), and it is what USE NEXT must pick. Cancellation is NOT
+# the exclusion - a cancelled seat's final window is the most use-it-or-lose-it
+# quota there is - and a "fix" that widened this to `status == cancelled` would
+# pass every other check below while quietly throwing that away.
+ED_BILL="$TMP/billing-ended.json"
+ED_PAST="$(date -v-1d '+%Y-%m-%d')"          # yesterday: this seat is over
+ED_PAST_H="$(date -v-1d '+%-d %b')"
+ED_SOON="$(date -v+2d '+%Y-%m-%d')"          # still alive, and dies before its reset
+cat > "$ED_BILL" <<J
+{"accounts":{
+  "work@example.com":{"plan":"Max 20x","renews_day":12,"amount_display":"\$200.00","usd_approx":200,"status":"active"},
+  "dead@example.com":{"plan":"Max 20x","renews_day":6,"amount_display":"\$200.00","usd_approx":200,"status":"cancelled","ends":"$ED_PAST"},
+  "soon@example.com":{"plan":"Max 5x","renews_day":9,"amount_display":"\$100.00","usd_approx":100,"status":"cancelled","ends":"$ED_SOON"}
+}}
+J
+
+write_ended_stub() {  # write_ended_stub <floor>
+  cat > "$LIB/rota-engine.sh" <<STUB
+#!/usr/bin/env bash
+[ "\${1:-}" = "usage" ] && [ "\${2:-}" = "--json" ] || { echo "stub: unexpected args: \$*" >&2; exit 9; }
+cat <<J
+{"generated_at":"$(date -u '+%Y-%m-%dT%H:%M:%SZ')","activeEmail":"work@example.com",
+ "floors":{"weekly_pct":$1},"peer":null,
+ "accounts":[
+  {"label":"work@example.com","email":"work@example.com","alias":"work","active":true,
+   "data":"live","quota_data":"live","quota_source":null,
+   "quota_measured_at":"$(date -u '+%Y-%m-%dT%H:%M:%SZ')","unmeasured":false,
+   "seat":{"status":"active","ends":null,"ended":false},
+   "weekly":{"remaining_pct":43,"resets_at":"$(date -u -v+5d '+%Y-%m-%dT%H:%M:%S+00:00')","expired":false},
+   "five_hour":{"remaining_pct":88}},
+  {"label":"dead@example.com","email":"dead@example.com","alias":"dead","active":false,
+   "config_dir":"$TMP/pool/dead",
+   "data":"cached","quota_data":"cached","quota_source":null,
+   "quota_measured_at":"$(date -u -v-1d '+%Y-%m-%dT%H:%M:%SZ')","unmeasured":false,
+   "seat":{"status":"cancelled","ends":"$ED_PAST","ended":true},
+   "weekly":{"remaining_pct":60,"resets_at":"$(date -u -v+4d '+%Y-%m-%dT%H:%M:%S+00:00')","expired":false},
+   "five_hour":{"remaining_pct":100}},
+  {"label":"soon@example.com","email":"soon@example.com","alias":"soon","active":false,
+   "data":"live","quota_data":"live","quota_source":null,
+   "quota_measured_at":"$(date -u '+%Y-%m-%dT%H:%M:%SZ')","unmeasured":false,
+   "seat":{"status":"cancelled","ends":"$ED_SOON","ended":false},
+   "weekly":{"remaining_pct":30,"resets_at":"$(date -u -v+6d '+%Y-%m-%dT%H:%M:%S+00:00')","expired":false},
+   "five_hour":{"remaining_pct":90}}
+ ]}
+J
+STUB
+  chmod +x "$LIB/rota-engine.sh"
+}
+
+export CLAUDE_BILLING_JSON="$ED_BILL"
+write_ended_stub 20
+OUT="$("$LIB/rota-billing.sh" 2>/dev/null)"
+JOUT="$("$LIB/rota-billing.sh" --json 2>/dev/null)"
+
+check "ended: USE NEXT does NOT name the seat that ended yesterday" \
+  '! grep -A2 "USE NEXT" <<<"$OUT" | grep -q "rota switch dead"'
+check "ended: and it is not smuggled into the 'then' tail either" \
+  '! grep -A2 "USE NEXT" <<<"$OUT" | grep -q "dead ("'
+check "ended: the cancelled-but-LIVE seat still wins, because its last window dies first" \
+  'grep -A1 "USE NEXT" <<<"$OUT" | grep -q "rota switch soon"'
+check "ended: and it is still called that seat's LAST window" \
+  'grep -A2 "USE NEXT" <<<"$OUT" | grep -q "LAST window"'
+check "ended: the withheld dead seat is named out loud, with the date the row shows" \
+  "grep -A1 '^  ENDED' <<<\"\$OUT\" | grep -q 'dead (60% left, ended $ED_PAST_H)'"
+check "ended: the block says the omission is permanent, not a flag away" \
+  'grep -A2 "^  ENDED" <<<"$OUT" | grep -q "no flag that ranks it"'
+check "ended: a cancelled seat that is still alive is NOT in that block" \
+  '! grep -A1 "^  ENDED" <<<"$OUT" | grep -q "soon"'
+check "ended: the row itself is unchanged - the table still shows its 60%" \
+  'grep "dead@example.com" <<<"$OUT" | grep -q " 60%"'
+
+# ⚠️ NOT EVEN WITH THE OVERRIDE. --include-reserved buys a reserved seat back
+# into the ranking because that seat's quota is real and somebody could decide to
+# spend it. A dead seat's is not real, so there is deliberately no twin flag, and
+# the one that exists must not resurrect it as a side effect.
+OUT2="$("$LIB/rota-billing.sh" --include-reserved 2>/dev/null)"
+check "ended: --include-reserved does not bring a dead seat back either" \
+  '! grep -A2 "USE NEXT" <<<"$OUT2" | grep -q "rota switch dead"'
+
+# ⚠️ ONE SEAT, ONE REASON, AND THE TERMINAL ONE WINS. A seat that is both
+# reserved and ended used to be listed under NOT OFFERED as "60% left → someone",
+# which promises its owner quota that no longer exists.
+mkdir -p "$TMP/pool/dead"
+printf 'owner=airmond-runner\nwhy=pushed to the runners\n' > "$TMP/pool/dead/RESERVED"
+OUT3="$("$LIB/rota-billing.sh" 2>/dev/null)"
+check "ended: a reserved AND ended seat is reported as ENDED" \
+  'grep -A1 "^  ENDED" <<<"$OUT3" | grep -q "dead ("'
+check "ended: and not offered to its owner as quota that is still there" \
+  '! grep -A1 "NOT OFFERED" <<<"$OUT3" | grep -q "dead ("'
+rm -rf "$TMP/pool/dead"
+
+# ⚠️ AN ENDED SEAT IS NOT AN "EARLIEST BACK": it is not coming back. next_reset()
+# names a real instant on a real calendar for an account that will not exist to
+# see it, and this line would send him to wait for it.
+write_ended_stub 99
+OUT="$("$LIB/rota-billing.sh" 2>/dev/null)"
+check "ended: with nothing over the floor, the dead seat is not the 'earliest back'" \
+  'grep -A1 "USE NEXT" <<<"$OUT" | grep -q "earliest back" && ! grep -A1 "USE NEXT" <<<"$OUT" | grep -q "earliest back is dead"'
+check "ended: a live seat is named as the earliest back instead" \
+  'grep -A1 "USE NEXT" <<<"$OUT" | grep -qE "earliest back is (work|soon)"'
+
+# The machine surface has to carry the fact the ranking used, or a --json consumer
+# re-deriving the pick inherits exactly the bug the table just stopped having -
+# which is what happened to the RESERVED exclusion on 2026-08-25.
+check "ended: json marks the dead seat under the engine's own field name" \
+  '[ "$(jrow "$JOUT" dead@example.com seat_ended)" = True ]'
+check "ended: json leaves a live seat alone" \
+  '[ "$(jrow "$JOUT" soon@example.com seat_ended)" = False ]'
+check "ended: json still publishes its weekly number, so nothing is hidden, only unranked" \
+  '[ "$(jrow "$JOUT" dead@example.com weekly_left_pct)" = 60 ]'
+unset CLAUDE_BILLING_JSON
+
+# --- a SCOPED weekly cap spent is not a spent SEAT (2026-09-26) ---------------
+# cedric.waldburger@ showed `WEEKLY LEFT 0%` with an EMPTY 5H column: its Fable cap
+# was spent (the binding weekly), but weekly_all sat at 60% used and the seat still
+# ran Opus. With a scoped binding and weekly_all known, the cell shows the all-model
+# figure, NOTES names the Fable cap, and 5h is not blanked. `nosc` is the control:
+# its ALL-MODEL weekly is spent, so 5h must still blank exactly as before. `plain`
+# carries no kind and no weekly_all at all (the pre-limits shape).
+SW_BILL="$TMP/scoped-billing.json"
+cat > "$SW_BILL" <<'J'
+{"accounts":{
+  "fable@example.com":{"plan":"Max 20x","renews_day":7,"amount_display":"$200.00","usd_approx":200,"status":"active"},
+  "nosc@example.com":{"plan":"Max 20x","renews_day":8,"amount_display":"$200.00","usd_approx":200,"status":"active"},
+  "plain@example.com":{"plan":"Max 20x","renews_day":9,"amount_display":"$200.00","usd_approx":200,"status":"active"}
+}}
+J
+cat > "$LIB/rota-engine.sh" <<'STUB'
+#!/usr/bin/env bash
+cat <<'J'
+{"generated_at":"2026-09-26T10:00:00+02:00","activeEmail":"plain@example.com","floors":{"weekly_pct":20},
+ "accounts":[
+  {"label":"fable@example.com","email":"fable@example.com","alias":"fable","active":false,"data":"live",
+   "weekly":{"remaining_pct":0,"used_pct":100,"resets_at":"2099-09-28T15:59:00+00:00","kind":"weekly_scoped","scope":"Fable"},
+   "weekly_all":{"used_pct":60,"remaining_pct":40,"resets_at":"2099-10-01T09:00:00+00:00"},
+   "five_hour":{"remaining_pct":84}},
+  {"label":"nosc@example.com","email":"nosc@example.com","alias":"nosc","active":false,"data":"live",
+   "weekly":{"remaining_pct":0,"used_pct":100,"resets_at":"2099-09-29T09:00:00+00:00","kind":"weekly_all","scope":null},
+   "weekly_all":{"used_pct":100,"remaining_pct":0,"resets_at":"2099-09-29T09:00:00+00:00"},
+   "five_hour":{"remaining_pct":97}},
+  {"label":"plain@example.com","email":"plain@example.com","alias":"plain","active":true,"data":"live",
+   "weekly":{"remaining_pct":70,"resets_at":"2099-09-30T09:00:00+00:00"},
+   "five_hour":{"remaining_pct":91}}
+ ]}
+J
+STUB
+chmod +x "$LIB/rota-engine.sh"
+export CLAUDE_BILLING_JSON="$SW_BILL"
+OUT="$("$LIB/rota-billing.sh" 2>/dev/null)"
+JOUT="$("$LIB/rota-billing.sh" --json 2>/dev/null)"
+check "scoped weekly: the cell shows the ALL-MODEL 40%, not the Fable cap's 0%" \
+  'grep "fable@example.com" <<<"$OUT" | grep -qE " 40% " && ! grep "fable@example.com" <<<"$OUT" | grep -qE "   0% "'
+check "scoped weekly: the 5h column is NOT blanked by a spent scoped cap" \
+  'grep "fable@example.com" <<<"$OUT" | grep -q " 84% "'
+check "scoped weekly: NOTES names the spent Fable cap and when it is back" \
+  'grep "fable@example.com" <<<"$OUT" | grep -qE "Fable spent · back [A-Z][a-z]{2} [0-9]{2} [A-Z][a-z]{2}"'
+check "all-model spent: behaviour unchanged, 0% and 5h still blanked" \
+  'grep "nosc@example.com" <<<"$OUT" | grep -q "   0% " && ! grep "nosc@example.com" <<<"$OUT" | grep -q "97%"'
+check "all-model spent: no scoped note on an unscoped binding" \
+  '! grep "nosc@example.com" <<<"$OUT" | grep -qE "spent · back|% left"'
+check "no weekly_all: the row renders exactly as before" \
+  'grep "plain@example.com" <<<"$OUT" | grep -q " 70% " && grep "plain@example.com" <<<"$OUT" | grep -q " 91% "'
+check "scoped weekly (json): weekly_left_pct stays the BINDING 0 the ranking reads" \
+  '[ "$(jrow "$JOUT" fable@example.com weekly_left_pct)" = 0 ]'
+check "scoped weekly (json): weekly_kind / weekly_scope are published" \
+  '[ "$(jrow "$JOUT" fable@example.com weekly_kind)/$(jrow "$JOUT" fable@example.com weekly_scope)" = weekly_scoped/Fable ]'
+check "scoped weekly (json): weekly_all is passed through" \
+  '[ "$(python3 -c "import json,sys;print([a[\"weekly_all\"][\"remaining_pct\"] for a in json.loads(sys.argv[1])[\"accounts\"] if a[\"account\"]==\"fable@example.com\"][0])" "$JOUT")" = 40 ]'
+check "no weekly_all (json): null, never invented" \
+  '[ "$(jrow "$JOUT" plain@example.com weekly_all)" = None ]'
+check "scoped weekly: the recommendation still ranks on the binding cap (fable is not USE NEXT)" \
+  '! grep -A1 "USE NEXT" <<<"$OUT" | grep -q "rota switch fable"'
+unset CLAUDE_BILLING_JSON
+cp "$TMP/engine.good" "$LIB/rota-engine.sh"; chmod +x "$LIB/rota-engine.sh"
 
 printf 'billing.test.sh: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

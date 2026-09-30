@@ -78,6 +78,50 @@ rota_seat_field() {  # rota_seat_field <billing-json> <email> <1=status|2=ends>
   printf '%s\n' "$ROTA_SEATS_TSV" | awk -F'\t' -v e="$2" -v f="${3:-2}" '$1==e{print $(f+1); exit}'
 }
 
+# ── ELIGIBILITY, THE ONE RULE THAT BELONGS HERE: A SEAT THAT ALREADY ENDED ───
+#
+# ⚠️ THE HEADER ABOVE SAYS ELIGIBILITY LIVES WITH ITS CALLER, AND IT STILL DOES
+# FOR THE FLOORS. This is not a floor. MIN_WEEKLY, the 80%-used ceiling and the
+# 30%-left headroom are POLICIES each picker chose for its own audience; "the
+# subscription is over" is a FACT about the seat, read out of the same
+# billing.json rows rota_seat_field already serves, and it has exactly one right
+# answer on both surfaces. A fact that both callers must respect belongs beside
+# the ordering it precedes.
+#
+# ⚠️ AND AN ENDED SEAT IS THE ONE SHAPE THE ORDERING ALONE GETS CATASTROPHICALLY
+# WRONG. rota_seat_deadline ranks on min(weekly reset, seat end), so a seat whose
+# end date has PASSED carries the earliest deadline in the pool and is therefore
+# ranked FIRST, most urgent, by both pickers - the use-it-or-lose-it rule aimed
+# at a seat that can no longer be used at all.
+#
+# THE INCIDENT, 2026-09-07 on the real pool. thea.hawk@tomahawk.vc ended 6 Sep
+# while it was the active claim. On the 7th `rota billing` still printed
+# "USE NEXT rota switch thea ... its weekly window resets first", the keeper's
+# unattended picker ranked it the same way, and every one of the six live tmux
+# panes on ballito was restarted onto it. The seat answers every request with
+# "Your organization has disabled Claude subscription access for Claude Code",
+# so the whole box was down until the seats were re-probed by hand. The quota
+# numbers were not wrong; nothing was measuring whether the seat still existed.
+#
+# STRICTLY BEFORE TODAY, never `<=`. Measured on that same incident: thea worked
+# through 6 Sep, its stated end date, and stopped on the 7th - so the end date
+# is the seat's LAST WORKING DAY, and a seat is still spendable on it. That is
+# also the day the ranking correctly calls the most urgent in the pool, and
+# retiring it a day early would throw away the one window that cannot be had
+# back. (rota_seat_deadline reads the same date as that day's T00:00:00Z, the
+# conservative end of the day, purely so a bare date sorts against an ISO
+# instant; the two conventions answer different questions and neither moves.)
+#
+# The optional third argument is the day to compare against, for tests and for a
+# caller that has already resolved "today"; it defaults to this box's local date,
+# the same clock seat_ended has always used.
+rota_seat_ended() {  # rota_seat_ended <billing-json> <email> [today-YYYY-MM-DD]
+  local ends
+  ends="$(rota_seat_field "${1:-}" "${2:-}" 2)"
+  [[ -n "$ends" ]] || return 1
+  [[ "$ends" < "${3:-$(date '+%Y-%m-%d')}" ]]
+}
+
 # ── THE DEADLINE: min(weekly reset, SEAT END) ────────────────────────────────
 #
 # ⚠️ A CANCELLED SEAT IS THE MOST USE-IT-OR-LOSE-IT QUOTA IN THE POOL, NOT THE

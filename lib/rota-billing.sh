@@ -38,14 +38,25 @@
 # stub. Measured once: the laptop held credentials for ONE of five seats, so
 # running this there answered "one usable seat", confidently, and wrong. A quota
 # table that silently describes the wrong machine is worse than no table, so
-# when ROTA_POOL_HOST is set and names another box, this ssh's to it and says
-# so. Unset (the default) means: this box IS the pool host, read locally.
+# when a pool host is set and names another box, this ssh's to it and says
+# so. Unset (the default) means: this box IS the pool host, read locally. It is
+# set either in the environment (ROTA_POOL_HOST) or, for a box where it is
+# simply true, in $CLAUDE_FAILOVER_HOME/pool-host — one line, like `peers`.
 
 set -euo pipefail
 ROTA_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CFG_DIR="${CLAUDE_FAILOVER_HOME:-$HOME/.config/claude-failover}"
 BILLING_JSON="${CLAUDE_BILLING_JSON:-$CFG_DIR/billing.json}"
 POOL_HOST="${ROTA_POOL_HOST:-${CLAUDE_POOL_HOST:-}}"
+# An env var only reaches a shell that exported it: on a laptop that means an
+# edit to a dotfile, a reload, and a table that is right in the terminal and
+# wrong in anything launchd or an agent starts. The pool host is a property of
+# the MACHINE, so it is also read from a one-line file beside the other
+# machine-local state (accounts, peers, billing.json) — env still wins, so a
+# one-off `ROTA_POOL_HOST=… rota billing` overrides it.
+if [ -z "$POOL_HOST" ] && [ -r "$CFG_DIR/pool-host" ]; then
+  POOL_HOST="$(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$CFG_DIR/pool-host" | grep -v '^$' | head -1 || true)"
+fi
 
 WANT_JSON=0
 FORCE_LOCAL=0
@@ -340,6 +351,16 @@ for a in usage.get('accounts', []):
         'weekly_resets_projected': bool(not w.get('resets_at') and w.get('resets_at_projected')),
         'five_hour_left_pct': f.get('remaining_pct'),
         'five_hour_resets_at': f.get('resets_at'),
+        # ── WHICH WEEKLY, AND THE ALL-MODEL ONE (2026-09-26) ─────────────────
+        # weekly_left_pct stays the BINDING (highest) weekly cap, which is what the
+        # recommendation below ranks on and must keep ranking on. When that cap is a
+        # per-model one (kind weekly_scoped, e.g. Fable) the seat can still run
+        # every other model against weekly_all, so the table shows that number and
+        # names the scoped cap in NOTES. weekly_all is null when the engine never
+        # measured it (cached, peer, recorded rows): no number is invented.
+        'weekly_kind': w.get('kind'),
+        'weekly_scope': w.get('scope'),
+        'weekly_all': a.get('weekly_all'),
         # ── WHERE DID THIS NUMBER COME FROM, AND WHEN ────────────────────────
         # quota_data is live | cached | peer | none. quota_source names the peer
         # box when the engine had to read the seat's numbers over ssh (this box
@@ -502,8 +523,23 @@ for _i, _r in enumerate(rows):
     _r['_ord'] = _i
 rows.sort(key=lambda r: (bool(r['reserved']), r['_ord']))
 
+def scoped_view(r):
+    """(all-model left %, scope name) when the binding weekly is a scoped cap and the
+    all-model weekly is known, else None: the row then renders exactly as before."""
+    wa = r.get('weekly_all') or {}
+    left = wa.get('remaining_pct') if isinstance(wa, dict) else None
+    if r.get('weekly_kind') == 'weekly_scoped' and r.get('weekly_scope') and left is not None:
+        return left, r['weekly_scope']
+    return None
+
 for r in rows:
     wk = r['weekly_left_pct']
+    sv = scoped_view(r)
+    # A spent SCOPED cap (Fable) is not a spent seat: the cell shows the all-model
+    # weekly and the scoped cap moves to NOTES. The ranking still reads
+    # weekly_left_pct, untouched.
+    if sv is not None:
+        wk = sv[0]
     # ⚠️ THIS CELL IS THE WHOLE POINT OF THE UNMEASURED WORK. `0%` (spent) and
     # `-` (unknown) were both visually EMPTY, and on 2026-08-21 that cost two
     # cancelled-but-live seats' worth of already-paid-for quota: the operator
@@ -523,6 +559,8 @@ for r in rows:
     # A spent weekly makes the 5h window meaningless: it reads ~100% precisely
     # because nothing can run against it. Printing that invites reading a dead
     # seat as available, so blank it rather than show a number that means nothing.
+    # `wk` is the ALL-MODEL figure on a scoped row, so a spent Fable cap alone no
+    # longer blanks a 5h window other models are still running against.
     fh = r['five_hour_left_pct']
     fh_plain = '' if wk == 0 else (f"{fh}%" if fh is not None else '-')
 
@@ -543,6 +581,13 @@ for r in rows:
         notes.append(c(f"CANCELLED, ends {fmt_date(r['ends'])}{tail}", '31'))
     elif r['status'] == 'unknown':
         notes.append(c('billing unknown, add it to billing.json', '33'))
+    if sv is not None:
+        sleft = r['weekly_left_pct']
+        if sleft == 0:
+            back = parse_ts(r.get('weekly_resets_at'))
+            notes.append(c(f"{sv[1]} spent \u00b7 back {fmt(back)}" if back else f"{sv[1]} spent", '33'))
+        elif sleft is not None:
+            notes.append(c(f"{sv[1]} {sleft}% left", '2'))
     # ⚠️ PROVENANCE AND AGE ON EVERY NUMBER THIS BOX DID NOT MEASURE LIVE. The
     # marker answers "whose measurement is this", the age answers "from when",
     # and a row missing either one reads as current when it may be days old.
@@ -648,16 +693,50 @@ floor = (usage.get('floors') or {}).get('weekly_pct', 20)
 # rank on, so the exclusion is spelled out rather than left to depend on a None
 # happening to fall under the floor: the day something hands these rows a
 # placeholder percentage, that accident would start recommending a guess.
+#
+# ⚠️ AND A SEAT THAT HAS ALREADY ENDED IS NEVER A RECOMMENDATION. On the evening
+# of 2026-09-07 this printed `rota switch thea` for a subscription that ended on
+# the 6th, with the row one line above it reading `CANCELLED, ends 6 Sep`: the
+# table and the recommendation contradicting each other on the same seat. A
+# session launched onto it does not get 60% of a week, it gets an auth failure.
+#
+# THE EXCLUSION IS NOT CANCELLATION - see the block above, and do not widen it
+# to `status == cancelled`: a cancelled seat with a FUTURE end date is a fine
+# pick, often the best one in the pool. It is the narrower fact that there is no
+# window left at all. loses_at() is min(next reset, seat end), so for an ended
+# seat the key is a moment that has already gone by, and that sorts it FIRST -
+# the most-about-to-be-lost seat in the list. The key is right; the seat had no
+# business being in the list. Fixing this by touching loses_at() or the sort
+# order would break the cancelled-but-live case that key exists for.
+#
+# `seat_ended`, not a date comparison written out again here: it is the field
+# this file already calls the only one that means the account is actually done,
+# and last_window() reads that same field, so a row's NOTES and the ranking
+# cannot disagree about whether a seat is over.
 usable = [r for r in rows if (r['weekly_left_pct'] or 0) >= floor
           and not is_unmeasured(r)
+          and not r['seat_ended']
           and (INCLUDE_RESERVED or not r['reserved'])]
 usable.sort(key=lambda r: (loses_at(r), -(r['weekly_left_pct'] or 0)))
 
 # Say what was withheld and why. A seat that silently vanishes from the ranking
 # is indistinguishable from one that is simply spent, which is how a reservation
 # gets quietly forgotten and then quietly violated.
+#
+# ⚠️ AN ENDED SEAT IS NOT "WITHHELD", IT IS OVER, so it is named below in its own
+# block and struck from this one. A seat that is both reserved and ended would
+# otherwise be advertised here as "95% left → airmond-runner", which promises its
+# owner quota that no longer exists. One seat, one reason, and the terminal one
+# wins.
 held = [r for r in rows if r['reserved'] and (r['weekly_left_pct'] or 0) >= floor
-        and not INCLUDE_RESERVED]
+        and not r['seat_ended'] and not INCLUDE_RESERVED]
+
+# The same sentence for the same reason, about the dead ones: these rows still
+# show a fat green bar, so an omission nobody explains reads as a bug in the
+# table rather than as a fact about the seat. --include-reserved has no twin
+# here on purpose; there is nothing left to include.
+ended_out = [r for r in rows if r['seat_ended'] and not is_unmeasured(r)
+             and (r['weekly_left_pct'] or 0) >= floor]
 
 print(f"\n  {c('monthly total (approx, seats that still charge):', '2')} ${total:,.2f}")
 
@@ -693,7 +772,14 @@ else:
     # and naming its next reset would tell you to wait for quota you might
     # already be holding, which is the same inversion the UNMEASURED bucket
     # exists to undo. The block above the total is its answer instead.
-    cands = [r for r in rows if not is_unmeasured(r) and next_reset(r)]
+    #
+    # ⚠️ AND AN ENDED SEAT IS NOT AN "EARLIEST BACK" EITHER: it is not coming
+    # back. next_reset() happily names the next weekly reset of a subscription
+    # that expired last week - a real instant, on a calendar, for an account that
+    # will not exist to see it - and this line would then tell him to sit and wait
+    # for it. Same field as the ranking above, for the same reason.
+    cands = [r for r in rows if not is_unmeasured(r) and not r['seat_ended']
+             and next_reset(r)]
     soonest = min(cands, key=next_reset, default=None)
     msg = f"nothing clears the {floor}%-weekly floor"
     if soonest:
@@ -714,6 +800,17 @@ if held:
     # wrong for most of the ways a reader got here - it would send them to a
     # command they did not type.
     print(f"     {c('reserved seats are excluded from the ranking; pass --include-reserved to rank them too', '2')}")
+
+if ended_out:
+    # The end date, not just the word: "ended" beside a 60% bar is a claim the
+    # reader will want to check against the row, and the row says `ends 6 Sep`.
+    # Alias, never account.split('@')[0], for the reason spelled out above NOT
+    # OFFERED - two seats can share a local-part.
+    detail = '  ·  '.join(
+        f"{r['alias'] or r['account']} ({r['weekly_left_pct']}% left, ended {fmt_date(r['ends'])})"
+        for r in ended_out)
+    print(f"\n  {c('ENDED', '1;31')}   {c(detail, '2')}")
+    print(f"     {c('the subscription is over, so that quota cannot be spent by anyone; there is no flag that ranks it', '2')}")
 
 missing = [r['account'] for r in rows if r['status'] == 'unknown']
 if missing:
