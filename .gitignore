@@ -1,3 +1,7 @@
 *.log
 .DS_Store
 scratch/
+
+# Litter from a pre-0.1.0 run of the pool-init tilde test. tests/pool-v2.test.sh
+# now asserts this can never appear again, so this is belt and braces.
+/~/
