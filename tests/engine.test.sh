@@ -46,10 +46,36 @@ SCRIPT="$REPO_ROOT/lib/rota-engine.sh"
 PASS=0
 FAIL=0
 ok()  { PASS=$((PASS + 1)); printf 'ok   - %s\n' "$1"; }
-bad() { FAIL=$((FAIL + 1)); printf 'FAIL - %s\n' "$1"; }
+# A FAILURE THAT CANNOT SAY WHY IS MOST OF A FLAKE'S COST. Measured across five
+# identical runs of this suite on 2026-08-23: four green, one red on a single
+# assertion,
+#
+#     FAIL - cached hold (json) → from_cached_numbers is true (got: )
+#
+# `got:` was EMPTY. Every capture below sent the script's stderr to /dev/null,
+# so a run that REFUSED (`die "usage needs jq"`, an unreadable cache, any
+# non-zero exit) and a run that produced no output were the same string. There
+# was nothing to diagnose from, and there is no CI behind this suite: every run
+# of it is a person typing it, usually to decide whether their own change is
+# safe. A reasonless one-in-five red costs them an investigation into their own
+# diff.
+#
+# So the script's stderr now goes to $ERRLOG instead of /dev/null, truncated per
+# scenario by new_run(), and a failure prints its tail.
+bad() {
+  FAIL=$((FAIL + 1))
+  printf 'FAIL - %s\n' "$1"
+  if [ -s "${ERRLOG:-/dev/null}" ]; then
+    printf '       ── the script said (stderr) ──\n'
+    sed 's/^/       /' "$ERRLOG" | tail -8
+  fi
+}
 
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/failover-test.XXXXXX")"
 ROOT="$(cd "$ROOT" && pwd)"
+# Where the script's stderr goes instead of /dev/null. Truncated per scenario in
+# new_run(), so a failure shows THIS scenario's noise and not the whole run's.
+ERRLOG="$ROOT/last-stderr"
 cleanup() { rm -rf "$ROOT"; }
 trap cleanup EXIT
 
@@ -357,6 +383,7 @@ run_switch() {
 # untouched), this is a bare $HOME with no accounts file and no credentials,
 # each scenario below populates exactly what it needs.
 new_run() {  # new_run <name>
+  : > "$ERRLOG"
   RUN="$ROOT/run.$1"
   rm -rf "$RUN"
   mkdir -p "$RUN/.claude" "$RUN/cfg" "$RUN/state"
@@ -528,7 +555,7 @@ sole@example.com|$RUN/.claude-pool/sole
 EOF
 printf '{"oauthAccount":{"emailAddress":"trusted@example.com"}}' > "$RUN/.claude.json"
 set +e
-OUT="$(FAKE_OLD_EMAIL=trusted@example.com FAKE_NEW_EMAIL=untrusted@example.com FAKE_LAG=0 "$SCRIPT" active 2>/dev/null)"
+OUT="$(FAKE_OLD_EMAIL=trusted@example.com FAKE_NEW_EMAIL=untrusted@example.com FAKE_LAG=0 "$SCRIPT" active 2>>"$ERRLOG")"
 RC=$?
 set -e
 [ "$RC" -eq 0 ] && ok "identity precedence → active exits 0" || bad "identity precedence → active exits 0 (got $RC)"
@@ -565,7 +592,7 @@ set +e
 # FAKE_NEW_EMAIL pins the auth-status third opinion to the account oauthAccount
 # claims, so this scenario keeps testing ONLY the credential-vs-oauthAccount
 # disagreement it was written for (scenario 16 covers auth-status disagreement).
-JSON_OUT="$(FAKE_NEW_EMAIL=wk@example.com "$SCRIPT" usage --json 2>/dev/null)"
+JSON_OUT="$(FAKE_NEW_EMAIL=wk@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 RC=$?
 set -e
 [ "$RC" -eq 0 ] && ok "FIX1 regression → usage --json exits 0" || bad "FIX1 regression → usage --json exits 0 (got $RC: $JSON_OUT)"
@@ -654,7 +681,7 @@ printf '{"seven_day":{"utilization":10,"resets_at":"%s"},"five_hour":{"utilizati
 printf '{"seven_day":{"utilization":31,"resets_at":"%s"},"five_hour":{"utilization":25,"resets_at":"%s"}}' \
   "$(iso_in +5d)" "$(iso_in +2H)" > "$RUN/state/usage-TOK-WK-2.json"
 set +e
-OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage 2>/dev/null)"
+OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
 RC=$?
 set -e
 [ "$RC" -eq 0 ] && ok "health floor → usage exits 0" || bad "health floor → usage exits 0 (got $RC: $OUT)"
@@ -703,7 +730,7 @@ printf '{"seven_day":{"utilization":55,"resets_at":"%s"},"five_hour":{"utilizati
 printf '{"seven_day":{"utilization":69,"resets_at":"%s"},"five_hour":{"utilization":25,"resets_at":"%s"}}' \
   "$(iso_in +5d)" "$(iso_in +2H)" > "$RUN/state/usage-TOK-WK-3.json"
 set +e
-OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage 2>/dev/null)"
+OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
 RC=$?
 set -e
 [ "$RC" -eq 0 ] && ok "blocked 5h → usage exits 0" || bad "blocked 5h → usage exits 0 (got $RC: $OUT)"
@@ -738,8 +765,8 @@ jq -n --arg wr "$(iso_in -2d)" --arg sr "$(iso_in +2H)" \
   '{"wk@example.com":{wk_u:"45",wk_r:$wr,se_u:"20",se_r:$sr,ts:"stale fixture",ts_epoch:"0"}}' \
   > "$RUN/cfg/usage-cache.json"
 set +e
-OUT="$("$SCRIPT" usage --no-refresh 2>/dev/null)"
-JSON_OUT="$("$SCRIPT" usage --no-refresh --json 2>/dev/null)"
+OUT="$("$SCRIPT" usage --no-refresh 2>>"$ERRLOG")"
+JSON_OUT="$("$SCRIPT" usage --no-refresh --json 2>>"$ERRLOG")"
 RC=$?
 set -e
 [ "$RC" -eq 0 ] && ok "expired cache → usage --no-refresh exits 0" || bad "expired cache → usage --no-refresh exits 0 (got $RC)"
@@ -805,8 +832,8 @@ EOF
 new_run seatlive
 seed_cancelled_seat "$(date -u -v+14d '+%Y-%m-%d')"
 set +e
-OUT="$(CLAUDE_BILLING_JSON="$RUN/billing.json" "$SCRIPT" usage --no-refresh 2>/dev/null)"
-JSON_OUT="$(CLAUDE_BILLING_JSON="$RUN/billing.json" "$SCRIPT" usage --no-refresh --json 2>/dev/null)"
+OUT="$(CLAUDE_BILLING_JSON="$RUN/billing.json" "$SCRIPT" usage --no-refresh 2>>"$ERRLOG")"
+JSON_OUT="$(CLAUDE_BILLING_JSON="$RUN/billing.json" "$SCRIPT" usage --no-refresh --json 2>>"$ERRLOG")"
 set -e
 ! grep -q "spare@example.com" <<<"$(unavail_block <<<"$OUT")" \
   && ok "cancelled seat, window rolled → NOT unavailable: the seat has not ended" \
@@ -838,8 +865,8 @@ grep -q "rota usage --record spare" <<<"$(unmeasured_block <<<"$OUT")" \
 new_run seatended
 seed_cancelled_seat "$(date -u -v-1d '+%Y-%m-%d')"
 set +e
-OUT="$(CLAUDE_BILLING_JSON="$RUN/billing.json" "$SCRIPT" usage --no-refresh 2>/dev/null)"
-JSON_OUT="$(CLAUDE_BILLING_JSON="$RUN/billing.json" "$SCRIPT" usage --no-refresh --json 2>/dev/null)"
+OUT="$(CLAUDE_BILLING_JSON="$RUN/billing.json" "$SCRIPT" usage --no-refresh 2>>"$ERRLOG")"
+JSON_OUT="$(CLAUDE_BILLING_JSON="$RUN/billing.json" "$SCRIPT" usage --no-refresh --json 2>>"$ERRLOG")"
 set -e
 grep -q "spare@example.com" <<<"$(unavail_block <<<"$OUT")" \
   && ok "seat past its end date → IS unavailable" \
@@ -895,7 +922,7 @@ jq -n --arg ends "$(date -u -v+2d '+%Y-%m-%d')" \
               "alpha@example.com":{plan:"Max 20x",status:"active"}}}' > "$RUN/billing.json"
 set +e
 SR_OUT="$(FAKE_NEW_EMAIL=primary@example.com CLAUDE_BILLING_JSON="$RUN/billing.json" \
-          "$SCRIPT" usage 2>/dev/null)"
+          "$SCRIPT" usage 2>>"$ERRLOG")"
 set -e
 grep -q "switch to spare@example.com" <<<"$SR_OUT" \
   && ok "seat deadline → the CANCELLED seat is picked, though its weekly reset is LATER" \
@@ -930,7 +957,7 @@ grep -q "LAST window" <<<"$SR_OUT" \
 # cannot tell the two apart and that ambiguity was the whole defect.
 set +e
 SR_JSON="$(FAKE_NEW_EMAIL=primary@example.com CLAUDE_BILLING_JSON="$RUN/billing.json" \
-           "$SCRIPT" usage --json 2>/dev/null)"
+           "$SCRIPT" usage --json 2>>"$ERRLOG")"
 set -e
 [ "$(jq -r '.recommendation.email' <<<"$SR_JSON" 2>/dev/null)" = "spare@example.com" ] \
   && ok "seat deadline (json) → the seat-end-bound pick is the one published" \
@@ -964,7 +991,7 @@ jq -n --arg ends "$(date -u -v+8d '+%Y-%m-%d')" \
               "alpha@example.com":{plan:"Max 20x",status:"active"}}}' > "$RUN/billing.json"
 set +e
 SR_OUT2="$(FAKE_NEW_EMAIL=primary@example.com CLAUDE_BILLING_JSON="$RUN/billing.json" \
-           "$SCRIPT" usage 2>/dev/null)"
+           "$SCRIPT" usage 2>>"$ERRLOG")"
 set -e
 grep -q "switch to alpha@example.com" <<<"$SR_OUT2" \
   && ok "seat deadline (control) → an end date AFTER the reset stops binding, and the soonest reset wins" \
@@ -980,7 +1007,7 @@ grep -q "soonest weekly reset among the accounts clearing the health floor" <<<"
 # recomputed clock, so the two can never disagree about the same pick
 set +e
 SR_JSON2="$(FAKE_NEW_EMAIL=primary@example.com CLAUDE_BILLING_JSON="$RUN/billing.json" \
-            "$SCRIPT" usage --json 2>/dev/null)"
+            "$SCRIPT" usage --json 2>>"$ERRLOG")"
 set -e
 [ "$(jq -r '.recommendation.deadline_kind' <<<"$SR_JSON2" 2>/dev/null)" = "reset" ] \
   && ok "seat deadline (control, json) → deadline_kind flips to reset when the reset is what bound it" \
@@ -1005,8 +1032,8 @@ jq -n --arg t "$(date -u -v+3d '+%Y-%m-%d')" \
 jq -n --arg t "$(date -u -v-3d '+%Y-%m-%d')" \
   '{boosts:[{through:$t,what:"Weekly limits are 50% higher"}],accounts:{}}' > "$RUN/past.json"
 set +e
-LIVE_OUT="$(CLAUDE_BILLING_JSON="$RUN/live.json" "$SCRIPT" usage --no-refresh 2>/dev/null)"
-PAST_OUT="$(CLAUDE_BILLING_JSON="$RUN/past.json" "$SCRIPT" usage --no-refresh 2>/dev/null)"
+LIVE_OUT="$(CLAUDE_BILLING_JSON="$RUN/live.json" "$SCRIPT" usage --no-refresh 2>>"$ERRLOG")"
+PAST_OUT="$(CLAUDE_BILLING_JSON="$RUN/past.json" "$SCRIPT" usage --no-refresh 2>>"$ERRLOG")"
 set -e
 grep -q "boost until" <<<"$LIVE_OUT" \
   && ok "boost → a live boost is stated, so a percentage is read against the right baseline" \
@@ -1049,9 +1076,9 @@ set -e
 # the dishonesty this change exists to remove.
 set +e
 REC_TABLE="$(CLAUDE_POOL_DIR="$RUN/.claude-pool" CLAUDE_HUMAN_USAGE="$RUN/cfg/human-usage.json" \
-             "$SCRIPT" usage --no-refresh 2>/dev/null)"
+             "$SCRIPT" usage --no-refresh 2>>"$ERRLOG")"
 REC_JSON="$(CLAUDE_POOL_DIR="$RUN/.claude-pool" CLAUDE_HUMAN_USAGE="$RUN/cfg/human-usage.json" \
-            "$SCRIPT" usage --no-refresh --json 2>/dev/null)"
+            "$SCRIPT" usage --no-refresh --json 2>>"$ERRLOG")"
 set -e
 [ "$(jq -r '.accounts[0].weekly.used_pct' <<<"$REC_JSON" 2>/dev/null)" = "12" ] \
   && ok "--record → the recorded reading is what the usage report then shows" \
@@ -1108,7 +1135,7 @@ cat > "$RUN/cfg/accounts" <<EOF
 nobody@example.com|$RUN/.claude-pool/nobody
 EOF
 set +e
-OUT="$("$SCRIPT" active 2>/dev/null)"
+OUT="$("$SCRIPT" active 2>>"$ERRLOG")"
 RC=$?
 set -e
 [ "$RC" -eq 3 ] && ok "unresolvable identity → active exits 3" || bad "unresolvable identity → active exits 3 (got $RC: $OUT)"
@@ -1136,7 +1163,7 @@ EOF
 printf '{"seven_day":{"utilization":16,"resets_at":"%s"},"five_hour":{"utilization":40,"resets_at":"%s"}}' \
   "$(iso_in +3d)" "$(iso_in +2H)" > "$RUN/state/usage-TOK-PROBE.json"
 set +e
-OUT="$(CLAUDE_CONFIG_DIR="$RUN/.claude" FAKE_NEW_EMAIL=solo@example.com "$SCRIPT" usage 2>/dev/null)"
+OUT="$(CLAUDE_CONFIG_DIR="$RUN/.claude" FAKE_NEW_EMAIL=solo@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
 RC=$?
 set -e
 [ "$RC" -eq 0 ] && ok "probe env → usage exits 0" || bad "probe env → usage exits 0 (got $RC: $OUT)"
@@ -1170,8 +1197,8 @@ EOF
 printf '{"seven_day":{"utilization":16,"resets_at":"%s"},"five_hour":{"utilization":40,"resets_at":"%s"}}' \
   "$(iso_in +3d)" "$(iso_in +2H)" > "$RUN/state/usage-TOK-POL.json"
 set +e
-OUT="$(FAKE_NEW_EMAIL=solo@example.com "$SCRIPT" usage 2>/dev/null)"
-JSON_OUT="$(FAKE_NEW_EMAIL=solo@example.com "$SCRIPT" usage --json 2>/dev/null)"
+OUT="$(FAKE_NEW_EMAIL=solo@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
+JSON_OUT="$(FAKE_NEW_EMAIL=solo@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 RC=$?
 set -e
 [ "$RC" -eq 0 ] && ok "polarity → usage exits 0" || bad "polarity → usage exits 0 (got $RC: $OUT)"
@@ -1223,8 +1250,8 @@ EOF
 printf '{"seven_day":{"utilization":20,"resets_at":"%s"},"five_hour":{"utilization":20,"resets_at":"%s"}}' \
   "$(iso_in +3d)" "$(iso_in +2H)" > "$RUN/state/usage-TOK-NEST.json"
 set +e
-OUT="$(FAKE_NEW_EMAIL=live@example.com "$SCRIPT" usage 2>/dev/null)"
-JSON_OUT="$(FAKE_NEW_EMAIL=live@example.com "$SCRIPT" usage --json 2>/dev/null)"
+OUT="$(FAKE_NEW_EMAIL=live@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
+JSON_OUT="$(FAKE_NEW_EMAIL=live@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 RC=$?
 set -e
 [ "$RC" -eq 0 ] && ok "nested config → usage exits 0" || bad "nested config → usage exits 0 (got $RC: $OUT)"
@@ -1245,7 +1272,7 @@ grep -qF 'CLAUDE_CONFIG_DIR=$HOME/.claude' <<<"$OUT" \
 printf '{"oauthAccount":{"emailAddress":"live@example.com"}}' > "$RUN/.claude/.claude.json"
 set +e
 OUT2="$(FAKE_NEW_EMAIL=live@example.com "$SCRIPT" usage 2>&1)"
-JSON2="$(FAKE_NEW_EMAIL=live@example.com "$SCRIPT" usage --json 2>/dev/null)"
+JSON2="$(FAKE_NEW_EMAIL=live@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 set -e
 ! grep -q "NESTED" <<<"$OUT2" \
   && ok "nested config → silent when the two configs agree (no needless alarm)" \
@@ -1268,13 +1295,13 @@ EOF
 printf '{"seven_day":{"utilization":20,"resets_at":"%s"},"five_hour":{"utilization":20,"resets_at":"%s"}}' \
   "$(iso_in +3d)" "$(iso_in +2H)" > "$RUN/state/usage-TOK-3RD.json"
 set +e
-AGREE_JSON="$(FAKE_NEW_EMAIL=solo@example.com "$SCRIPT" usage --json 2>/dev/null)"
+AGREE_JSON="$(FAKE_NEW_EMAIL=solo@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 # --verbose: the identity/fingerprint line is DETAIL, not a warning, so the
 # default three-bucket view no longer carries it (2026-08-07). It still prints,
 # that is what --verbose is for, and what this asserts.
 AGREE_OUT="$(FAKE_NEW_EMAIL=solo@example.com "$SCRIPT" usage --verbose 2>&1)"
 AGREE_PLAIN="$(FAKE_NEW_EMAIL=solo@example.com "$SCRIPT" usage 2>&1)"
-DIS_JSON="$(FAKE_NEW_EMAIL=someone-else@example.com "$SCRIPT" usage --json 2>/dev/null)"
+DIS_JSON="$(FAKE_NEW_EMAIL=someone-else@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 DIS_OUT="$(FAKE_NEW_EMAIL=someone-else@example.com "$SCRIPT" usage 2>&1)"
 set -e
 [ "$(jq -r '.active.auth_status' <<<"$AGREE_JSON" 2>/dev/null)" = "solo@example.com" ] \
@@ -1337,9 +1364,9 @@ printf '{"seven_day":{"utilization":0.0,"resets_at":null,"limit_dollars":null},"
 printf '{"seven_day":{"utilization":18,"resets_at":"%s"},"five_hour":{"utilization":23,"resets_at":"%s"}}' \
   "$(iso_in +2d)" "$(iso_in +2H)" > "$RUN/state/usage-TOK-FRESH-ALPHA.json"
 set +e
-OUT="$(FAKE_NEW_EMAIL=spent@example.com "$SCRIPT" usage 2>/dev/null)"
-VOUT="$(FAKE_NEW_EMAIL=spent@example.com "$SCRIPT" usage --verbose 2>/dev/null)"
-JSON_OUT="$(FAKE_NEW_EMAIL=spent@example.com "$SCRIPT" usage --json 2>/dev/null)"
+OUT="$(FAKE_NEW_EMAIL=spent@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
+VOUT="$(FAKE_NEW_EMAIL=spent@example.com "$SCRIPT" usage --verbose 2>>"$ERRLOG")"
+JSON_OUT="$(FAKE_NEW_EMAIL=spent@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 RC=$?
 set -e
 [ "$RC" -eq 0 ] && ok "fresh window → usage exits 0" || bad "fresh window → usage exits 0 (got $RC: $OUT)"
@@ -1425,8 +1452,8 @@ printf '{"seven_day":{"utilization":99,"resets_at":"%s"},"five_hour":{"utilizati
 printf '{"seven_day":{"utilization":0.0,"resets_at":null},"five_hour":{"utilization":0.0,"resets_at":null}}' \
   > "$RUN/state/usage-TOK-FW-PRIMARY.json"
 set +e
-OUT="$(FAKE_NEW_EMAIL=alpha@example.com "$SCRIPT" usage 2>/dev/null)"
-JSON_OUT="$(FAKE_NEW_EMAIL=alpha@example.com "$SCRIPT" usage --json 2>/dev/null)"
+OUT="$(FAKE_NEW_EMAIL=alpha@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
+JSON_OUT="$(FAKE_NEW_EMAIL=alpha@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 RC=$?
 set -e
 [ "$RC" -eq 0 ] && ok "fresh wins → usage exits 0" || bad "fresh wins → usage exits 0 (got $RC: $OUT)"
@@ -1482,9 +1509,9 @@ printf '{"seven_day":{"utilization":18,"resets_at":"%s"},"five_hour":{"utilizati
 printf '{"seven_day":{"utilization":40,"resets_at":"%s"},"five_hour":{"resets_at":"%s"}}' \
   "$(iso_in +2d)" "$(iso_in +2H)" > "$RUN/state/usage-TOK-INC-PARTIAL.json"
 set +e
-OUT="$(FAKE_NEW_EMAIL=alpha@example.com "$SCRIPT" usage 2>/dev/null)"
-VOUT="$(FAKE_NEW_EMAIL=alpha@example.com "$SCRIPT" usage --verbose 2>/dev/null)"
-JSON_OUT="$(FAKE_NEW_EMAIL=alpha@example.com "$SCRIPT" usage --json 2>/dev/null)"
+OUT="$(FAKE_NEW_EMAIL=alpha@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
+VOUT="$(FAKE_NEW_EMAIL=alpha@example.com "$SCRIPT" usage --verbose 2>>"$ERRLOG")"
+JSON_OUT="$(FAKE_NEW_EMAIL=alpha@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 RC=$?
 set -e
 [ "$RC" -eq 0 ] && ok "incomplete data → usage exits 0" || bad "incomplete data → usage exits 0 (got $RC: $OUT)"
@@ -1539,9 +1566,9 @@ EOF
 jq -n '{"primary@example.com":{wk_u:"0.0",wk_r:"",se_u:"0.0",se_r:"",
         ts:"Jul 30 21:06",ts_epoch:"1785438377"}}' > "$RUN/cfg/usage-cache.json"
 set +e
-OUT="$("$SCRIPT" usage --no-refresh 2>/dev/null)"
-VOUT="$("$SCRIPT" usage --no-refresh --verbose 2>/dev/null)"
-JSON_OUT="$("$SCRIPT" usage --no-refresh --json 2>/dev/null)"
+OUT="$("$SCRIPT" usage --no-refresh 2>>"$ERRLOG")"
+VOUT="$("$SCRIPT" usage --no-refresh --verbose 2>>"$ERRLOG")"
+JSON_OUT="$("$SCRIPT" usage --no-refresh --json 2>>"$ERRLOG")"
 RC=$?
 set -e
 [ "$RC" -eq 0 ] && ok "cached fresh → usage --no-refresh exits 0" || bad "cached fresh → exits 0 (got $RC: $OUT)"
@@ -1601,8 +1628,8 @@ printf '{"five_hour":{"utilization":34.0,"resets_at":"%s"},
   "$FIVE_R" "$WK_ALL_R" "$FIVE_R" "$WK_ALL_R" "$WK_SCOPED_R" \
   > "$RUN/state/usage-TOK-BIND-SCOPED.json"
 set +e
-OUT="$(FAKE_NEW_EMAIL=solo@example.com "$SCRIPT" usage 2>/dev/null)"
-JSON_OUT="$(FAKE_NEW_EMAIL=solo@example.com "$SCRIPT" usage --json 2>/dev/null)"
+OUT="$(FAKE_NEW_EMAIL=solo@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
+JSON_OUT="$(FAKE_NEW_EMAIL=solo@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 RC=$?
 set -e
 [ "$RC" -eq 0 ] && ok "binding scoped → usage exits 0" || bad "binding scoped → usage exits 0 (got $RC: $OUT)"
@@ -1643,8 +1670,8 @@ bind_row="$(jq -c '.accounts[] | select(.email=="solo@example.com")' <<<"$JSON_O
 # the cache stores the binding NUMBER but not which limit produced it, so a --no-refresh
 # row must keep the 47 and drop the annotation rather than invent or stale one
 set +e
-CACHED_OUT="$("$SCRIPT" usage --no-refresh 2>/dev/null)"
-CACHED_JSON="$("$SCRIPT" usage --no-refresh --json 2>/dev/null)"
+CACHED_OUT="$("$SCRIPT" usage --no-refresh 2>>"$ERRLOG")"
+CACHED_JSON="$("$SCRIPT" usage --no-refresh --json 2>>"$ERRLOG")"
 set -e
 grep -qE '^    weekly  [█░]{15} +53% left · 47% used' <<<"$CACHED_OUT" \
   && ok "binding scoped → the cached row keeps the binding NUMBER" \
@@ -1681,8 +1708,8 @@ printf '{"five_hour":{"utilization":34.0,"resets_at":"%s"},
   "$FIVE_R" "$WK_ALL_R" "$FIVE_R" "$WK_ALL_R" "$WK_ALL_R" \
   > "$RUN/state/usage-TOK-BIND-ALL.json"
 set +e
-OUT="$(FAKE_NEW_EMAIL=solo@example.com "$SCRIPT" usage 2>/dev/null)"
-JSON_OUT="$(FAKE_NEW_EMAIL=solo@example.com "$SCRIPT" usage --json 2>/dev/null)"
+OUT="$(FAKE_NEW_EMAIL=solo@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
+JSON_OUT="$(FAKE_NEW_EMAIL=solo@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 RC=$?
 set -e
 [ "$RC" -eq 0 ] && ok "binding all → usage exits 0" || bad "binding all → usage exits 0 (got $RC: $OUT)"
@@ -1727,8 +1754,8 @@ fb_case() {  # fb_case <label> <limits-json-fragment-or-empty>
   printf '%s' "$body" > "$RUN/state/usage-TOK-FB.json"
   rm -f "$RUN/cfg/usage-cache.json"
   set +e
-  FB_OUT="$(FAKE_NEW_EMAIL=solo@example.com "$SCRIPT" usage 2>/dev/null)"
-  FB_JSON="$(FAKE_NEW_EMAIL=solo@example.com "$SCRIPT" usage --json 2>/dev/null)"
+  FB_OUT="$(FAKE_NEW_EMAIL=solo@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
+  FB_JSON="$(FAKE_NEW_EMAIL=solo@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
   FB_RC=$?
   set -e
   [ "$FB_RC" -eq 0 ] && ok "fallback [$label] → usage exits 0" \
@@ -1759,8 +1786,8 @@ printf '{"five_hour":{"utilization":34.0,"resets_at":"%s"},"seven_day":{"utiliza
   "$FB_SE_R" "$FB_WK_R" "$FB_WK_R" "$FB_WK_R" > "$RUN/state/usage-TOK-FB.json"
 rm -f "$RUN/cfg/usage-cache.json"
 set +e
-OUT="$(FAKE_NEW_EMAIL=solo@example.com "$SCRIPT" usage 2>/dev/null)"
-JSON_OUT="$(FAKE_NEW_EMAIL=solo@example.com "$SCRIPT" usage --json 2>/dev/null)"
+OUT="$(FAKE_NEW_EMAIL=solo@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
+JSON_OUT="$(FAKE_NEW_EMAIL=solo@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 RC=$?
 set -e
 [ "$RC" -eq 0 ] && ok "null scope name → usage exits 0" || bad "null scope name → usage exits 0 (got $RC: $OUT)"
@@ -1816,9 +1843,9 @@ printf '{"seven_day":{"utilization":18,"resets_at":"%s"},"five_hour":{"utilizati
 printf '{"seven_day":{"utilization":10,"resets_at":"%s"},"five_hour":{"utilization":95,"resets_at":"%s"}}' \
   "$(iso_in +4d)" "$BF_SE_R" > "$RUN/state/usage-TOK-BF-BUSY.json"
 set +e
-OUT="$(FAKE_NEW_EMAIL=opuscap@example.com "$SCRIPT" usage 2>/dev/null)"
-VOUT="$(FAKE_NEW_EMAIL=opuscap@example.com "$SCRIPT" usage --verbose 2>/dev/null)"
-JSON_OUT="$(FAKE_NEW_EMAIL=opuscap@example.com "$SCRIPT" usage --json 2>/dev/null)"
+OUT="$(FAKE_NEW_EMAIL=opuscap@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
+VOUT="$(FAKE_NEW_EMAIL=opuscap@example.com "$SCRIPT" usage --verbose 2>>"$ERRLOG")"
+JSON_OUT="$(FAKE_NEW_EMAIL=opuscap@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 RC=$?
 set -e
 [ "$RC" -eq 0 ] && ok "binding floor → usage exits 0" || bad "binding floor → usage exits 0 (got $RC: $OUT)"
@@ -1904,9 +1931,9 @@ printf '{"five_hour":{"utilization":5,"resets_at":"%s"},"seven_day":{"utilizatio
 printf '{"five_hour":{"utilization":5,"resets_at":"%s"},"seven_day":{"utilization":45,"resets_at":"%s"}}' \
   "$SS_SE_R" "$SS_ALL_R" > "$RUN/state/usage-TOK-SS-plain.json"
 set +e
-OUT="$(FAKE_NEW_EMAIL=alpha@example.com "$SCRIPT" usage 2>/dev/null)"
-VOUT="$(FAKE_NEW_EMAIL=alpha@example.com "$SCRIPT" usage --verbose 2>/dev/null)"
-JSON_OUT="$(FAKE_NEW_EMAIL=alpha@example.com "$SCRIPT" usage --json 2>/dev/null)"
+OUT="$(FAKE_NEW_EMAIL=alpha@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
+VOUT="$(FAKE_NEW_EMAIL=alpha@example.com "$SCRIPT" usage --verbose 2>>"$ERRLOG")"
+JSON_OUT="$(FAKE_NEW_EMAIL=alpha@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 RC=$?
 set -e
 [ "$RC" -eq 0 ] && ok "scoped spent → usage exits 0" || bad "scoped spent → usage exits 0 (got $RC: $OUT)"
@@ -1936,7 +1963,7 @@ grep -qE 'resets  weekly .* · all models .* · 5h ' <<<"$VOUT" \
   && ok "unscoped rows → no all-models note where nothing is scoped" \
   || bad "unscoped rows → no all-models note (got: $OUT)"
 set +e
-SS_CACHED_JSON="$("$SCRIPT" usage --no-refresh --json 2>/dev/null)"
+SS_CACHED_JSON="$("$SCRIPT" usage --no-refresh --json 2>>"$ERRLOG")"
 set -e
 [ "$(jq -r '.accounts[] | select(.email=="fable@example.com") | .weekly_all' <<<"$SS_CACHED_JSON" 2>/dev/null)" = "null" ] \
   && ok "scoped spent (json) → a cached row leaves weekly_all null, never invented" \
@@ -2084,7 +2111,7 @@ printf '{"seven_day":{"utilization":69,"resets_at":"%s"},"five_hour":{"utilizati
 printf '{"seven_day":{"utilization":30,"resets_at":"%s"},"five_hour":{"utilization":20,"resets_at":"%s"}}' \
   "$(iso_in +3d)" "$(iso_in +3H)" > "$RUN/state/usage-TOK-J2.json"
 set +e
-JS="$(FAKE_NEW_EMAIL=one@example.com "$SCRIPT" usage --json 2>/dev/null)"
+JS="$(FAKE_NEW_EMAIL=one@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 RC=$?
 set -e
 [ "$RC" -eq 0 ] && ok "json shape → exits 0" || bad "json shape → exits 0 (got $RC)"
@@ -2119,7 +2146,7 @@ wk_in="$(jq -r '.weekly.resetsInSeconds' <<<"$j1" 2>/dev/null)"
   || bad "json shape → active object untouched (got: $(jq -c '.active' <<<"$JS" 2>/dev/null))"
 # the reason must be the dashboard's own sentence, not a paraphrase
 J_REASON="$(jq -r '.recommendation.reason' <<<"$JS" 2>/dev/null)"
-J_HUMAN="$(FAKE_NEW_EMAIL=one@example.com "$SCRIPT" usage 2>/dev/null | grep -c "^→" || true)"
+J_HUMAN="$(FAKE_NEW_EMAIL=one@example.com "$SCRIPT" usage 2>>"$ERRLOG" | grep -c "^→" || true)"
 [ "$J_HUMAN" -ge 1 ] && [ "${J_REASON:0:1}" = "→" ] \
   && ok "json shape → recommendation.reason is the same sentence the dashboard prints" \
   || bad "json shape → recommendation.reason is the dashboard sentence (got: $J_REASON)"
@@ -2134,7 +2161,7 @@ esac
 # the error object must be buildable WITHOUT it.
 new_run jsonerr
 set +e
-ERR_OUT="$("$SCRIPT" usage --json 2>/dev/null)"
+ERR_OUT="$("$SCRIPT" usage --json 2>>"$ERRLOG")"
 ERR_RC=$?
 set -e
 [ "$ERR_RC" -ne 0 ] && ok "json error → non-zero exit when it cannot answer" \
@@ -2188,9 +2215,9 @@ EOF
 
 burn_fixture burndown 91
 set +e
-OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage 2>/dev/null)"
-VOUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --verbose 2>/dev/null)"
-JSON_OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --json 2>/dev/null)"
+OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
+VOUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --verbose 2>>"$ERRLOG")"
+JSON_OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 SW_OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" switch-auto --dry-run 2>&1)"
 SW_RC=$?
 set -e
@@ -2262,7 +2289,7 @@ grep -q "^→ stay on primary@example.com" <<<"$SW_OUT" \
 # with CLAUDE_FAILOVER_EXHAUSTED, so 9% left switches when the threshold is 10.
 burn_fixture burnedge97 97
 set +e
-OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage 2>/dev/null)"
+OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
 set -e
 grep -q "^→ stay on primary@example.com: weekly 97% used · 3% left" <<<"$OUT" \
   && ok "threshold → 3% left is still above the 2% threshold: hold" \
@@ -2270,8 +2297,8 @@ grep -q "^→ stay on primary@example.com: weekly 97% used · 3% left" <<<"$OUT"
 
 burn_fixture burnedge98 98
 set +e
-OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage 2>/dev/null)"
-JSON_OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --json 2>/dev/null)"
+OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
+JSON_OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 set -e
 grep -q "switch to wk@example.com" <<<"$OUT" \
   && ok "threshold → 2% left is AT the threshold: the ranking decides again" \
@@ -2285,7 +2312,7 @@ grep -q "soonest weekly reset among the accounts clearing the health floor" <<<"
 
 burn_fixture burnenv 91
 set +e
-OUT="$(CLAUDE_FAILOVER_EXHAUSTED=10 FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage 2>/dev/null)"
+OUT="$(CLAUDE_FAILOVER_EXHAUSTED=10 FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
 set -e
 grep -q "switch to wk@example.com" <<<"$OUT" \
   && ok "threshold → CLAUDE_FAILOVER_EXHAUSTED=10 makes 9% left count as spent" \
@@ -2314,8 +2341,8 @@ cat > "$RUN/cfg/usage-cache.json" <<EOF
 }
 EOF
 set +e
-OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --no-refresh 2>/dev/null)"
-JSON_OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --no-refresh --json 2>/dev/null)"
+OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --no-refresh 2>>"$ERRLOG")"
+JSON_OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --no-refresh --json 2>>"$ERRLOG")"
 set -e
 grep -q "^→ stay on primary@example.com: weekly 91% used · 9% left" <<<"$OUT" \
   && ok "cached hold → cached numbers may hold him (staying put is the safe direction)" \
@@ -2335,9 +2362,9 @@ grep -q "\[from CACHED numbers, Jul 20 02:14" <<<"$OUT" \
 # must be the unchanged pre-2026-08-06 one: switch to wk.
 burn_fixture roomy 91 20
 set +e
-OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage 2>/dev/null)"
-VOUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --verbose 2>/dev/null)"
-JSON_OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --json 2>/dev/null)"
+OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
+VOUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --verbose 2>>"$ERRLOG")"
+JSON_OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 SW_OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" switch-auto --dry-run 2>&1)"
 SW_RC=$?
 set -e
@@ -2364,7 +2391,7 @@ grep -q "mode: floor, there IS somewhere good to go (best other account wk@examp
 # Both directions, on fixtures whose auto-trigger says the opposite, so the override is
 # proved to be doing the work and not just agreeing with the default.
 set +e
-OUT="$(CLAUDE_FAILOVER_MODE=burn-down FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage 2>/dev/null)"
+OUT="$(CLAUDE_FAILOVER_MODE=burn-down FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
 set -e
 grep -q "^→ stay on primary@example.com" <<<"$OUT" \
   && ok "forced mode → CLAUDE_FAILOVER_MODE=burn-down holds even with a roomy pool" \
@@ -2380,8 +2407,8 @@ grep -q "comfortable mark 50%" <<<"$OUT" \
 
 burn_fixture forcedfloor 91
 set +e
-OUT="$(CLAUDE_FAILOVER_MODE=floor FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage 2>/dev/null)"
-JSON_OUT="$(CLAUDE_FAILOVER_MODE=floor FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --json 2>/dev/null)"
+OUT="$(CLAUDE_FAILOVER_MODE=floor FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
+JSON_OUT="$(CLAUDE_FAILOVER_MODE=floor FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 set -e
 grep -q "switch to wk@example.com" <<<"$OUT" \
   && ok "forced mode → CLAUDE_FAILOVER_MODE=floor switches even under scarcity" \
@@ -2562,7 +2589,7 @@ EOF
 printf '{"seven_day":{"utilization":20,"resets_at":"%s"},"five_hour":{"utilization":20,"resets_at":"%s"}}' \
   "$(iso_in +3d)" "$(iso_in +2H)" > "$RUN/state/usage-TOK-FIX.json"
 set +e
-WARN_OUT="$(FAKE_NEW_EMAIL=live@example.com "$SCRIPT" usage 2>/dev/null)"
+WARN_OUT="$(FAKE_NEW_EMAIL=live@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
 set -e
 grep -q "repair-nested" <<<"$WARN_OUT" \
   && ok "nested warning → names \`repair-nested\` as the remedy" \
@@ -2630,7 +2657,7 @@ EXQ_RC=$?
 # inherit its dated boosts and then fail by itself on the day one expired, with
 # a diff pointing at a line nobody touched.
 printf '{"accounts":{}}\n' > "$RUN/no-billing.json"
-EX_USAGE="$(FAKE_NEW_EMAIL=primary@example.com CLAUDE_BILLING_JSON="$RUN/no-billing.json" "$SCRIPT" usage 2>/dev/null)"
+EX_USAGE="$(FAKE_NEW_EMAIL=primary@example.com CLAUDE_BILLING_JSON="$RUN/no-billing.json" "$SCRIPT" usage 2>>"$ERRLOG")"
 set -e
 
 [ "$EX_RC" -eq 0 ] && ok "self-explaining switch → still exits 0 and still switches" \
@@ -2839,7 +2866,7 @@ norm_json() {
 # the same pinned-empty billing file as scenario 39, and for the same reason:
 # this fixture's run dir is a fresh one, so it needs its own copy
 printf '{"accounts":{}}\n' > "$RUN/no-billing.json"
-EX_JSON="$(FAKE_NEW_EMAIL=primary@example.com CLAUDE_BILLING_JSON="$RUN/no-billing.json" "$SCRIPT" usage --json 2>/dev/null | norm_json)"
+EX_JSON="$(FAKE_NEW_EMAIL=primary@example.com CLAUDE_BILLING_JSON="$RUN/no-billing.json" "$SCRIPT" usage --json 2>>"$ERRLOG" | norm_json)"
 # every published key path, in sorted order, the shape contract itself
 # LC_ALL=C so the ordering is ASCII and identical on every box, a locale-sorted
 # expectation would pass here and fail on a runner with a different LC_COLLATE.
@@ -2909,14 +2936,14 @@ EX_JSON_VALS_WANT='{"a":[{"active":true,"data":"live","email":"primary@example.c
 # rule would (correctly) suppress them.
 ESC="$(printf '\033')"
 set +e
-CLR_ON="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --color 2>/dev/null)"
-CLR_OFF="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --no-color 2>/dev/null)"
-CLR_AUTO="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage 2>/dev/null)"
-CLR_NOENV="$(NO_COLOR=1 FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage 2>/dev/null)"
-CLR_NOENV_FORCED="$(NO_COLOR=1 FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --color 2>/dev/null)"
+CLR_ON="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --color 2>>"$ERRLOG")"
+CLR_OFF="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --no-color 2>>"$ERRLOG")"
+CLR_AUTO="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
+CLR_NOENV="$(NO_COLOR=1 FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
+CLR_NOENV_FORCED="$(NO_COLOR=1 FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --color 2>>"$ERRLOG")"
 # shellcheck disable=SC1007  # NO_COLOR set to the EMPTY string is the case under test
-CLR_NOENV_EMPTY="$(NO_COLOR= FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage 2>/dev/null)"
-CLR_JSON="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --json --color 2>/dev/null)"
+CLR_NOENV_EMPTY="$(NO_COLOR= FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
+CLR_JSON="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --json --color 2>>"$ERRLOG")"
 CLR_BAD="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --nonsense 2>&1)"
 CLR_BAD_RC=$?
 set -e
@@ -2964,8 +2991,8 @@ $(diff <(printf '%s\n' "$CLR_OFF_N") <(printf '%s\n' "$CLR_STRIPPED") || true)"
 # Nothing was deleted in the redesign; the dense extras MOVED. This is the pair of
 # assertions that keeps that promise honest in both directions.
 set +e
-V_OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --verbose 2>/dev/null)"
-V_SHORT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage 2>/dev/null)"
+V_OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --verbose 2>>"$ERRLOG")"
+V_SHORT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
 V_RC=$?
 set -e
 [ "$V_RC" -eq 0 ] && ok "verbose → usage --verbose exits 0" || bad "verbose → exits 0 (got $V_RC: $V_OUT)"
@@ -2986,7 +3013,7 @@ grep -q '^      resets  weekly resets ' <<<"$V_OUT" \
   || bad "verbose → detail must stay behind the flag (got: $V_SHORT)"
 # -v is the short form of the same flag
 set +e
-V_SHORTFLAG="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage -v 2>/dev/null)"
+V_SHORTFLAG="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage -v 2>>"$ERRLOG")"
 set -e
 [ "$V_SHORTFLAG" != "$V_SHORT" ] && [ "$(grep -c '^      slot    ' <<<"$V_SHORTFLAG")" -eq 3 ] \
   && ok "verbose → -v is the same flag" \
@@ -3038,12 +3065,12 @@ panes_teardown() { unset FAKE_TMUX_PANES FAKE_TMUX_WORKING FAKE_TMUX_BACKGROUND;
 
 panes_fixture panes
 set +e
-PB_ACC="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" accounts 2>/dev/null)"
+PB_ACC="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" accounts 2>>"$ERRLOG")"
 PB_ACC_RC=$?
-PB_USAGE="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage 2>/dev/null)"
+PB_USAGE="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
 PB_SW="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" switch-auto --dry-run 2>&1)"
 PB_SWQ="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" switch-auto --dry-run --quiet 2>&1)"
-PB_JSON="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --json 2>/dev/null)"
+PB_JSON="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 set -e
 
 [ "$PB_ACC_RC" -eq 0 ] && ok "panes → accounts still exits 0 with the block attached" \
@@ -3096,8 +3123,8 @@ printf '%s' "$PB_JSON" | jq -e 'type=="object"' >/dev/null 2>&1 \
 
 # colour gating: the block obeys the same rule as everything else around it
 set +e
-PB_COL="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" accounts --color 2>/dev/null)"
-PB_NOCOL="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" accounts --no-color 2>/dev/null)"
+PB_COL="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" accounts --color 2>>"$ERRLOG")"
+PB_NOCOL="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" accounts --no-color 2>>"$ERRLOG")"
 set -e
 grep 'PANES' <<<"$PB_COL" | grep -q "$ESC" \
   && ok "panes → --color paints the block too" \
@@ -3368,7 +3395,7 @@ panes_teardown
 NS_LOG="$ROOT/tmux-nosession.log"
 : > "$NS_LOG"
 set +e
-NS_ACC="$(ROTA_TMUX_SESSION= TMUX_LOG="$NS_LOG" FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" accounts 2>/dev/null)"
+NS_ACC="$(ROTA_TMUX_SESSION= TMUX_LOG="$NS_LOG" FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" accounts 2>>"$ERRLOG")"
 NS_ACC_RC=$?
 NS_SW="$(ROTA_TMUX_SESSION= TMUX_LOG="$NS_LOG" FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" switch-auto --dry-run 2>&1)"
 NS_RI="$(ROTA_TMUX_SESSION= TMUX_LOG="$NS_LOG" FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" switch-auto --dry-run --restart-idle 2>&1)"
@@ -3399,7 +3426,7 @@ grep -q 'no tmux session configured' <<<"$NS_RI" && grep -q 'ROTA_TMUX_SESSION' 
 
 # (b) a configured name the server does not hold
 set +e
-NB_ACC="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" accounts 2>/dev/null)"
+NB_ACC="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" accounts 2>>"$ERRLOG")"
 NB_ACC_RC=$?
 NB_SW="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" switch-auto --dry-run 2>&1)"
 NB_RI="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" switch-auto --dry-run --restart-idle 2>&1)"
@@ -3435,7 +3462,7 @@ NOW="$(date +%s)"
 for t in 001 002 003 004; do ps_row "$((NOW - 600))" claude.exe > "$FAKE_STATE/ps-ttys$t.txt"; done
 touch -t "$(date -r "$((NOW - 3600))" '+%Y%m%d%H%M.%S')" "$HOME/.claude/.credentials.json"
 set +e
-HB_OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" accounts 2>/dev/null)"
+HB_OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" accounts 2>>"$ERRLOG")"
 set -e
 grep -q '^         4 may still be on the previous account' <<<"$HB_OUT" \
   && ok "heuristic → a cp -p-preserved mtime cannot hide panes: ctime still says the file just changed" \
@@ -3445,7 +3472,7 @@ panes_fixture heuristicfresh
 NOW="$(date +%s)"
 for t in 001 002 003 004; do ps_row "$((NOW + 3600))" claude.exe > "$FAKE_STATE/ps-ttys$t.txt"; done
 set +e
-HF_OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" accounts 2>/dev/null)"
+HF_OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" accounts 2>>"$ERRLOG")"
 set -e
 grep -q '^  PANES  4 total · 2 idle · 2 working$' <<<"$HF_OUT" \
   && ! grep -q 'may still be' <<<"$HF_OUT" \
@@ -3937,7 +3964,7 @@ run_usage
 grep -qE '^  ✗ deadpool@example\.com +cleared, needs login' <<<"$(unavail_block <<<"$OUT")" \
   && ok "no-heal → today's behaviour is kept: the row reports it and names the fix" \
   || bad "no-heal → row reports the state (got: $(unavail_block <<<"$OUT"))"
-grep -q "CLAUDE_CONFIG_DIR=.*claude-pool/deadpool claude" <<<"$(FAKE_NEW_EMAIL=live@example.com "$SCRIPT" usage --no-color --verbose 2>/dev/null)" \
+grep -q "CLAUDE_CONFIG_DIR=.*claude-pool/deadpool claude" <<<"$(FAKE_NEW_EMAIL=live@example.com "$SCRIPT" usage --no-color --verbose 2>>"$ERRLOG")" \
   && ok "no-heal → --verbose spells out the exact re-login command for that dir" \
   || bad "no-heal → the exact re-login command is available"
 
@@ -3982,8 +4009,8 @@ EOF
 printf '{"seven_day":{"utilization":10,"resets_at":"%s"},"five_hour":{"utilization":10,"resets_at":"%s"}}' \
   "$(iso_in +2d)" "$(iso_in +2H)" > "$RUN/state/usage-TOK-R-LIVE.json"
 set +e
-R_OUT="$(FAKE_NEW_EMAIL=live@example.com "$SCRIPT" usage --no-color 2>/dev/null)"
-R_JSON="$(FAKE_NEW_EMAIL=live@example.com "$SCRIPT" usage --json 2>/dev/null)"
+R_OUT="$(FAKE_NEW_EMAIL=live@example.com "$SCRIPT" usage --no-color 2>>"$ERRLOG")"
+R_JSON="$(FAKE_NEW_EMAIL=live@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 set -e
 R_UNAVAIL="$(unavail_block <<<"$R_OUT")"
 grep -qE '^  ✗ absent@example\.com +no stored credential' <<<"$R_UNAVAIL" \
@@ -4177,9 +4204,9 @@ peer_json "$(iso_at -30S)" remotealias remote@example.com:73:88 > "$RUN/state/pe
 # ⚠️ ONE $? PER RUN. Capturing it after the second assignment silently tested the
 # --json run twice and never checked the table run's exit code at all.
 set +e
-P_OUT="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage 2>/dev/null)"
+P_OUT="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
 RC=$?
-P_JSON="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>/dev/null)"
+P_JSON="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 RC_JSON=$?
 set -e
 P_REMOTE="$(prow remote@example.com "$P_JSON")"
@@ -4237,7 +4264,7 @@ grep -q 'via peerbox' <<<"$P_OUT" \
 peer_fixture peerlocalwins
 peer_json "$(iso_at -30S)" remotealias local@example.com:1:1 remote@example.com:73:88 \
   > "$RUN/state/peer-peerbox.json"
-P_JSON="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>/dev/null)"
+P_JSON="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 P_LOCAL="$(prow local@example.com "$P_JSON")"
 [ "$(jq -r '.quota_data' <<<"$P_LOCAL")" = live ] \
   && [ "$(jq -r '.weekly.remaining_pct' <<<"$P_LOCAL")" = 90 ] \
@@ -4253,7 +4280,7 @@ jq -n --arg wr "$(iso_in +3d)" --arg sr "$(iso_in +2H)" --arg te "$(( $(date +%s
   '{"remote@example.com":{wk_u:"40",wk_r:$wr,se_u:"30",se_r:$sr,ts:"a minute ago",ts_epoch:$te}}' \
   > "$RUN/cfg/usage-cache.json"
 peer_json "$(iso_at -2d)" remotealias remote@example.com:73:88 > "$RUN/state/peer-peerbox.json"
-P_JSON="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>/dev/null)"
+P_JSON="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 P_REMOTE="$(prow remote@example.com "$P_JSON")"
 [ "$(jq -r '.quota_data' <<<"$P_REMOTE")" = cached ] \
   && [ "$(jq -r '.weekly.remaining_pct' <<<"$P_REMOTE")" = 60 ] \
@@ -4265,7 +4292,7 @@ jq -n --arg wr "$(iso_in +3d)" --arg sr "$(iso_in +2H)" --arg te "$(( $(date +%s
   '{"remote@example.com":{wk_u:"40",wk_r:$wr,se_u:"30",se_r:$sr,ts:"three days ago",ts_epoch:$te}}' \
   > "$RUN/cfg/usage-cache.json"
 peer_json "$(iso_at -30S)" remotealias remote@example.com:73:88 > "$RUN/state/peer-peerbox.json"
-P_JSON="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>/dev/null)"
+P_JSON="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 P_REMOTE="$(prow remote@example.com "$P_JSON")"
 [ "$(jq -r '.quota_data' <<<"$P_REMOTE")" = peer ] \
   && [ "$(jq -r '.weekly.remaining_pct' <<<"$P_REMOTE")" = 73 ] \
@@ -4279,13 +4306,13 @@ P_REMOTE="$(prow remote@example.com "$P_JSON")"
 # a bare marker. A 2.5-day-old number shown like a live one is worse than a blank.
 peer_fixture peerage
 peer_json "$(iso_at -2d)" remotealias remote@example.com:73:88 > "$RUN/state/peer-peerbox.json"
-P_OUT="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage 2>/dev/null)"
+P_OUT="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
 grep -q 'via peerbox, 2d old' <<<"$P_OUT" \
   && ok "age → a two-day-old peer number says so, in one coarse glanceable unit" \
   || bad "age → a stale peer row shows its age (got: $P_OUT)"
 peer_fixture peerageminor
 peer_json "$(iso_at -30S)" remotealias remote@example.com:73:88 > "$RUN/state/peer-peerbox.json"
-P_OUT="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage 2>/dev/null)"
+P_OUT="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
 grep -q 'via peerbox' <<<"$P_OUT" && ! grep -qE 'via peerbox, [0-9]+[mhd] old' <<<"$P_OUT" \
   && ok "age → a number measured 30s ago carries no age: below 120s it IS now" \
   || bad "age → a fresh peer row shows no age (got: $P_OUT)"
@@ -4294,7 +4321,7 @@ grep -q 'via peerbox' <<<"$P_OUT" && ! grep -qE 'via peerbox, [0-9]+[mhd] old' <
 # The whole feature is a bonus on top of a table that was already correct. A peer
 # problem must never cost the operator a line to read, a stack trace, or a hang.
 peer_fixture peerdown
-P_NOPEER="$("$SCRIPT" usage 2>/dev/null | norm_peer)"
+P_NOPEER="$("$SCRIPT" usage 2>>"$ERRLOG" | norm_peer)"
 P_DEAD="$(ROTA_PEERS=deadbox "$SCRIPT" usage 2>"$RUN/peer.err" | norm_peer)"
 [ "$P_NOPEER" = "$P_DEAD" ] \
   && ok "unreachable peer → output is byte-identical to having no peer at all" \
@@ -4308,7 +4335,7 @@ grep -q 'peer deadbox' <<<"$(ROTA_PEERS=deadbox "$SCRIPT" usage --verbose 2>&1 >
 # the same for a peer that answers with something that is not JSON
 peer_fixture peerjunk
 : > "$RUN/state/peer-junk-peerbox"
-P_JUNK="$(ROTA_PEERS=peerbox "$SCRIPT" usage --json 2>/dev/null)"
+P_JUNK="$(ROTA_PEERS=peerbox "$SCRIPT" usage --json 2>>"$ERRLOG")"
 [ "$(jq -r '.accounts[] | select(.email=="remote@example.com") | .quota_data' <<<"$P_JUNK")" = none ] \
   && ok "junk from a peer → ignored, the row stays honestly empty" \
   || bad "junk from a peer → must be ignored (got: $P_JUNK)"
@@ -4320,7 +4347,7 @@ peer_fixture peerhang
 : > "$RUN/state/peer-slow-peerbox"
 HANG_START="$(date +%s)"
 set +e
-P_HANG="$(ROTA_PEER_TIMEOUT=1 ROTA_PEERS=peerbox "$SCRIPT" usage --json 2>/dev/null)"
+P_HANG="$(ROTA_PEER_TIMEOUT=1 ROTA_PEERS=peerbox "$SCRIPT" usage --json 2>>"$ERRLOG")"
 HANG_RC=$?
 set -e
 HANG_SECS=$(( $(date +%s) - HANG_START ))
@@ -4386,7 +4413,7 @@ done
 peer_fixture peerfailquiet
 : > "$RUN/state/peer-slow-peerbox"
 ROTA_PEER_TIMEOUT=1 ROTA_PEERS=peerbox "$SCRIPT" usage >/dev/null 2>&1 || true
-FQ_NOPEER="$("$SCRIPT" usage 2>/dev/null | norm_peer)"
+FQ_NOPEER="$("$SCRIPT" usage 2>>"$ERRLOG" | norm_peer)"
 FQ_CACHED="$(ROTA_PEERS=peerbox "$SCRIPT" usage 2>"$RUN/fq.err" | norm_peer)"
 [ "$FQ_NOPEER" = "$FQ_CACHED" ] && [ ! -s "$RUN/fq.err" ] \
   && ok "failure cache → a suppressed peer still renders byte-identical no-peer output, silently" \
@@ -4421,7 +4448,7 @@ for VAL in '"n/a"' 'true' '"85%"' '"1e3"' "\"U_WKX[\$(touch $PWN)0]\""; do
   # without it the run prints the (correct, unrelated) identity WARNING to stderr
   # and the capture stops being the one parseable object under test.
   set +e
-  HOSTILE_OUT="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>/dev/null)"
+  HOSTILE_OUT="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
   HOSTILE_RC=$?
   set -e
   [ "$HOSTILE_RC" -eq 0 ] && jq -e 'type=="object"' <<<"$HOSTILE_OUT" >/dev/null 2>&1 \
@@ -4440,7 +4467,7 @@ jq -n --arg g "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" --arg m "$(iso_at -30S)" \
   '{generated_at:$g, peer:null, accounts:[{account:"remote@example.com",
      weekly_left_pct:"n/a", five_hour_left_pct:"n/a", quota_data:"cached",
      quota_measured_at:$m}]}' > "$RUN/state/peer-peerbox.json"
-HOSTILE_BOTH="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>/dev/null)"
+HOSTILE_BOTH="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 [ "$(jq -r '.accounts[] | select(.email=="remote@example.com") | .quota_data' <<<"$HOSTILE_BOTH")" = none ] \
   && ok "hostile payload → a row with NO usable number at all is not claimed as a peer row" \
   || bad "hostile payload → both-windows-garbage must fall through (got: $HOSTILE_BOTH)"
@@ -4459,7 +4486,7 @@ jq -n --arg g "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" --arg m "$(iso_at -30S)" \
      quota_data:"cached", quota_source:null, quota_measured_at:$m,
      weekly:{remaining_pct:64, resets_at:$wr},
      five_hour:{remaining_pct:91, resets_at:$sr}}]}' > "$RUN/state/peer-peerbox.json"
-P_ENG="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>/dev/null)"
+P_ENG="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 P_ENG_ROW="$(prow remote@example.com "$P_ENG")"
 [ "$(jq -r '.quota_data' <<<"$P_ENG_ROW")" = peer ] \
   && [ "$(jq -r '.weekly.remaining_pct' <<<"$P_ENG_ROW")" = 64 ] \
@@ -4478,7 +4505,7 @@ P_ENG_ROW="$(prow remote@example.com "$P_ENG")"
 peer_fixture peerfirstwins
 peer_json "$(iso_at -30S)" remotealias remote@example.com:73:88 > "$RUN/state/peer-boxA.json"
 peer_json "$(iso_at -30S)" remotealias remote@example.com:11:11 > "$RUN/state/peer-boxB.json"
-P_MULTI="$(ROTA_PEERS="boxA boxB" FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>/dev/null)"
+P_MULTI="$(ROTA_PEERS="boxA boxB" FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 [ "$(jq -r '.peer.host' <<<"$P_MULTI")" = boxA ] \
   && [ "$(jq -r '.accounts[]|select(.email=="remote@example.com")|.weekly.remaining_pct' <<<"$P_MULTI")" = 73 ] \
   && ok "multi-peer → the FIRST peer that answers usefully wins, in configured order" \
@@ -4491,7 +4518,7 @@ peer_fixture peeruseless
 # boxA is up and healthy but knows nothing about the seat this box is missing
 peer_json "$(iso_at -30S)" other other@example.com:99:99 > "$RUN/state/peer-boxA.json"
 peer_json "$(iso_at -30S)" remotealias remote@example.com:41:55 > "$RUN/state/peer-boxB.json"
-P_USELESS="$(ROTA_PEERS="boxA boxB" FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>/dev/null)"
+P_USELESS="$(ROTA_PEERS="boxA boxB" FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 [ "$(jq -r '.peer.host' <<<"$P_USELESS")" = boxB ] \
   && [ "$(jq -r '.accounts[]|select(.email=="remote@example.com")|.weekly.remaining_pct' <<<"$P_USELESS")" = 41 ] \
   && ok "multi-peer → a peer that answers UNUSEFULLY does not end the search" \
@@ -4536,7 +4563,7 @@ ROTA_PEERS=peerbox "$SCRIPT" usage --no-refresh --json >/dev/null 2>&1 || true
 # another seat's line, which is the one failure worse than a blank row.
 peer_fixture peeralias
 peer_json "$(iso_at -30S)" remoteseat someone-else@example.com:73:88 > "$RUN/state/peer-peerbox.json"
-P_JSON="$(ROTA_PEERS=peerbox "$SCRIPT" usage --json 2>/dev/null)"
+P_JSON="$(ROTA_PEERS=peerbox "$SCRIPT" usage --json 2>>"$ERRLOG")"
 [ "$(jq -r '.accounts[] | select(.email=="remote@example.com") | .quota_data' <<<"$P_JSON")" = none ] \
   && ok "alias collision → a peer row whose ALIAS matches but whose email does not is ignored" \
   || bad "alias collision → must not cross-match (got: $P_JSON)"
@@ -4548,7 +4575,7 @@ P_JSON="$(ROTA_PEERS=peerbox "$SCRIPT" usage --json 2>/dev/null)"
 peer_fixture peerfile
 peer_json "$(iso_at -30S)" remotealias remote@example.com:73:88 > "$RUN/state/peer-peerbox.json"
 printf '# boxes that hold what this one does not\n\n  peerbox  \n' > "$RUN/cfg/peers"
-P_JSON="$("$SCRIPT" usage --json 2>/dev/null)"
+P_JSON="$("$SCRIPT" usage --json 2>>"$ERRLOG")"
 [ "$(jq -r '.accounts[] | select(.email=="remote@example.com") | .quota_data' <<<"$P_JSON")" = peer ] \
   && ok "peers file → read from \$CFG_DIR/peers, with comments and blank lines ignored" \
   || bad "peers file → the file is read (got: $P_JSON)"
@@ -4568,7 +4595,7 @@ ROTA_PEERS="$SELF_HOST" "$SCRIPT" usage --json >/dev/null 2>&1 || true
 # is armed, so a failure to skip fills the row and is visible twice over.
 peer_fixture peerselffqdn
 peer_json "$(iso_at -30S)" remotealias remote@example.com:73:88 > "$RUN/state/peer-peerbox.local.json"
-P_FQDN="$(HOSTNAME=peerbox.local ROTA_PEERS=peerbox.local "$SCRIPT" usage --json 2>/dev/null)"
+P_FQDN="$(HOSTNAME=peerbox.local ROTA_PEERS=peerbox.local "$SCRIPT" usage --json 2>>"$ERRLOG")"
 [ "$(ssh_count)" -eq 0 ] \
   && ok "self as peer → the FQDN spelling is skipped too (HOSTNAME=peerbox.local vs peerbox.local)" \
   || bad "self as peer → dialled its own FQDN $(ssh_count) time(s)"
@@ -4624,9 +4651,9 @@ jq -n --arg ends "$(date -u -v+5d '+%Y-%m-%d')" \
   > "$RUN/billing.json"
 set +e
 PU_OUT="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com \
-          CLAUDE_BILLING_JSON="$RUN/billing.json" "$SCRIPT" usage 2>/dev/null)"
+          CLAUDE_BILLING_JSON="$RUN/billing.json" "$SCRIPT" usage 2>>"$ERRLOG")"
 PU_JSON="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com \
-           CLAUDE_BILLING_JSON="$RUN/billing.json" "$SCRIPT" usage --json 2>/dev/null)"
+           CLAUDE_BILLING_JSON="$RUN/billing.json" "$SCRIPT" usage --json 2>>"$ERRLOG")"
 set -e
 PU_REMOTE="$(prow remote@example.com "$PU_JSON")"
 grep -q 'remote@example.com' <<<"$(unmeasured_block <<<"$PU_OUT")" \
@@ -4665,8 +4692,8 @@ cred_json TOK-REMOTE > "$RUN/.claude-pool/remoteseat/.credentials.json"
 printf '429' > "$RUN/state/usage-TOK-REMOTE.code"
 peer_json "$(iso_at -30S)" remotealias remote@example.com:73:88 > "$RUN/state/peer-peerbox.json"
 set +e
-P4_OUT="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage 2>/dev/null)"
-P4_JSON="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>/dev/null)"
+P4_OUT="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
+P4_JSON="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 set -e
 P4_REMOTE="$(prow remote@example.com "$P4_JSON")"
 [ "$(jq -r '.quota_data' <<<"$P4_REMOTE")" = peer ] \
@@ -4691,8 +4718,8 @@ jq -n --arg wr "$(iso_in +3d)" --arg sr "$(iso_in +2H)" --arg te "$(( $(date +%s
   '{"remote@example.com":{wk_u:"27",wk_r:$wr,se_u:"12",se_r:$sr,ts:"ten minutes ago",ts_epoch:$te}}' \
   > "$RUN/cfg/usage-cache.json"
 set +e
-C4_OUT="$(FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage 2>/dev/null)"
-C4_JSON="$(FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>/dev/null)"
+C4_OUT="$(FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
+C4_JSON="$(FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 set -e
 C4_REMOTE="$(prow remote@example.com "$C4_JSON")"
 [ "$(jq -r '.quota_data' <<<"$C4_REMOTE")" = cached ] \
@@ -4709,8 +4736,8 @@ peer_fixture nonum429
 cred_json TOK-REMOTE > "$RUN/.claude-pool/remoteseat/.credentials.json"
 printf '429' > "$RUN/state/usage-TOK-REMOTE.code"
 set +e
-N4_OUT="$(FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage 2>/dev/null)"
-N4_JSON="$(FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>/dev/null)"
+N4_OUT="$(FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
+N4_JSON="$(FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 set -e
 [ "$(jq -r '.unmeasured' <<<"$(prow remote@example.com "$N4_JSON")")" = true ] \
   && ok "429 with no number at all → still UNMEASURED, the case that arm was written for" \
@@ -4735,7 +4762,7 @@ jq --arg wr "$(iso_in +3d)" --argjson te "$(date +%s)" \
    "$RUN/cfg/human-usage.json" > "$RUN/cfg/hu.json" && mv "$RUN/cfg/hu.json" "$RUN/cfg/human-usage.json"
 peer_json "$(iso_at -2d)" remotealias remote@example.com:73:88 > "$RUN/state/peer-peerbox.json"
 R1_JSON="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com \
-           CLAUDE_HUMAN_USAGE="$RUN/cfg/human-usage.json" "$SCRIPT" usage --json 2>/dev/null)"
+           CLAUDE_HUMAN_USAGE="$RUN/cfg/human-usage.json" "$SCRIPT" usage --json 2>>"$ERRLOG")"
 R1_REMOTE="$(prow remote@example.com "$R1_JSON")"
 [ "$(jq -r '.weekly.remaining_pct' <<<"$R1_REMOTE")" = 92 ] \
   && [ "$(jq -r '.quota_data' <<<"$R1_REMOTE")" = cached ] \
@@ -4751,7 +4778,7 @@ jq --arg wr "$(iso_in +3d)" --argjson te "$(( $(date +%s) - 259200 ))" \
    "$RUN/cfg/human-usage.json" > "$RUN/cfg/hu.json" && mv "$RUN/cfg/hu.json" "$RUN/cfg/human-usage.json"
 peer_json "$(iso_at -30S)" remotealias remote@example.com:73:88 > "$RUN/state/peer-peerbox.json"
 R2_JSON="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com \
-           CLAUDE_HUMAN_USAGE="$RUN/cfg/human-usage.json" "$SCRIPT" usage --json 2>/dev/null)"
+           CLAUDE_HUMAN_USAGE="$RUN/cfg/human-usage.json" "$SCRIPT" usage --json 2>>"$ERRLOG")"
 R2_REMOTE="$(prow remote@example.com "$R2_JSON")"
 [ "$(jq -r '.weekly.remaining_pct' <<<"$R2_REMOTE")" = 73 ] \
   && [ "$(jq -r '.quota_data' <<<"$R2_REMOTE")" = peer ] \
@@ -4769,7 +4796,7 @@ jq --arg wr "$(iso_in +3d)" --argjson te "$(date +%s)" \
                                     source:"vendor usage page, read by hand"}' \
    "$RUN/cfg/human-usage.json" > "$RUN/cfg/hu.json" && mv "$RUN/cfg/hu.json" "$RUN/cfg/human-usage.json"
 R3_JSON="$(FAKE_NEW_EMAIL=local@example.com CLAUDE_HUMAN_USAGE="$RUN/cfg/human-usage.json" \
-           "$SCRIPT" usage --json 2>/dev/null)"
+           "$SCRIPT" usage --json 2>>"$ERRLOG")"
 R3_LOCAL="$(prow local@example.com "$R3_JSON")"
 [ "$(jq -r '.quota_data' <<<"$R3_LOCAL")" = live ] \
   && [ "$(jq -r '.weekly.remaining_pct' <<<"$R3_LOCAL")" = 90 ] \
@@ -4816,7 +4843,7 @@ EOF
 printf '{"seven_day":{"utilization":10,"resets_at":"%s"},"five_hour":{"utilization":10,"resets_at":"%s"}}' \
   "$(iso_in +2d)" "$(iso_in +2H)" > "$RUN/state/usage-TOK-X-LIVE.json"
 run_usage
-X_JSON="$(FAKE_NEW_EMAIL=live@example.com "$SCRIPT" usage --json 2>/dev/null)"
+X_JSON="$(FAKE_NEW_EMAIL=live@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 X_EXPIRED="$(prow expired@example.com "$X_JSON")"
 X_LIMITED="$(prow limited@example.com "$X_JSON")"
 [ "$(grep -c '^expired$' "$RUN/state/nudges" 2>/dev/null || echo 0)" -ge 1 ] \
@@ -4875,7 +4902,7 @@ EOF
 printf '{"seven_day":{"utilization":10,"resets_at":"%s"},"five_hour":{"utilization":10,"resets_at":"%s"}}' \
   "$(iso_in +2d)" "$(iso_in +2H)" > "$RUN/state/usage-TOK-R-LIVE.json"
 run_usage
-R_JSON="$(FAKE_NEW_EMAIL=live@example.com "$SCRIPT" usage --json 2>/dev/null)"
+R_JSON="$(FAKE_NEW_EMAIL=live@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 ! grep -qE '^(marked|listed)$' "$RUN/state/nudges" 2>/dev/null \
   && ok "reserved seat → neither reservation source is nudged, expired token or not" \
   || bad "reserved seat → must not nudge (nudges: $(cat "$RUN/state/nudges" 2>/dev/null || echo none))"
@@ -4949,9 +4976,9 @@ PROJ_SEEN="$(date -u -r "$PROJ_SEEN_EPOCH" '+%Y-%m-%dT%H:%M:%S.123456+00:00')"
 PROJ_WANT="$(date -u -r $(( PROJ_SEEN_EPOCH + 604800 )) '+%Y-%m-%dT%H:%M:%S+00:00')"
 proj_fixture projected "$PROJ_SEEN"
 set +e
-OUT="$(FAKE_NEW_EMAIL=fresh@example.com "$SCRIPT" usage --no-color 2>/dev/null)"
-VOUT="$(FAKE_NEW_EMAIL=fresh@example.com "$SCRIPT" usage --no-color --verbose 2>/dev/null)"
-JSON_OUT="$(FAKE_NEW_EMAIL=fresh@example.com "$SCRIPT" usage --json 2>/dev/null)"
+OUT="$(FAKE_NEW_EMAIL=fresh@example.com "$SCRIPT" usage --no-color 2>>"$ERRLOG")"
+VOUT="$(FAKE_NEW_EMAIL=fresh@example.com "$SCRIPT" usage --no-color --verbose 2>>"$ERRLOG")"
+JSON_OUT="$(FAKE_NEW_EMAIL=fresh@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 RC=$?
 set -e
 PJ_ROW="$(prow "fresh@example.com" "$JSON_OUT")"
@@ -4989,8 +5016,8 @@ grep -q 'resets  weekly resets ~' <<<"$VOUT" \
 # (b) nothing ever seen for this seat → NO projection, and no ~ anywhere
 proj_fixture noseen ""
 set +e
-OUT="$(FAKE_NEW_EMAIL=fresh@example.com "$SCRIPT" usage --no-color 2>/dev/null)"
-JSON_OUT="$(FAKE_NEW_EMAIL=fresh@example.com "$SCRIPT" usage --json 2>/dev/null)"
+OUT="$(FAKE_NEW_EMAIL=fresh@example.com "$SCRIPT" usage --no-color 2>>"$ERRLOG")"
+JSON_OUT="$(FAKE_NEW_EMAIL=fresh@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 set -e
 NS_ROW="$(prow "fresh@example.com" "$JSON_OUT")"
 [ "$(jq -r '[.weekly.resets_at, .weekly.resets_at_projected, .weekly.projected_from] | @csv' <<<"$NS_ROW")" = ',,' ] \
@@ -5019,7 +5046,7 @@ jq -n --arg wr "$(iso_in -2d)" \
   '{"fresh@example.com":{wk_u:"40",wk_r:$wr,se_u:"5",se_r:"",ts:"Sep 01 09:00",ts_epoch:"1",wk_r_seen:$wr}}' \
   > "$RUN/cfg/usage-cache.json"
 set +e
-JSON_OUT="$(FAKE_NEW_EMAIL=fresh@example.com "$SCRIPT" usage --json 2>/dev/null)"
+JSON_OUT="$(FAKE_NEW_EMAIL=fresh@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 set -e
 EX_ROW="$(prow "fresh@example.com" "$JSON_OUT")"
 [ "$(jq -r '.weekly.expired' <<<"$EX_ROW")" = "true" ] \
@@ -5064,7 +5091,7 @@ printf '{"seven_day":{"utilization":30,"resets_at":"%s"},"five_hour":{"utilizati
 printf '{"seven_day":{"utilization":99,"resets_at":"%s"},"five_hour":{"utilization":15,"resets_at":"%s"}}' \
   "$(iso_in +4d)" "$(iso_in +1H)" > "$RUN/state/usage-TOK-PR-PRIMARY.json"
 set +e
-JSON_OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --json 2>/dev/null)"
+JSON_OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 set -e
 [ "$(jq -r '.recommendation.email' <<<"$JSON_OUT")" = "proj@example.com" ] \
   && ok "projected ranking → the seat that loses its untouched week FIRST is the pick, not the one resetting later" \
@@ -5098,7 +5125,7 @@ printf '{"five_hour":{"utilization":10.0,"resets_at":"%s"},
     "scope":{"model":{"id":null,"display_name":"Fable"}}}]}' \
   "$SN_FIVE_R" "$SN_ALL_R" "$SN_FIVE_R" "$SN_ALL_R" > "$RUN/state/usage-TOK-SCOPED-NULL.json"
 set +e
-JSON_OUT="$(FAKE_NEW_EMAIL=solo@example.com "$SCRIPT" usage --json 2>/dev/null)"
+JSON_OUT="$(FAKE_NEW_EMAIL=solo@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 set -e
 SN_ROW="$(prow "solo@example.com" "$JSON_OUT")"
 [ "$(jq -r '[.weekly.kind, (.weekly.used_pct|tostring)] | join(" ")' <<<"$SN_ROW")" = "weekly_scoped 47" ] \
@@ -5119,7 +5146,7 @@ SU_NEW_R="$(iso_in +4d)"
 printf '{"seven_day":{"utilization":30,"resets_at":"%s"},"five_hour":{"utilization":10,"resets_at":"%s"}}' \
   "$SU_NEW_R" "$(iso_in +2H)" > "$RUN/state/usage-TOK-PROJ.json"
 set +e
-JSON_OUT="$(FAKE_NEW_EMAIL=fresh@example.com "$SCRIPT" usage --json 2>/dev/null)"
+JSON_OUT="$(FAKE_NEW_EMAIL=fresh@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 set -e
 SU_ROW="$(prow "fresh@example.com" "$JSON_OUT")"
 [ "$(jq -r '."fresh@example.com".wk_r_seen' "$RUN/cfg/usage-cache.json")" = "$SU_NEW_R" ] \
@@ -5197,8 +5224,8 @@ printf '{"seven_day":{"utilization":40,"resets_at":"%s"},"five_hour":{"utilizati
 printf '{"seven_day":{"utilization":0.0,"resets_at":null},"five_hour":{"utilization":0.0,"resets_at":null}}' \
   > "$RUN/state/usage-TOK-PJ-PROJ.json"
 set +e
-OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --no-color 2>/dev/null)"
-JSON_OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --json 2>/dev/null)"
+OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --no-color 2>>"$ERRLOG")"
+JSON_OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 SA_OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" switch-auto --dry-run 2>&1)"
 set -e
 PJ_REASON="$(jq -r '.recommendation.reason' <<<"$JSON_OUT")"
@@ -5264,9 +5291,9 @@ printf '{"seven_day":{"utilization":40,"resets_at":"%s"},"five_hour":{"utilizati
 printf '{"seven_day":{"utilization":0.0,"resets_at":null},"five_hour":{"utilization":0.0,"resets_at":null}}' \
   > "$RUN/state/usage-TOK-PL-IDLE.json"
 set +e
-OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --no-color 2>/dev/null)"
-VOUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --no-color --verbose 2>/dev/null)"
-JSON_OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --json 2>/dev/null)"
+OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --no-color 2>>"$ERRLOG")"
+VOUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --no-color --verbose 2>>"$ERRLOG")"
+JSON_OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 set -e
 [ "$(jq -r '.accounts[] | select(.email=="idle@example.com") | .weekly.resets_at_projected' <<<"$JSON_OUT")" != "null" ] \
   && ok "legend gate → the idle seat really does project (the fixture is doing what it claims)" \
@@ -5373,7 +5400,7 @@ run_usage
 [ "$(grep -c '^dormant$' "$RUN/state/nudges" 2>/dev/null || echo 0)" -eq 1 ] \
   && ok "dormant × 429 → the unpinned in-date seat IS woken, exactly once" \
   || bad "dormant × 429 → must wake once (nudges: $(cat "$RUN/state/nudges" 2>/dev/null || echo none))"
-DW_JSON="$(FAKE_NEW_EMAIL=live@example.com "$SCRIPT" usage --json 2>/dev/null)"
+DW_JSON="$(FAKE_NEW_EMAIL=live@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 DW_DORMANT="$(prow dormant@example.com "$DW_JSON")"
 [ "$(jq -r '.quota_data' <<<"$DW_DORMANT")" = "live" ] \
   && ok "dormant × 429 → after the wake the row is measured LIVE in the same run, no human in the loop" \
@@ -5405,7 +5432,7 @@ run_usage
   && [ "$(grep -c '^dormant$' "$RUN/state/nudges" 2>/dev/null || echo 0)" -eq 1 ] \
   && ok "dormant × 429 → a second run within the TTL spends NO further wake on either seat" \
   || bad "dormant × 429 → no re-wake within TTL (nudges: $(cat "$RUN/state/nudges" 2>/dev/null || echo none))"
-DW_JSON2="$(FAKE_NEW_EMAIL=live@example.com "$SCRIPT" usage --json 2>/dev/null)"
+DW_JSON2="$(FAKE_NEW_EMAIL=live@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
 DW_STUCK2="$(prow stuck@example.com "$DW_JSON2")"
 grep -q 'already spent' <<<"$(jq -r '.stale_reason' <<<"$DW_STUCK2")" \
   && ok "dormant × 429 → the second run's stuck reason says the wake was already spent, with the TTL" \
