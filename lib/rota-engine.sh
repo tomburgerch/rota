@@ -5293,7 +5293,7 @@ PANE_STATUS_BGWORK_RE='(^|[^0-9])[0-9]+ (shells?|monitors?)([^A-Za-z]|$)'
 # bgq (exit question a) · draft (b) · picker (any other footer) · bgwork
 # (status line lists shells/monitors) · "" (an ordinary prompt).
 pane_screen_kind() {
-  local lines last above
+  local lines last above status
   lines="$(tmuxc capture-pane -p -t "${1:-}" </dev/null 2>/dev/null | grep -v '^[[:space:]]*$' || true)"
   last="$(tail -n 1 <<<"$lines")"
   if grep -qE "$PANE_FOOTER_DRAFT_RE" <<<"$last"; then
@@ -5303,8 +5303,16 @@ pane_screen_kind() {
     if grep -qE "$PANE_OPTION2_RE" <<<"$above"; then echo bgq; else echo picker; fi
   elif grep -qE "$PANE_FOOTER_ANY_RE" <<<"$last"; then
     echo picker
-  elif grep -qE "$PANE_STATUS_BGWORK_RE" <<<"$last"; then
-    echo bgwork
+  else
+    # Claude's status line is not always the LAST line: sub-agent rows
+    # ("⏺ main", "◯ general-purpose …") can sit under it. So find the status
+    # line among the bottom 8 non-blank lines by its own markers, and only then
+    # look for running shells/monitors on it (a transcript line saying "3 shells"
+    # has no status markers and never counts).
+    status="$(tail -n 8 <<<"$lines" | grep -E '⏵⏵|auto mode|for agents|to manage|shift\+tab' | tail -n 1 || true)"
+    if [[ -n "$status" ]] && grep -qE "$PANE_STATUS_BGWORK_RE" <<<"$status"; then
+      echo bgwork
+    fi
   fi
   return 0
 }

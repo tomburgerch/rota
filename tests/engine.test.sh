@@ -281,7 +281,8 @@ case "${1:-}" in
       if [ "$kind" = predraft ]; then printf "$draft"; exit 0; fi
       if [ "$kind" = draft ] && [ $quit = 1 ]; then printf "$draft"; exit 0; fi
       if [ "$kind" = bg ] && [ $quit = 1 ] && [ $esc = 0 ]; then printf "$bgq"; exit 0; fi
-      if [ "$kind" = shells ]; then printf '❯ \n  ⏵⏵ auto mode on · 2 shells, 1 monitor\n'; exit 0; fi
+      # shells: the real shape on durban 2026-10-10, agent rows BELOW the status line
+      if [ "$kind" = shells ]; then printf '❯ \n  ⏵⏵ auto mode on · 2 shells, 1 monitor · ← for agents\n\n  ⏺ main\n  ◯ general-purpose  Fixing extensionless imports in desk.ts\n'; exit 0; fi
       if [ "$kind" = scroll ]; then printf "$bgq$draft"'\nwe discussed "Enter to confirm · Esc to cancel" and 3 shells earlier\n❯ \nSession: 30%%\n'; exit 0; fi
     done
     case " ${FAKE_TMUX_WORKING:-} " in
