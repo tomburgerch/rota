@@ -5458,8 +5458,8 @@ pane_pin_resolve() {
 # because the projects dir is gigabytes and a restart must not read all of
 # it. A malformed line is skipped, never fatal (fromjson?). Callers resolve
 # ONCE per pane, so the reported id is the sent one.
-pane_resume_target() {  # pane_resume_target <title> → <session-id>; empty + rc 1 when nothing resolves
-  local title="${1:-}" needle f cur id mt best="" best_mt=-1
+pane_title_lookup() {  # pane_title_lookup <title> → <session-id>; rc 1 nothing resolves, rc 3 AMBIGUOUS (>1 transcript)
+  local title="${1:-}" needle f cur id mt best="" best_mt=-1 hits=0
   local uuid_re='^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$'
   if [[ -z "$title" || ! -d "$PROJECTS_DIR" ]]; then return 1; fi
   # the fragment as the transcript spells it: JSON-encoded, so a title holding
@@ -5476,11 +5476,81 @@ pane_resume_target() {  # pane_resume_target <title> → <session-id>; empty + r
     [[ "$cur" == "$title" ]] || continue
     mt="$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null)" || mt=0
     [[ "$mt" =~ ^[0-9]+$ ]] || mt=0
+    hits=$((hits + 1))
     if (( mt > best_mt )); then best="$id"; best_mt="$mt"; fi
   done < <(find "$PROJECTS_DIR" -mindepth 2 -maxdepth 2 -name '*.jsonl' -mtime -3 \
              -exec grep -alF -- "$needle" {} + 2>/dev/null || true)
   [[ -n "$best" ]] || return 1
+  (( hits == 1 )) || return 3
   printf '%s' "$best"
+}
+
+# The record Claude Code 2.1.29x writes per live session:
+# <pool>/<account>/sessions/<pid>.json = {"pid","tmux":"<prefix>:@<win>.%<pane>",
+# "sessionId",...}. <prefix> is the host name (ballito) or the tmux SESSION name
+# (durban: "pocket:@45.%45"), same two shapes Dazzle's pocketmux reads. A record
+# is only trusted when its pid is a live claude process ON THIS PANE (its tty),
+# because records of dead sessions are never cleaned up and a pane id (%N) is
+# reused. Prints the session id; rc 1 when the pane has no such record.
+pane_record_session() {  # pane_record_session <pane-id> <pane-tty>
+  local pane="${1:-}" tty="${2:-}" host names f rec pfx pid sid live
+  local uuid_re='^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$'
+  [[ "$pane" =~ ^%[0-9]+$ && -n "$tty" ]] || return 1
+  host="$(printf '%s' "${ROTA_HOST_NAME:-$(hostname -s 2>/dev/null || true)}" | tr '[:upper:]' '[:lower:]')"
+  names="$(tmuxc list-sessions -F '#{session_name}' </dev/null 2>/dev/null || true)"
+  [[ -n "$PANES_SESSION" ]] && names="${names}"$'\n'"$PANES_SESSION"
+  live="$(ps -t "${tty#/dev/}" -o pid=,ucomm= 2>/dev/null | awk '$2 ~ /^(claude(\.exe|-real)?|[0-9]+\.[0-9]+\.[0-9]+)$/ { print $1 }' || true)"
+  [[ -n "$live" ]] || return 1
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    rec="$(jq -r '[.pid // "", .tmux // "", .sessionId // ""] | map(tostring) | join("\u001f")' "$f" 2>/dev/null || true)"
+    IFS=$'\037' read -r pid pfx sid <<<"$rec"
+    [[ "$pid" =~ ^[0-9]+$ && "$sid" =~ $uuid_re ]] || continue
+    [[ "$pfx" =~ ^(([A-Za-z0-9][A-Za-z0-9_.-]*):)?@[0-9]+\.${pane}$ ]] || continue
+    if [[ -n "${BASH_REMATCH[2]}" ]]; then
+      if [[ "$(printf '%s' "${BASH_REMATCH[2]}" | tr '[:upper:]' '[:lower:]')" != "$host" ]] \
+         && ! grep -qxF -- "${BASH_REMATCH[2]}" <<<"$names"; then continue; fi
+    fi
+    grep -qxF -- "$pid" <<<"$live" || continue
+    printf '%s' "$sid"; return 0
+  done < <({ find -L "$POOL_ROOT" -mindepth 3 -maxdepth 3 -path '*/sessions/*.json' \
+               -exec grep -lE "\"tmux\" *: *\"[^\"]*\\.${pane}\"" {} + 2>/dev/null
+             find -L "$HOME/.claude/sessions" -mindepth 1 -maxdepth 1 -name '*.json' \
+               -exec grep -lE "\"tmux\" *: *\"[^\"]*\\.${pane}\"" {} + 2>/dev/null; } | sort -u)
+  return 1
+}
+
+# Per-run memory of lookups that came back empty or ambiguous: the projects dir
+# is gigabytes, and one run asks about the same pane from more than one place
+# (the plan, the sender, the report). Process-global on purpose (callers read
+# PANE_RESUME_OUT instead of capturing stdout, which would lose the cache to
+# the subshell); one run is one tick of the keeper.
+PANE_RESUME_MISS=$'\n'
+PANE_RESUME_OUT=""
+
+# What a restarted pane is asked to resume: the SESSION ID, and NOTHING else
+# (see the 2026-10-10 contract above). Sets PANE_RESUME_OUT; rc 1 when nothing
+# resolves, and the caller leaves the pane running BEFORE sending any key.
+#   1. the pane's own session record (pane_record_session): exact.
+#   2. only then the title, and only when exactly ONE recent transcript carries
+#      it as its current title. Two sessions with one title used to resolve to
+#      whichever wrote last, so a restart could resume the wrong conversation;
+#      now it is refused instead.
+pane_resume_target() {  # pane_resume_target <pane-id> <title> [<pane-tty>]
+  local pane="${1:-}" title="${2:-}" tty="${3:-}" key id rc
+  PANE_RESUME_OUT=""
+  key="${pane}|${title}"
+  if [[ "$PANE_RESUME_MISS" == *$'\n'"$key"$'\n'* ]]; then return 1; fi
+  if [[ -z "$tty" && "$pane" =~ ^%[0-9]+$ ]]; then
+    tty="$(tmuxc display-message -p -t "$pane" '#{pane_tty}' </dev/null 2>/dev/null || true)"
+  fi
+  if id="$(pane_record_session "$pane" "$tty")" && [[ -n "$id" ]]; then
+    PANE_RESUME_OUT="$id"; return 0
+  fi
+  rc=0; id="$(pane_title_lookup "$title")" || rc=$?
+  if (( rc == 0 )) && [[ -n "$id" ]]; then PANE_RESUME_OUT="$id"; return 0; fi
+  PANE_RESUME_MISS="${PANE_RESUME_MISS}${key}"$'\n'
+  return 1
 }
 
 # The one shape rota will ever type after `--resume`: a Claude session id.
@@ -5563,7 +5633,7 @@ pane_restart_one() {  # pane_restart_one <pane-id> <resume-target>
 #     destroys that work; no amount of "it was probably fine" is worth it.
 #     (pane-converge picks those up once they go idle.)
 #   • `claude --resume "<session-id>"`, the id resolved from the pane title
-#     (pane_resume_target), the bare title only when nothing resolves; NEVER
+#     (pane_resume_target: the pane's own record, else an unambiguous title); NEVER
 #     `claude --continue`. --continue resumes the most recent conversation
 #     FOR THE WORKING DIRECTORY, and every pane here sits in ~/code, so it
 #     loads some other pane's conversation. Done once, on 2026-08-06. And a
@@ -5621,7 +5691,7 @@ restart_idle_panes() {  # restart_idle_panes <dry-run 0|1> [<explicit 0|1>]
     fi
     # resolved once, BEFORE any screen check or key: the plan, the sent line and
     # the result line all show it. No id → the pane is never quit.
-    target="$(pane_resume_target "$name")" || target=""
+    pane_resume_target "$pid" "$name" "$tty" || true; target="$PANE_RESUME_OUT"
     if [[ -z "$target" ]]; then
       printf '         %-5s %s\n' "$pid" "skipped, no session id for \"$name\": left running (resume would open a picker)"
       continue
@@ -5784,7 +5854,7 @@ cmd_pane_converge() {  # cmd_pane_converge [--dry-run]
     fi
     # once, and BEFORE any screen check or key: plan, sent line and result agree,
     # and a pane with no session id is never quit (resume by title opens a picker)
-    target="$(pane_resume_target "$name")" || target=""
+    pane_resume_target "$pid" "$name" "$tty" || true; target="$PANE_RESUME_OUT"
     if [[ -z "$target" ]]; then
       printf '%s still on %s, no session id for "%s": left running (resume would open a picker)\n' "$pid" "$id" "$name"
       busy=$((busy + 1))

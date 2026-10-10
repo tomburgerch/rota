@@ -314,6 +314,9 @@ case "${1:-}" in
     done
     var="FAKE_TMUX_CMD_${pane#%}"
     eval "printf '%s\n' \"\${$var:-zsh}\"" ;;
+  list-sessions)
+    # FAKE_TMUX_SESSIONS="pocket other": this box's tmux session names
+    for n in ${FAKE_TMUX_SESSIONS:-}; do printf '%s\n' "$n"; done ;;
   send-keys) : ;;
 esac
 exit 0
@@ -332,6 +335,13 @@ cat > "$STUB_DIR/ps" <<'STUB'
 tty=""; prev=""
 for a in "$@"; do [ "$prev" = "-t" ] && tty="$a"; prev="$a"; done
 f="${FAKE_STATE:-/nonexistent}/ps-$tty.txt"
+# the pane's-processes probe (`-o pid=,ucomm=`): $FAKE_STATE/pidps-<tty>.txt,
+# "<pid> <ucomm>" per line; an absent file = nothing on that tty
+case "$*" in
+  *pid=,ucomm=*)
+    pf="${FAKE_STATE:-/nonexistent}/pidps-$tty.txt"
+    [ -f "$pf" ] && cat "$pf"; exit 0 ;;
+esac
 if [ -n "$tty" ] && [ -f "$f" ]; then cat "$f"; exit 0; fi
 exec /bin/ps "$@"
 STUB
@@ -3376,14 +3386,25 @@ printf '{"type":"custom-title","customTitle":"rainbow rush game"}\n{"type":"cust
 printf '{"type":"custom-title","customTitle":"rainbow rush game"}\n' > "$RB_PROJ/-home-code/$RB_C/$RB_D.jsonl"
 touch -t "$(date -r $(( $(date +%s) - 3600 )) '+%Y%m%d%H%M.%S')" "$RB_PROJ/-home-code/$RB_A.jsonl"
 export CLAUDE_PROJECTS_DIR="$RB_PROJ"
+# A and B carry the same title, so the title alone is ambiguous (2026-10-10:
+# rota refuses it). %1's own Claude process published a record naming B, which
+# is what resolves it.
+export ROTA_HOST_NAME=testbox
+rec_write() {  # rec_write <pid> <tmux-addr> <session-id>
+  mkdir -p "$RUN/.claude-pool/primary/sessions"
+  printf '{"pid":%s,"tmux":"%s","sessionId":"%s","kind":"interactive"}\n' "$1" "$2" "$3" \
+    > "$RUN/.claude-pool/primary/sessions/$1.json"
+}
+rec_write 4101 "testbox:@1.%1" "$RB_B"
+printf '4101 claude.exe\n' > "$FAKE_STATE/pidps-ttys001.txt"
 set +e
 RB_DRY="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" switch-auto --dry-run --restart-idle 2>&1)"
 RB_DRY_RC=$?
 set -e
 [ "$RB_DRY_RC" -eq 0 ] \
   && grep -q "%1 *would restart → CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" claude --resume \"$RB_B\"" <<<"$RB_DRY" \
-  && ok "resume by id → the plan resumes the NEWEST transcript carrying the title, by session id, not by title" \
-  || bad "resume by id → newest id in the plan (got $RB_DRY_RC: $RB_DRY)"
+  && ok "resume by id → the plan resumes the session id in the pane's own record, by id, not by title" \
+  || bad "resume by id → record id in the plan (got $RB_DRY_RC: $RB_DRY)"
 ! grep -q "$RB_A" <<<"$RB_DRY" \
   && ok "resume by id → the older twin with the same title is never the pick" \
   || bad "resume by id → picked the older twin (got: $RB_DRY)"
@@ -3461,7 +3482,101 @@ set -e
 grep -qE "%1 +restarted → CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/wk\" claude --resume \"$RB_B\"" <<<"$RB_LIVE" \
   && ok "resume by id → the result line shows the id that was sent (one resolution per pane)" \
   || bad "resume by id → result line (got: $RB_LIVE)"
-unset CLAUDE_PROJECTS_DIR
+rm -f "$RUN/.claude-pool/primary/sessions"/*.json "$FAKE_STATE/pidps-ttys001.txt"
+
+# --- 43c. the PANE'S OWN RECORD names the session; a title is only a fallback
+# Claude Code 2.1.29x writes <pool>/<account>/sessions/<pid>.json per live
+# session: {"pid","tmux":"<prefix>:@<win>.%<pane>","sessionId"}. Two sessions
+# with one title used to resolve to whichever wrote last, so a restart could
+# resume the WRONG conversation. Now: the record of the live claude process on
+# THIS pane first; the title only when it is unambiguous.
+panes_fixture twin
+FAKE_TMUX_PANES="%1${US}/dev/ttys001${US}claude.exe${US}✳ twin pane"
+export FAKE_TMUX_PANES
+unset FAKE_TMUX_WORKING FAKE_TMUX_BACKGROUND
+TW_PROJ="$RUN/projects-twin"; mkdir -p "$TW_PROJ/-home-code"
+TW_OLD=11111111-1111-4111-8111-111111111111
+TW_NEW=22222222-2222-4222-8222-222222222222
+printf '{"type":"custom-title","customTitle":"twin pane"}\n' > "$TW_PROJ/-home-code/$TW_OLD.jsonl"
+printf '{"type":"custom-title","customTitle":"twin pane"}\n' > "$TW_PROJ/-home-code/$TW_NEW.jsonl"
+touch -t "$(date -r $(( $(date +%s) - 3600 )) '+%Y%m%d%H%M.%S')" "$TW_PROJ/-home-code/$TW_OLD.jsonl"
+export CLAUDE_PROJECTS_DIR="$TW_PROJ" ROTA_HOST_NAME=testbox
+tw_run() { FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" switch-auto --dry-run --restart-idle 2>&1 || true; }
+tw_clear() { rm -f "$RUN/.claude-pool/primary/sessions"/*.json "$FAKE_STATE/pidps-ttys001.txt"; }
+
+# the record names the OLDER twin, its pid is the pane's live claude
+tw_clear; rec_write 4201 "testbox:@1.%1" "$TW_OLD"; printf '4201 claude.exe\n' > "$FAKE_STATE/pidps-ttys001.txt"
+TW1="$(tw_run)"
+grep -q "%1 *would restart → .*claude --resume \"$TW_OLD\"" <<<"$TW1" \
+  && ok "pane record → two same-title transcripts, the record names the OLDER one: that id, not the newest" \
+  || bad "pane record → older id expected (got: $TW1)"
+
+# record whose pid is NOT on the pane (dead): ignored; two twins → refuse
+tw_clear; rec_write 4202 "testbox:@1.%1" "$TW_OLD"; printf '9999 claude.exe\n' > "$FAKE_STATE/pidps-ttys001.txt"
+TW2="$(tw_run)"
+grep -q '%1 *skipped, no session id for "twin pane": left running' <<<"$TW2" && ! grep -q 'would restart' <<<"$TW2" \
+  && ok "pane record → a dead/foreign pid's record is stale; the title is ambiguous, so the pane is left running" \
+  || bad "pane record → stale record + twins (got: $TW2)"
+
+# a record whose pid is on the pane but is not a claude process: ignored too
+tw_clear; rec_write 4203 "testbox:@1.%1" "$TW_OLD"; printf '4203 zsh\n' > "$FAKE_STATE/pidps-ttys001.txt"
+TW2B="$(tw_run)"
+grep -q '%1 *skipped, no session id' <<<"$TW2B" \
+  && ok "pane record → a pid that is not a claude process on that pane is ignored" \
+  || bad "pane record → non-claude pid (got: $TW2B)"
+
+# dead record, ONE transcript: the title fallback is unambiguous
+mv "$TW_PROJ/-home-code/$TW_NEW.jsonl" "$TW_PROJ/$TW_NEW.hold"
+tw_clear; rec_write 4204 "testbox:@1.%1" "$TW_NEW"; printf '9999 claude.exe\n' > "$FAKE_STATE/pidps-ttys001.txt"
+TW3="$(tw_run)"
+grep -q "%1 *would restart → .*claude --resume \"$TW_OLD\"" <<<"$TW3" \
+  && ok "pane record → dead record falls back to the title, which names one transcript: that id" \
+  || bad "pane record → fallback to the single title match (got: $TW3)"
+
+# no record at all, ONE transcript: unchanged behaviour
+tw_clear
+TW4="$(tw_run)"
+grep -q "%1 *would restart → .*claude --resume \"$TW_OLD\"" <<<"$TW4" \
+  && ok "pane record → no record, one transcript with the title: that id (unchanged)" \
+  || bad "pane record → single transcript, no record (got: $TW4)"
+
+# no record, TWO transcripts: refuse, nothing sent
+mv "$TW_PROJ/$TW_NEW.hold" "$TW_PROJ/-home-code/$TW_NEW.jsonl"
+TW5LOG="$ROOT/tmux-twin5.log"
+TW5="$(TMUX_LOG="$TW5LOG" FAKE_NEW_EMAIL=primary@example.com FAKE_LAG=0 "$SCRIPT" switch-auto --restart-idle 2>&1 || true)"
+grep -q '%1 *skipped, no session id for "twin pane": left running' <<<"$TW5" \
+  && ! grep -q 'send-keys -t %1' "$TW5LOG" \
+  && ok "pane record → no record and two same-title transcripts: refused, pane left running, not one key sent" \
+  || bad "pane record → ambiguous title not refused (got: $TW5 / $(grep 'send-keys' "$TW5LOG"))"
+
+# durban shape: the prefix is a tmux SESSION name on this box
+tw_clear; rec_write 4206 "pocket:@45.%1" "$TW_OLD"; printf '4206 2.1.296\n' > "$FAKE_STATE/pidps-ttys001.txt"
+TW6="$(FAKE_TMUX_SESSIONS="pocket other" tw_run)"
+grep -q "%1 *would restart → .*claude --resume \"$TW_OLD\"" <<<"$TW6" \
+  && ok "pane record → durban shape (prefix = this box's tmux session name, claude named by VERSION) resolves" \
+  || bad "pane record → session-name prefix (got: $TW6)"
+
+# a prefix that is neither this host nor a local tmux session = another box's record
+TW7="$(tw_run)"
+grep -q '%1 *skipped, no session id' <<<"$TW7" \
+  && ok "pane record → a foreign prefix (another box's synced record) is ignored" \
+  || bad "pane record → foreign prefix accepted (got: $TW7)"
+tw_clear
+# per-run cache: a failed lookup for a pane is remembered, so the projects-dir
+# scan runs ONCE for that pane however many times a run asks. The engine runs
+# main on load, so a copy without that last line is sourced in a subshell, with
+# a `find` shim counting the transcript scans.
+TW_LIBDIR="$ROOT/lib-nomain"; mkdir -p "$TW_LIBDIR"; cp "$REPO_ROOT"/lib/*.sh "$TW_LIBDIR/"
+TW_LIB="$TW_LIBDIR/rota-engine.sh"
+sed '$ d' "$SCRIPT" > "$TW_LIB"
+TW_FIND="$ROOT/find-shim"; mkdir -p "$TW_FIND"
+printf '#!/bin/sh\ncase "$*" in *-mtime*) echo scan >> "%s/scans" ;; esac\nexec /usr/bin/find "$@"\n' "$ROOT" > "$TW_FIND/find"
+chmod +x "$TW_FIND/find"; : > "$ROOT/scans"
+TW8="$(PATH="$TW_FIND:$PATH" bash -c '. "$1"; a=0; pane_resume_target %1 "twin pane" /dev/ttys001 || a=$?; b=0; pane_resume_target %1 "twin pane" /dev/ttys001 || b=$?; echo "$a $b"' _ "$TW_LIB" 2>&1 | tail -1)"
+[ "$TW8" = "1 1" ] && [ "$(wc -l < "$ROOT/scans" | tr -d ' ')" = 1 ] \
+  && ok "pane record → a failed lookup is cached: the second ask for the same pane never rescans the projects dir" \
+  || bad "pane record → miss cache (rcs '$TW8', scans: $(wc -l < "$ROOT/scans"))"
+unset CLAUDE_PROJECTS_DIR ROTA_HOST_NAME
 panes_teardown
 
 # --- 44. with no configured session the whole thing is a SILENT no-op -----------
