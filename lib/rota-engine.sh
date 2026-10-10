@@ -1335,7 +1335,7 @@ live_claude_pins() {
     NR == 1 && $1 == "PID" { next }
     {
       cmd = $5; sub(".*/", "", cmd)
-      if (cmd != "claude" && cmd != "claude.exe") next
+      if (cmd !~ /^(claude(\.exe|-real)?|[0-9]+\.[0-9]+\.[0-9]+)$/) next
       for (i = 6; i <= NF; i++)
         if ($i ~ /^CLAUDE_CONFIG_DIR=/) {
           sub("CLAUDE_CONFIG_DIR=", "", $i)
@@ -2038,7 +2038,7 @@ any_live_claude() {
     NR == 1 && $1 == "PID" { next }
     {
       cmd = $5; sub(".*/", "", cmd)
-      if (cmd == "claude" || cmd == "claude.exe") pids = pids (pids ? "," : "") $1
+      if (cmd ~ /^(claude(\.exe|-real)?|[0-9]+\.[0-9]+\.[0-9]+)$/) pids = pids (pids ? "," : "") $1
     }
     END { if (pids) print pids }' 2>/dev/null || true
 }
@@ -5044,7 +5044,7 @@ pane_claude_started() {  # pane_claude_started <pane-tty, e.g. /dev/ttys003>
   # ucomm the sixth, awk reassembles the five rather than trusting column
   # positions, and drops the trailing spaces `date -j` would complain about.
   stamp="$(ps -t "${tty#/dev/}" -o lstart=,ucomm= 2>/dev/null \
-            | awk '$6 ~ /^(claude(\.exe)?|[0-9]+\.[0-9]+\.[0-9]+)$/ { printf "%s %s %s %s %s", $1, $2, $3, $4, $5; exit }' \
+            | awk '$6 ~ /^(claude(\.exe|-real)?|[0-9]+\.[0-9]+\.[0-9]+)$/ { printf "%s %s %s %s %s", $1, $2, $3, $4, $5; exit }' \
             || true)"
   [[ -n "$stamp" ]] || { printf '0'; return 0; }
   secs="$(date -j -f '%a %b %e %H:%M:%S %Y' "$stamp" +%s 2>/dev/null || true)"
@@ -5153,12 +5153,13 @@ strip_pane_glyph() {
 # configured one does not exist,
 # or it holds no claude panes.
 # Is this tmux `pane_current_command` / ps `ucomm` a Claude Code process?
-# `claude` (npm shim), `claude.exe` (native build on ballito) or a bare VERSION
+# `claude` (npm shim), `claude.exe` (native build on ballito), `claude-real`
+# (durban's ~/.local/libexec wrapper target, what `ps eww` shows) or a bare VERSION
 # like `2.1.295` (native build on durban 2026-10-10: the binary lives at
 # ~/.local/share/claude/versions/<version>, so tmux and ps name it by that).
 # Missing the version form made every pane-converge on durban a silent no-op.
 is_claude_cmd() {  # is_claude_cmd <name>
-  [[ "${1:-}" =~ ^(claude(\.exe)?|[0-9]+\.[0-9]+\.[0-9]+)$ ]]
+  [[ "${1:-}" =~ ^(claude(\.exe|-real)?|[0-9]+\.[0-9]+\.[0-9]+)$ ]]
 }
 
 PANES_SCANNED=0        # 0 = not yet · 1 = scanned, usable · 2 = scanned, nothing to show
@@ -5555,7 +5556,7 @@ pane_pin_dir() {  # pane_pin_dir <pane-tty, e.g. /dev/ttys003>
     NR == 1 && $1 == "PID" { next }
     $2 == t1 || $2 == t2 {
       cmd = $5; sub(".*/", "", cmd)
-      if (cmd != "claude" && cmd != "claude.exe") next
+      if (cmd !~ /^(claude(\.exe|-real)?|[0-9]+\.[0-9]+\.[0-9]+)$/) next
       for (i = 6; i <= NF; i++)
         if ($i ~ /^CLAUDE_CONFIG_DIR=/) {
           sub("CLAUDE_CONFIG_DIR=", "", $i)

@@ -3499,7 +3499,7 @@ panes_teardown
 # restart machinery, and every restart line is PINNED (explicit
 # CLAUDE_CONFIG_DIR=<active pool dir>), never PATH-dependent again.
 explains_fixture converge
-FAKE_TMUX_PANES="%1${US}/dev/ttys001${US}claude.exe${US}✳ rainbow rush game
+FAKE_TMUX_PANES="%1${US}/dev/ttys001${US}2.1.295${US}✳ rainbow rush game
 %2${US}/dev/ttys002${US}claude.exe${US}⠂ liquity agm
 %3${US}/dev/ttys003${US}claude.exe${US}
 %4${US}/dev/ttys004${US}claude.exe${US}✳ ahv case edgar
@@ -3508,7 +3508,8 @@ FAKE_TMUX_PANES="%1${US}/dev/ttys001${US}claude.exe${US}✳ rainbow rush game
 export FAKE_TMUX_PANES
 export FAKE_TMUX_WORKING="%2"
 # pid → pinned dir, per tty (the TT column is ps's short "s001" spelling):
-#   %1 idle, pinned wk        → DIVERGENT, restartable
+#   %1 idle, pinned wk        → DIVERGENT, restartable (durban's native shape:
+#                               tmux says 2.1.295, ps says .../libexec/claude-real)
 #   %2 mid-work, pinned alpha → DIVERGENT, busy, reported, never touched
 #   %3 idle, EMPTY title, wk  → DIVERGENT, but nothing to resume, left alone
 #   %4 idle, pinned primary   → on the claim already, not divergent
@@ -3518,7 +3519,7 @@ export FAKE_TMUX_WORKING="%2"
 #   %6 idle, non-pool pin     → scratch/login capture, never touched or counted
 cat > "$FAKE_STATE/pool-ps.txt" <<POOLPS
 PID TT STAT TIME COMMAND
-101 s001 S+ 0:00 /usr/local/bin/claude CLAUDE_CONFIG_DIR=$RUN/.claude-pool/wk HOME=$RUN
+101 s001 S+ 0:00 /Users/x/.local/libexec/claude-real CLAUDE_CONFIG_DIR=$RUN/.claude-pool/wk HOME=$RUN
 102 s002 S+ 0:00 /usr/local/bin/claude CLAUDE_CONFIG_DIR=$RUN/.claude-pool/alpha HOME=$RUN
 103 s003 S+ 0:00 /usr/local/bin/claude CLAUDE_CONFIG_DIR=$RUN/.claude-pool/wk
 104 s004 S+ 0:00 /usr/local/bin/claude CLAUDE_CONFIG_DIR=$RUN/.claude-pool/primary

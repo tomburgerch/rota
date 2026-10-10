@@ -358,7 +358,7 @@ dir_has_live_process() {  # dir_has_live_process <dir>
     NR == 1 && $1 == "PID" { next }
     {
       cmd = $5; sub(".*/", "", cmd)
-      if (cmd != "claude" && cmd != "claude.exe") next
+      if (cmd !~ /^(claude(\.exe|-real)?|[0-9]+\.[0-9]+\.[0-9]+)$/) next
       for (i = 6; i <= NF; i++)
         if ($i ~ /^CLAUDE_CONFIG_DIR=/) {
           sub("CLAUDE_CONFIG_DIR=", "", $i)
