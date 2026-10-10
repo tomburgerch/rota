@@ -3050,11 +3050,12 @@ panes_fixture() {  # panes_fixture <name>
   # the quiet kind of busy · %9 is a plain shell and must not be counted at all.
   { ps_row "$before" zsh; ps_row "$before" claude.exe; } > "$FAKE_STATE/ps-ttys001.txt"
   { ps_row "$before" claude.exe; }                     > "$FAKE_STATE/ps-ttys002.txt"
-  { ps_row "$after"  claude.exe; }                     > "$FAKE_STATE/ps-ttys003.txt"
+  # %3 is a native build named by its VERSION, as tmux and ps show it on durban.
+  { ps_row "$after"  2.1.295; }                        > "$FAKE_STATE/ps-ttys003.txt"
   { ps_row "$before" claude.exe; }                     > "$FAKE_STATE/ps-ttys004.txt"
   FAKE_TMUX_PANES="%1${US}/dev/ttys001${US}claude.exe${US}✳ rainbow rush game
 %2${US}/dev/ttys002${US}claude.exe${US}⠂ liquity agm
-%3${US}/dev/ttys003${US}claude.exe${US}
+%3${US}/dev/ttys003${US}2.1.295${US}
 %4${US}/dev/ttys004${US}claude.exe${US}✳ ahv case edgar
 %9${US}/dev/ttys009${US}zsh${US}shell"
   export FAKE_TMUX_PANES

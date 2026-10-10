@@ -5044,7 +5044,7 @@ pane_claude_started() {  # pane_claude_started <pane-tty, e.g. /dev/ttys003>
   # ucomm the sixth, awk reassembles the five rather than trusting column
   # positions, and drops the trailing spaces `date -j` would complain about.
   stamp="$(ps -t "${tty#/dev/}" -o lstart=,ucomm= 2>/dev/null \
-            | awk '$6 ~ /^claude(\.exe)?$/ { printf "%s %s %s %s %s", $1, $2, $3, $4, $5; exit }' \
+            | awk '$6 ~ /^(claude(\.exe)?|[0-9]+\.[0-9]+\.[0-9]+)$/ { printf "%s %s %s %s %s", $1, $2, $3, $4, $5; exit }' \
             || true)"
   [[ -n "$stamp" ]] || { printf '0'; return 0; }
   secs="$(date -j -f '%a %b %e %H:%M:%S %Y' "$stamp" +%s 2>/dev/null || true)"
@@ -5152,6 +5152,15 @@ strip_pane_glyph() {
 # other. Returns 1 (and prints nothing) when no tmux session is configured, the
 # configured one does not exist,
 # or it holds no claude panes.
+# Is this tmux `pane_current_command` / ps `ucomm` a Claude Code process?
+# `claude` (npm shim), `claude.exe` (native build on ballito) or a bare VERSION
+# like `2.1.295` (native build on durban 2026-10-10: the binary lives at
+# ~/.local/share/claude/versions/<version>, so tmux and ps name it by that).
+# Missing the version form made every pane-converge on durban a silent no-op.
+is_claude_cmd() {  # is_claude_cmd <name>
+  [[ "${1:-}" =~ ^(claude(\.exe)?|[0-9]+\.[0-9]+\.[0-9]+)$ ]]
+}
+
 PANES_SCANNED=0        # 0 = not yet · 1 = scanned, usable · 2 = scanned, nothing to show
 PANES_TOTAL=0; PANES_IDLE=0; PANES_WORKING=0; PANES_PREV_ACCT=0
 PANES_ROWS=""          # <pane-id> US <title> US <working 0|1> US <pre-switch 0|1> US <tty>, one per line
@@ -5184,7 +5193,7 @@ panes_scan() {
   local pid tty cmd title working started
   while IFS="$PANES_US" read -r pid tty cmd title; do
     [[ -n "$pid" ]] || continue
-    case "$cmd" in claude|claude.exe) ;; *) continue ;; esac
+    is_claude_cmd "$cmd" || continue
     PANES_TOTAL=$((PANES_TOTAL + 1))
     working=0; pane_is_working "$pid" && working=1
     if (( working )); then PANES_WORKING=$((PANES_WORKING + 1))
@@ -5239,7 +5248,7 @@ pane_await_shell() {  # pane_await_shell <pane-id>
   local pid="${1:-}" i=0 cur
   while (( i < PANE_RESTART_TRIES )); do
     cur="$(tmuxc display-message -p -t "$pid" '#{pane_current_command}' </dev/null 2>/dev/null || true)"
-    case "$cur" in claude|claude.exe) ;; *) return 0 ;; esac
+    is_claude_cmd "$cur" || return 0
     sleep "$PANE_RESTART_SLEEP"
     i=$((i + 1))
   done
