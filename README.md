@@ -64,6 +64,10 @@ Everything else (`reconcile`, `normalize`, `cred-guard`, `cred-restore`, `adopt-
 - It does not touch headless containers or CI runners (a per-container `CLAUDE_CONFIG_DIR` already solves that with one line of config).
 - It does not know what anything costs; `billing.json` is yours to keep.
 
+## Exit questions on restart
+
+When `rota switch` or `pane-converge` restarts an idle pane it sends `/quit`, and Claude Code may answer with a question instead of exiting. If background tasks are running, rota answers `2` ("Move to background and exit") so the tasks keep running and the pane resumes. If there is an unsent feedback draft, rota sends nothing (Escape would discard it, Enter would send it; both are your call): the pane is reported as `needs you: unsent feedback draft, send or discard it, then it moves` and is not counted restarted. A pane already showing that question, or any other picker, is not sent `/quit` at all. This is the one case rota cannot finish alone.
+
 ## Failure modes it handles (and why you want somebody else's tool)
 
 Every one of these cost real hours before it was understood.

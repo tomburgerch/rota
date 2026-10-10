@@ -264,6 +264,22 @@ case "${1:-}" in
   capture-pane)
     pane=""; prev=""
     for a in "$@"; do [ "$prev" = "-t" ] && pane="$a"; prev="$a"; done
+    # FAKE_TMUX_EXITQ="%1:bg %2:draft %3:predraft": Claude Code's exit questions.
+    #   bg       after /quit, the background-tasks picker (until a bare "2" is sent)
+    #   draft    after /quit, the unsent-feedback-draft question (never goes away)
+    #   predraft the draft question is ALREADY on screen before any /quit
+    for spec in ${FAKE_TMUX_EXITQ:-}; do
+      [ "${spec%%:*}" = "$pane" ] || continue
+      kind="${spec#*:}"; quit=0; two=0
+      grep -q "^tmux send-keys -t $pane /quit" "${TMUX_LOG:-/dev/null}" && quit=1
+      grep -q "^tmux send-keys -t $pane 2\$" "${TMUX_LOG:-/dev/null}" && two=1
+      draft='You have 1 unsent feedback draft\n  Enter to review & send · Esc to discard and exit\n'
+      if [ "$kind" = predraft ]; then printf "$draft"; exit 0; fi
+      if [ "$kind" = draft ] && [ $quit = 1 ]; then printf "$draft"; exit 0; fi
+      if [ "$kind" = bg ] && [ $quit = 1 ] && [ $two = 0 ]; then
+        printf 'The following will stop when you exit:\n   shell · sleep 600\n   ❯ 1. Exit and stop tasks\n     2. Move to background and exit\n     3. Stay\n   Enter to confirm · Esc to cancel\n'; exit 0
+      fi
+    done
     case " ${FAKE_TMUX_WORKING:-} " in
       *" $pane "*) printf '· Frobnicating… (esc to interrupt · 12s)\n'; exit 0 ;;
     esac
@@ -274,6 +290,13 @@ case "${1:-}" in
   display-message)
     pane=""; prev=""
     for a in "$@"; do [ "$prev" = "-t" ] && pane="$a"; prev="$a"; done
+    for spec in ${FAKE_TMUX_EXITQ:-}; do
+      [ "${spec%%:*}" = "$pane" ] || continue
+      kind="${spec#*:}"; quit=0; two=0
+      grep -q "^tmux send-keys -t $pane /quit" "${TMUX_LOG:-/dev/null}" && quit=1
+      grep -q "^tmux send-keys -t $pane 2\$" "${TMUX_LOG:-/dev/null}" && two=1
+      { [ "$kind" = predraft ] || [ $quit = 1 ] && { [ "$kind" != bg ] || [ $two = 0 ]; }; } && { echo claude.exe; exit 0; }
+    done
     var="FAKE_TMUX_CMD_${pane#%}"
     eval "printf '%s\n' \"\${$var:-zsh}\"" ;;
   send-keys) : ;;
@@ -3743,6 +3766,63 @@ grep -q '^pane-converge: restarted=0 busy=1 divergent=1 claim=primary@example.co
 ! grep -q 'send-keys' "$SM_LOG" \
   && ok "shared-dir map → not one keystroke sent" \
   || bad "shared-dir map → pane was touched ($(grep 'send-keys' "$SM_LOG"))"
+panes_teardown
+rm -f "$FAKE_STATE/pool-ps.txt"
+
+# --- 45e. Claude Code's exit questions (2026-10-10, ballito) --------------------
+# `rota switch cs` restarted one of three idle panes; the other two were left
+# STUCK inside /quit's follow-up question: (a) "background tasks will stop,
+# 1 Exit and stop / 2 Move to background and exit / 3 Stay" and (b) "You have 1
+# unsent feedback draft, Enter to review & send, Esc to discard and exit".
+# Any stray Enter on (a) kills the background work. Now: (a) is answered with a
+# bare "2" (a digit selects AND confirms), the pane exits and resumes; (b) is
+# never touched (Escape discards): reported `needs you`, not counted restarted;
+# and a pane ALREADY showing (b) is not /quit at all.
+explains_fixture exitq
+FAKE_TMUX_PANES="%1${US}/dev/ttys001${US}claude.exe${US}✳ bg tasks pane
+%2${US}/dev/ttys002${US}claude.exe${US}✳ draft pane
+%3${US}/dev/ttys003${US}claude.exe${US}✳ predraft pane"
+export FAKE_TMUX_PANES
+export FAKE_TMUX_EXITQ="%1:bg %2:draft %3:predraft"
+cat > "$FAKE_STATE/pool-ps.txt" <<POOLPS
+PID TT STAT TIME COMMAND
+101 s001 S+ 0:00 /usr/local/bin/claude CLAUDE_CONFIG_DIR=$RUN/.claude-pool/wk HOME=$RUN
+102 s002 S+ 0:00 /usr/local/bin/claude CLAUDE_CONFIG_DIR=$RUN/.claude-pool/wk HOME=$RUN
+103 s003 S+ 0:00 /usr/local/bin/claude CLAUDE_CONFIG_DIR=$RUN/.claude-pool/wk HOME=$RUN
+POOLPS
+EQ_LOG="$ROOT/tmux-exitq.log"; : > "$EQ_LOG"
+set +e
+EQ_OUT="$(TMUX_LOG="$EQ_LOG" ROTA_PANE_RESTART_TRIES=3 "$SCRIPT" pane-converge 2>&1)"
+EQ_RC=$?
+set -e
+[ "$EQ_RC" -eq 0 ] && ok "exit questions → the run exits 0" || bad "exit questions → exit (got $EQ_RC: $EQ_OUT)"
+grep -q 'tmux send-keys -t %1 /quit Enter' "$EQ_LOG" \
+  && grep -q '^tmux send-keys -t %1 2$' "$EQ_LOG" \
+  && ok "exit questions (a) → background-tasks picker answered with a bare 2 (move to background and exit)" \
+  || bad "exit questions (a) → 2 sent ($(grep 'send-keys -t %1' "$EQ_LOG"))"
+[ "$(grep -c '^tmux send-keys -t %1 2$' "$EQ_LOG")" -eq 1 ] \
+  && ! grep -qE '^tmux send-keys -t %1 (Enter|Escape|1|3)' "$EQ_LOG" \
+  && ok "exit questions (a) → the answer is sent once, never Enter/Escape/1/3 (those stop tasks or stay)" \
+  || bad "exit questions (a) → stray keys ($(grep 'send-keys -t %1' "$EQ_LOG"))"
+grep -q '^tmux send-keys -t %1 CLAUDE_CONFIG_DIR=.* claude --resume "bg tasks pane" Enter$' "$EQ_LOG" \
+  && grep -q '%1 restarted onto primary@example.com' <<<"$EQ_OUT" \
+  && ok "exit questions (a) → once at a shell, the resume line is typed and the pane counts restarted" \
+  || bad "exit questions (a) → resume ($(grep 'send-keys -t %1' "$EQ_LOG") / $EQ_OUT)"
+grep -q 'tmux send-keys -t %2 /quit Enter' "$EQ_LOG" \
+  && [ "$(grep -c '^tmux send-keys -t %2 ' "$EQ_LOG")" -eq 1 ] \
+  && ok "exit questions (b) → after /quit the draft question gets NO key at all (no Escape, no Enter, no resume line)" \
+  || bad "exit questions (b) → keys sent ($(grep 'send-keys -t %2' "$EQ_LOG"))"
+grep -q '%2 still on wk@example.com, needs you: unsent feedback draft, send or discard it, then it moves' <<<"$EQ_OUT" \
+  && ok "exit questions (b) → reported as needs-you with the one action that clears it" \
+  || bad "exit questions (b) → reason (got: $EQ_OUT)"
+! grep -q '^tmux send-keys -t %3 ' "$EQ_LOG" \
+  && grep -q '%3 still on wk@example.com, needs you: unsent feedback draft' <<<"$EQ_OUT" \
+  && ok "exit questions (b) → a pane ALREADY on the draft question is not even /quit (that creates the stuck state)" \
+  || bad "exit questions (b) pre-check ($(grep 'send-keys -t %3' "$EQ_LOG") / $EQ_OUT)"
+grep -q '^pane-converge: restarted=1 busy=2 divergent=3 claim=primary@example.com$' <<<"$EQ_OUT" \
+  && ok "exit questions → only the answerable pane counts restarted (restarted=1 busy=2)" \
+  || bad "exit questions → summary (got: $EQ_OUT)"
+unset FAKE_TMUX_EXITQ
 panes_teardown
 rm -f "$FAKE_STATE/pool-ps.txt"
 
