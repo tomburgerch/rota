@@ -491,15 +491,18 @@
 #                                     machine-readable summary line
 #                                     (`pane-converge: restarted=N busy=M divergent=K`);
 #                                     exit 0 always, a busy pane is a wait, not an
-#                                     Exit questions: /quit can be answered by Claude
-#                                     Code with a question. "Background tasks will stop"
-#                                     gets a bare `2` (move to background and exit), so
-#                                     the work keeps running. "Unsent feedback draft" is
-#                                     never answered (Escape would discard it): the pane
-#                                     is reported `needs you: unsent feedback draft, send
-#                                     or discard it, then it moves`, counted busy, and a
-#                                     pane already showing it (or any picker) is not
-#                                     sent /quit at all.
+#                                     Exit questions: a pane whose status line lists
+#                                     running shells/monitors is skipped before /quit
+#                                     ("background work running; moves when it
+#                                     finishes"); if /quit still raises the
+#                                     background-work question it gets ONE Escape,
+#                                     never "2" (that backgrounds the session and a
+#                                     resume would make a second live copy). An unsent
+#                                     feedback draft is never answered (Escape would
+#                                     discard it): `needs you: unsent feedback draft,
+#                                     send or discard it, then it moves`. Both count
+#                                     busy, not restarted. Matches are anchored to the
+#                                     bottom line of the pane.
 #                                     error. The pool keeper runs this every tick (step
 #                                     4b, PANE_CONVERGE=0 disables), which is what makes
 #                                     "a busy pane converges when it goes idle" true
@@ -5252,14 +5255,23 @@ dq_arg() {
   printf '"%s"' "$s"
 }
 
-# The two questions Claude Code can ask INSTEAD of exiting on /quit
-# (2026-10-10, ballito: two of three idle panes were left stuck inside them,
-# where any stray Enter kills background tasks):
-#   (a) background tasks are running:
-#         "The following will stop when you exit: …
-#          1. Exit and stop tasks / 2. Move to background and exit / 3. Stay"
-#       Digits in these numbered pickers select AND confirm, so rota sends
-#       exactly "2" (no Enter): the tasks keep running, the pane exits.
+# Claude Code's exit questions, and background work (2026-10-10, ballito: two of
+# three idle panes were left stuck inside /quit's follow-up question):
+#   (a) background work is running; /quit asks
+#         "Background work is running / The following will stop when you exit:
+#          shell · sleep 600 / ❯ 1. Exit and stop tasks /
+#          2. Move to background and exit / 3. Stay /
+#          Enter to confirm · Esc to cancel"
+#       NEVER press 2: verified in Claude Code 2.1.296 it turns the whole
+#       session into a live BACKGROUND AGENT, so the `claude --resume` that
+#       follows creates a SECOND live copy of the same conversation (shimmer
+#       had one on gmail and one on cs). 1 stops the work. So rota presses
+#       Escape ONCE ("Esc to cancel" returns to the session unchanged), checks
+#       the pane is back at the prompt, and reports the pane busy:
+#       "background work running; moves when it finishes" (the keeper retries
+#       next tick). Better, it is detected BEFORE /quit: Claude's bottom status
+#       line lists running background work ("⏵⏵ auto mode on · 2 shells, 1
+#       monitor"), and such a pane is skipped without /quit being sent.
 #   (b) a queued feedback draft:
 #         "You have 1 unsent feedback draft
 #          Enter to review & send · Esc to discard and exit"
@@ -5269,30 +5281,61 @@ dq_arg() {
 #       and is NOT counted restarted. This is the one case rota cannot finish
 #       alone. To avoid creating the stuck state, pane_restart_one looks BEFORE
 #       sending /quit and skips a pane already showing (b) or any other picker.
-PANE_EXITQ_BG_RE='Move to background and exit'
-PANE_EXITQ_DRAFT_RE='unsent feedback draft|Enter to review & send'
-PANE_PICKER_RE='Enter to confirm|Esc to cancel|Esc to discard'
+# Every match is ANCHORED to the bottom of the screen (the last non-blank
+# line); a transcript line quoting these words higher up triggers nothing.
+PANE_FOOTER_BG_RE='^[[:space:]]*Enter to confirm · Esc to cancel[[:space:]]*$'
+PANE_OPTION2_RE='^[[:space:]]*(❯[[:space:]]*)?2\. Move to background and exit[[:space:]]*$'
+PANE_FOOTER_DRAFT_RE='^[[:space:]]*Enter to review & send · Esc to discard and exit[[:space:]]*$'
+PANE_FOOTER_ANY_RE='^[[:space:]]*(Enter to |Esc to )[A-Za-z &]+([[:space:]]·[[:space:]]+Esc to [A-Za-z &]+)?[[:space:]]*$'
+PANE_STATUS_BGWORK_RE='(^|[^0-9])[0-9]+ (shells?|monitors?)([^A-Za-z]|$)'
 
-pane_tail() {  # pane_tail <pane-id>: the last lines on screen
-  tmuxc capture-pane -p -t "${1:-}" </dev/null 2>/dev/null | tail -25
+# pane_screen_kind <pane-id>: one word for what the BOTTOM of the pane shows:
+# bgq (exit question a) · draft (b) · picker (any other footer) · bgwork
+# (status line lists shells/monitors) · "" (an ordinary prompt).
+pane_screen_kind() {
+  local lines last above
+  lines="$(tmuxc capture-pane -p -t "${1:-}" </dev/null 2>/dev/null | grep -v '^[[:space:]]*$' || true)"
+  last="$(tail -n 1 <<<"$lines")"
+  if grep -qE "$PANE_FOOTER_DRAFT_RE" <<<"$last"; then
+    echo draft
+  elif grep -qE "$PANE_FOOTER_BG_RE" <<<"$last"; then
+    above="$(tail -n 9 <<<"$lines" | sed '$d')"
+    if grep -qE "$PANE_OPTION2_RE" <<<"$above"; then echo bgq; else echo picker; fi
+  elif grep -qE "$PANE_FOOTER_ANY_RE" <<<"$last"; then
+    echo picker
+  elif grep -qE "$PANE_STATUS_BGWORK_RE" <<<"$last"; then
+    echo bgwork
+  fi
+  return 0
 }
 
 # Wait for a pane to fall back to its shell after /quit. Bounded: a pane that
 # never lets go is LEFT ALONE, never force-killed. Returns 0 at a shell · 1 never
-# let go · 5 stuck on the unsent-feedback-draft question (keys untouched). While
-# waiting, answers the background-tasks question once (see above).
+# let go · 5 stuck on the unsent-feedback-draft question (keys untouched) · 6
+# some other question is up (keys untouched) · 7 the background-work question
+# was cancelled with ONE Escape and the pane is back at its prompt.
 pane_await_shell() {  # pane_await_shell <pane-id>
-  local pid="${1:-}" i=0 cur screen answered=0
+  local pid="${1:-}" i=0 cur kind escaped=0
   while (( i < PANE_RESTART_TRIES )); do
     cur="$(tmuxc display-message -p -t "$pid" '#{pane_current_command}' </dev/null 2>/dev/null || true)"
     is_claude_cmd "$cur" || return 0
-    screen="$(pane_tail "$pid")"
-    if grep -qE "$PANE_EXITQ_DRAFT_RE" <<<"$screen"; then
-      return 5
-    elif (( ! answered )) && grep -qE "$PANE_EXITQ_BG_RE" <<<"$screen"; then
-      tmuxc send-keys -t "$pid" 2 </dev/null 2>/dev/null || true
-      answered=1
-    fi
+    kind="$(pane_screen_kind "$pid")"
+    case "$kind" in
+      draft) return 5 ;;
+      picker) return 6 ;;
+      bgq)
+        (( escaped )) && return 6
+        # re-capture right before the key: still claude AND still the question
+        cur="$(tmuxc display-message -p -t "$pid" '#{pane_current_command}' </dev/null 2>/dev/null || true)"
+        is_claude_cmd "$cur" && [[ "$(pane_screen_kind "$pid")" == "bgq" ]] || return 6
+        tmuxc send-keys -t "$pid" Escape </dev/null 2>/dev/null || return 6
+        escaped=1
+        case "$(pane_screen_kind "$pid")" in
+          ""|bgwork) return 7 ;;
+          draft) return 5 ;;
+          *) return 6 ;;
+        esac ;;
+    esac
     sleep "$PANE_RESTART_SLEEP"
     i=$((i + 1))
   done
@@ -5459,21 +5502,26 @@ pane_pin_refuse_reason() {
 # /quit landed but the resume line did not · 4 REFUSED before touching the
 # pane: the active account's credential is a husk/absent, so a restart could
 # only produce a dead "/login" pane · 5 the pane shows the unsent-feedback-draft
-# question (before or after /quit): needs him, no key sent · 6 the pane already
-# shows some picker/question, /quit not sent. The background-tasks exit question
-# is answered "2" automatically (see pane_await_shell).
+# question (before or after /quit): needs him, no key sent · 6 the pane shows
+# some other picker/question, no key sent · 7 background work is running (seen
+# in the status line before /quit, or the exit question cancelled with one
+# Escape): busy, retried next tick. Never "2": see the block comment above.
 pane_restart_one() {  # pane_restart_one <pane-id> <resume-target>
   local pid="${1:-}" target="${2:-}"
   pane_pin_resolve
   [[ "$PANE_PIN_STATE" == "refuse" ]] && return 4
-  local screen arc=0
-  screen="$(pane_tail "$pid")"
-  grep -qE "$PANE_EXITQ_DRAFT_RE" <<<"$screen" && return 5
-  grep -qE "$PANE_PICKER_RE" <<<"$screen" && return 6
+  local arc=0
+  case "$(pane_screen_kind "$pid")" in
+    draft) return 5 ;;
+    bgwork) return 7 ;;
+    "") ;;
+    *) return 6 ;;
+  esac
   tmuxc send-keys -t "$pid" '/quit' Enter </dev/null 2>/dev/null || return 1
   pane_await_shell "$pid" || arc=$?
-  (( arc == 5 )) && return 5
-  (( arc )) && return 2
+  case "$arc" in 0) ;; 5|6|7) return "$arc" ;; *) return 2 ;; esac
+  # the resume line only ever goes to a shell: look once more right before it
+  is_claude_cmd "$(tmuxc display-message -p -t "$pid" '#{pane_current_command}' </dev/null 2>/dev/null || true)" && return 2
   tmuxc send-keys -t "$pid" "$(pane_resume_line "$target")" Enter </dev/null 2>/dev/null || return 3
   return 0
 }
@@ -5566,6 +5614,7 @@ restart_idle_panes() {  # restart_idle_panes <dry-run 0|1> [<explicit 0|1>]
       4) printf '         %-5s %s\n' "$pid" "skipped, $(pane_pin_refuse_reason)" ;;
       5) printf '         %-5s %s\n' "$pid" "needs you: unsent feedback draft, send or discard it, then it moves" ;;
       6) printf '         %-5s %s\n' "$pid" "skipped, pane is showing a question or picker; left alone" ;;
+      7) printf '         %-5s %s\n' "$pid" "skipped, background work running; moves when it finishes" ;;
       *) printf '         %-5s %s\n' "$pid" "FAILED, /quit sent but the resume line did not; pane is at a shell" ;;
     esac
   done <<<"$PANES_ROWS"
@@ -5718,6 +5767,9 @@ cmd_pane_converge() {  # cmd_pane_converge [--dry-run]
       restarted=$((restarted + 1))
     elif (( rrc == 5 )); then
       printf '%s still on %s, needs you: unsent feedback draft, send or discard it, then it moves\n' "$pid" "$id"
+      busy=$((busy + 1))
+    elif (( rrc == 7 )); then
+      printf '%s still on %s, background work running; moves when it finishes\n' "$pid" "$id"
       busy=$((busy + 1))
     elif (( rrc == 6 )); then
       printf '%s still on %s, pane is showing a question or picker; left alone, will retry next tick\n' "$pid" "$id"
