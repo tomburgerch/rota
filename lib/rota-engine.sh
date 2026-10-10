@@ -5111,7 +5111,11 @@ tmuxc() {  # tmux, through the resolved binary + any pinned socket
   resolve_tmux || return 127
   # ${arr[@]+…} guard: macOS bash 3.2 treats expanding an EMPTY array under
   # set -u as an unbound variable and aborts the whole script.
-  "$TMUX_BIN" ${TMUX_SOCK_ARGS[@]+"${TMUX_SOCK_ARGS[@]}"} "$@"
+  # -u (force UTF-8): launchd runs the keeper with no LANG, and tmux then
+  # prints the \037 field separator of every -F listing as "_", so panes_scan
+  # read each pane as an empty command and converge never saw a pane (both
+  # boxes, found 2026-10-10). -u must come before the socket args and command.
+  "$TMUX_BIN" -u ${TMUX_SOCK_ARGS[@]+"${TMUX_SOCK_ARGS[@]}"} "$@"
 }
 
 # Can we reach a tmux SERVER at all? Tries the default resolution first, then

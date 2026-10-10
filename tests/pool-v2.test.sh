@@ -1887,6 +1887,8 @@ set -e
 # env-driven panes, logged send-keys, no real tmux anywhere near it.
 cat > "$ROOT/tmux-panes" <<'PANESTUB'
 #!/usr/bin/env bash
+# rota calls `tmux -u …` (force UTF-8, see tmuxc): drop it before logging.
+[ "${1:-}" = "-u" ] && shift
 printf 'tmux %s\n' "$*" >> "${TMUX_LOG:-/dev/null}"
 case "${1:-}" in
   ls)          exit 0 ;;
