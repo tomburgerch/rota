@@ -254,13 +254,21 @@ TMUX_LOG="$ROOT/tmux.log"
 : > "$TMUX_LOG"
 cat > "$STUB_DIR/tmux" <<'STUB'
 #!/usr/bin/env bash
+# rota calls `tmux -u …` (force UTF-8): drop it before logging, so the logged
+# lines stay `tmux <command> …`. FAKE_TMUX_NO_UTF8=1 models launchd's missing
+# LANG, where real tmux WITHOUT -u prints the \037 separator as "_".
+UTF8=0; [ "${1:-}" = "-u" ] && { UTF8=1; shift; }
 printf 'tmux %s\n' "$*" >> "${TMUX_LOG:-/dev/null}"
 US=$'\037'
 case "${1:-}" in
   has-session)
     [ -n "${FAKE_TMUX_PANES:-}" ] && exit 0 || exit 1 ;;
   list-panes)
-    printf '%s\n' "${FAKE_TMUX_PANES:-}" ;;
+    if [ "${FAKE_TMUX_NO_UTF8:-0}" = 1 ] && [ "$UTF8" = 0 ]; then
+      printf '%s\n' "${FAKE_TMUX_PANES:-}" | tr '\037' '_'
+    else
+      printf '%s\n' "${FAKE_TMUX_PANES:-}"
+    fi ;;
   capture-pane)
     pane=""; prev=""
     for a in "$@"; do [ "$prev" = "-t" ] && pane="$a"; prev="$a"; done
@@ -3584,6 +3592,15 @@ grep -q "%5 on unpinned, no CLAUDE_CONFIG_DIR → would restart (CLAUDE_CONFIG_D
 grep -q '^pane-converge: restarted=2 busy=2 divergent=4 claim=primary@example.com (dry-run)$' <<<"$PC_DRY" \
   && ok "pane-converge → the machine-readable summary counts exactly the divergent panes (unpinned included)" \
   || bad "pane-converge → summary line (got: $PC_DRY)"
+# 2026-10-10: under launchd there is no LANG, and tmux without -u prints the
+# \037 field separator as "_", so the keeper's scan read every pane as an
+# empty command and converge was a silent no-op on both boxes.
+set +e
+PC_NOUTF="$(FAKE_TMUX_NO_UTF8=1 TMUX_LOG=/dev/null "$SCRIPT" pane-converge --dry-run 2>&1)"
+set -e
+grep -q '^pane-converge: restarted=2 busy=2 divergent=4 claim=primary@example.com (dry-run)$' <<<"$PC_NOUTF" \
+  && ok "pane-converge → still sees every pane with no UTF-8 locale (launchd): tmux is called with -u" \
+  || bad "pane-converge → no-locale scan (got: $PC_NOUTF)"
 ! grep -q 'send-keys' "$PC_DRY_LOG" \
   && ok "pane-converge → --dry-run sends not one keystroke" \
   || bad "pane-converge → dry run stayed read-only ($(grep 'send-keys' "$PC_DRY_LOG"))"
