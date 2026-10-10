@@ -393,7 +393,10 @@
 #                                     successful switch the panes that are safe to
 #                                     restart are restarted so they pick the new account
 #                                     up, `/quit`, wait for the shell, then
-#                                     `claude --resume "<pane title>"`. --new-only opts
+#                                     `claude --resume "<session-id>"`: rota resumes
+#                                     BY ID ONLY (a title opens a picker on durban); a
+#                                     pane with no resolvable id is never quit.
+#                                     --new-only opts
 #                                     out: only NEW `claude` launches adopt the account.
 #                                     --restart-idle is still accepted as the EXPLICIT
 #                                     spelling of the default (a no-op alias, kept for
@@ -5436,8 +5439,12 @@ pane_pin_resolve() {
   return 0
 }
 
-# What a restarted pane is asked to resume: the SESSION ID behind its title, or
-# the title itself when nothing resolves. A title is only unique by luck
+# What a restarted pane is asked to resume: the SESSION ID behind its title,
+# and NOTHING else. rota resumes by id only (2026-10-10): when no id resolves
+# this prints nothing and returns 1, and the caller leaves the pane running
+# BEFORE sending any key. A title is no fallback: on durban `claude --resume
+# <non-uuid>` is routed to claude-resume-picker.sh, an fzf picker that parked
+# pane %0 ("Clean up (tommy)") with the session already quit. A title is only unique by luck
 # (sessions get renamed to their predecessor's title, the morning's and the
 # afternoon's "project x"), and `claude --resume "<title>"` on a non-unique
 # title parks the pane in a session picker nobody is watching: three of four
@@ -5451,14 +5458,14 @@ pane_pin_resolve() {
 # because the projects dir is gigabytes and a restart must not read all of
 # it. A malformed line is skipped, never fatal (fromjson?). Callers resolve
 # ONCE per pane, so the reported id is the sent one.
-pane_resume_target() {  # pane_resume_target <title> → <session-id>, or <title> when nothing resolves
+pane_resume_target() {  # pane_resume_target <title> → <session-id>; empty + rc 1 when nothing resolves
   local title="${1:-}" needle f cur id mt best="" best_mt=-1
   local uuid_re='^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$'
-  if [[ -z "$title" || ! -d "$PROJECTS_DIR" ]]; then printf '%s' "$title"; return 0; fi
+  if [[ -z "$title" || ! -d "$PROJECTS_DIR" ]]; then return 1; fi
   # the fragment as the transcript spells it: JSON-encoded, so a title holding
   # a quote or a backslash is looked for as its escaped bytes, not its raw ones
   needle="\"customTitle\":$(jq -cn --arg t "$title" '$t' 2>/dev/null)" || needle=""
-  if [[ -z "$needle" ]]; then printf '%s' "$title"; return 0; fi
+  if [[ -z "$needle" ]]; then return 1; fi
   while IFS= read -r f; do
     [[ -n "$f" ]] || continue
     id="${f##*/}"; id="${id%.jsonl}"
@@ -5472,7 +5479,13 @@ pane_resume_target() {  # pane_resume_target <title> → <session-id>, or <title
     if (( mt > best_mt )); then best="$id"; best_mt="$mt"; fi
   done < <(find "$PROJECTS_DIR" -mindepth 2 -maxdepth 2 -name '*.jsonl' -mtime -3 \
              -exec grep -alF -- "$needle" {} + 2>/dev/null || true)
-  printf '%s' "${best:-$title}"
+  [[ -n "$best" ]] || return 1
+  printf '%s' "$best"
+}
+
+# The one shape rota will ever type after `--resume`: a Claude session id.
+pane_target_is_session_id() {  # pane_target_is_session_id <target>
+  [[ "${1:-}" =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ ]]
 }
 
 # The exact line a restarted pane is asked to type. ONE builder, shared by the
@@ -5517,9 +5530,12 @@ pane_pin_refuse_reason() {
 # question (before or after /quit): needs him, no key sent · 6 the pane shows
 # some other picker/question, no key sent · 7 background work is running (seen
 # in the status line before /quit, or the exit question cancelled with one
-# Escape): busy, retried next tick. Never "2": see the block comment above.
+# Escape): busy, retried next tick · 8 the target is not a session id: no key
+# sent, the pane keeps running. Never "2": see the block comment above.
 pane_restart_one() {  # pane_restart_one <pane-id> <resume-target>
   local pid="${1:-}" target="${2:-}"
+  # no session id, no /quit: a title resume opens a picker (see pane_resume_target)
+  pane_target_is_session_id "$target" || return 8
   pane_pin_resolve
   [[ "$PANE_PIN_STATE" == "refuse" ]] && return 4
   local arc=0
@@ -5603,8 +5619,13 @@ restart_idle_panes() {  # restart_idle_panes <dry-run 0|1> [<explicit 0|1>]
       printf '         %-5s %s\n' "$pid" "skipped, empty pane title, so there is no session name to resume"
       continue
     fi
-    # resolved once: the plan, the sent line and the result line all show it
-    target="$(pane_resume_target "$name")"
+    # resolved once, BEFORE any screen check or key: the plan, the sent line and
+    # the result line all show it. No id → the pane is never quit.
+    target="$(pane_resume_target "$name")" || target=""
+    if [[ -z "$target" ]]; then
+      printf '         %-5s %s\n' "$pid" "skipped, no session id for \"$name\": left running (resume would open a picker)"
+      continue
+    fi
     if (( dry )); then
       # The dry run must tell the truth about BOTH halves of the 2026-08-16
       # hardening: the pinned line it would send, and the refusal it would
@@ -5623,6 +5644,7 @@ restart_idle_panes() {  # restart_idle_panes <dry-run 0|1> [<explicit 0|1>]
       0) printf '         %-5s %s\n' "$pid" "restarted → $(pane_resume_line "$target")" ;;
       1) printf '         %-5s %s\n' "$pid" "skipped, send-keys failed (pane gone?)" ;;
       2) printf '         %-5s %s\n' "$pid" "skipped, still running claude after /quit; left alone" ;;
+      8) printf '         %-5s %s\n' "$pid" "skipped, no session id for \"$name\": left running (resume would open a picker)" ;;
       4) printf '         %-5s %s\n' "$pid" "skipped, $(pane_pin_refuse_reason)" ;;
       5) printf '         %-5s %s\n' "$pid" "needs you: unsent feedback draft, send or discard it, then it moves" ;;
       6) printf '         %-5s %s\n' "$pid" "skipped, pane is showing a question or picker; left alone" ;;
@@ -5760,7 +5782,14 @@ cmd_pane_converge() {  # cmd_pane_converge [--dry-run]
       busy=$((busy + 1))
       continue
     fi
-    target="$(pane_resume_target "$name")"  # once: plan, sent line and result agree
+    # once, and BEFORE any screen check or key: plan, sent line and result agree,
+    # and a pane with no session id is never quit (resume by title opens a picker)
+    target="$(pane_resume_target "$name")" || target=""
+    if [[ -z "$target" ]]; then
+      printf '%s still on %s, no session id for "%s": left running (resume would open a picker)\n' "$pid" "$id" "$name"
+      busy=$((busy + 1))
+      continue
+    fi
     if (( dry )); then
       pane_pin_resolve
       if [[ "$PANE_PIN_STATE" == "refuse" ]]; then
@@ -5785,6 +5814,9 @@ cmd_pane_converge() {  # cmd_pane_converge [--dry-run]
       busy=$((busy + 1))
     elif (( rrc == 6 )); then
       printf '%s still on %s, pane is showing a question or picker; left alone, will retry next tick\n' "$pid" "$id"
+      busy=$((busy + 1))
+    elif (( rrc == 8 )); then
+      printf '%s still on %s, no session id for "%s": left running (resume would open a picker)\n' "$pid" "$id" "$name"
       busy=$((busy + 1))
     elif (( rrc == 4 )); then
       # husk refusal (2026-08-16): a stale pane beats a guaranteed-dead one

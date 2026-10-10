@@ -1915,21 +1915,29 @@ mk_pool converge
 # (already converged, no line, no count).
 FAKE_TMUX_PANES="%1${US}/dev/ttys001${US}claude${US}✳ alpha work
 %2${US}/dev/ttys002${US}claude${US}✳ beta work
-%3${US}/dev/ttys003${US}claude${US}✳ gamma work"
+%3${US}/dev/ttys003${US}claude${US}✳ gamma work
+%4${US}/dev/ttys004${US}claude${US}✳ orphan work"
 export FAKE_TMUX_PANES
 export FAKE_TMUX_WORKING="%2"
+# rota resumes by SESSION ID only (2026-10-10): "alpha work" has a transcript
+# and resolves to an id; %4 "orphan work" has none, so it must never be quit.
+CONV_PROJ="$RUN/projects"; CONV_SID=abababab-abab-4bab-8bab-abababababab
+mkdir -p "$CONV_PROJ/-home-code"
+printf '{"type":"custom-title","customTitle":"alpha work"}\n' > "$CONV_PROJ/-home-code/$CONV_SID.jsonl"
+export CLAUDE_PROJECTS_DIR="$CONV_PROJ"
 cat > "$RUN/state/pool-ps.txt" <<POOLPS
 PID TT STAT TIME COMMAND
 101 s001 S+ 0:00 /usr/local/bin/claude CLAUDE_CONFIG_DIR=$RUN/.claude-pool/wk
 102 s002 S+ 0:00 /usr/local/bin/claude CLAUDE_CONFIG_DIR=$RUN/.claude-pool/team
 103 s003 S+ 0:00 /usr/local/bin/claude CLAUDE_CONFIG_DIR=$RUN/.claude-pool/alpha
+104 s004 S+ 0:00 /usr/local/bin/claude CLAUDE_CONFIG_DIR=$RUN/.claude-pool/wk
 POOLPS
 CONV_TMUX_LOG="$ROOT/tmux-converge.log"
 : > "$CONV_TMUX_LOG"
 export TMUX_LOG="$CONV_TMUX_LOG"
 run_keeper CLAUDE_KEEPER_NOW_HHMM=0200 AUTO_SWITCH_RESTART_IDLE=0 \
   CLAUDE_FAILOVER_TMUX_BIN="$ROOT/tmux-panes"
-[ "$RC" -eq 0 ] && grep -q 'converge=1+busy:1' "$RUN/cfg/keeper-status" \
+[ "$RC" -eq 0 ] && grep -q 'converge=1+busy:2' "$RUN/cfg/keeper-status" \
   && ok "converge → keeper-status counts the restart AND the still-busy pane" \
   || bad "converge → status (got $RC: $(cat "$RUN/cfg/keeper-status" 2>/dev/null))"
 grep -q "pane-converge: %1 restarted onto $(email_of alpha) (was $(email_of wk))" "$RUN/cfg/keeper.log" \
@@ -1939,12 +1947,15 @@ grep -q "pane-converge: %2 busy on $(email_of team)" "$RUN/cfg/keeper.log" \
   && ok "converge → the mid-work divergent pane is logged as busy, not touched" \
   || bad "converge → busy logged (log: $(tail -5 "$RUN/cfg/keeper.log"))"
 grep -q 'send-keys -t %1 /quit Enter' "$CONV_TMUX_LOG" \
-  && grep -q "send-keys -t %1 CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/alpha\" claude --resume \"alpha work\" Enter" "$CONV_TMUX_LOG" \
-  && ok "converge → the divergent idle pane got /quit + a PINNED resume-by-name" \
+  && grep -q "send-keys -t %1 CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/alpha\" claude --resume \"$CONV_SID\" Enter" "$CONV_TMUX_LOG" \
+  && ok "converge → the divergent idle pane got /quit + a PINNED resume by session id" \
   || bad "converge → restart keystrokes ($(cat "$CONV_TMUX_LOG"))"
-! grep -qE 'send-keys -t (%2|%3)' "$CONV_TMUX_LOG" \
+! grep -qE 'send-keys -t (%2|%3|%4)' "$CONV_TMUX_LOG" \
   && ok "converge → the busy pane and the already-converged pane were never touched" \
   || bad "converge → touched a protected pane ($(grep 'send-keys' "$CONV_TMUX_LOG"))"
+grep -q "pane-converge: %4 still on $(email_of wk), no session id for \"orphan work\": left running" "$RUN/cfg/keeper.log" \
+  && ok "converge → a pane with no session id is logged with the reason and never quit" \
+  || bad "converge → no-id log (log: $(tail -5 "$RUN/cfg/keeper.log"))"
 # tick 2: the busy pane's wall still stands, its line must NOT repeat (log-once
 # per pane+account), while the restart (the stub never re-pins, so %1 diverges
 # again) logs again because it is an ACTION, not a standing condition
@@ -1953,10 +1964,13 @@ run_keeper CLAUDE_KEEPER_NOW_HHMM=0200 AUTO_SWITCH_RESTART_IDLE=0 \
 [ "$(grep -c "pane-converge: %2 busy on" "$RUN/cfg/keeper.log")" -eq 1 ] \
   && ok "converge → two ticks with the same busy pane produce ONE log line" \
   || bad "converge → busy logged $(grep -c 'pane-converge: %2 busy on' "$RUN/cfg/keeper.log") times"
+[ "$(grep -c "pane-converge: %4 still on" "$RUN/cfg/keeper.log")" -eq 1 ] \
+  && ok "converge → the no-session-id pane is logged ONCE across ticks (log_once per pane+account)" \
+  || bad "converge → no-id logged $(grep -c 'pane-converge: %4 still on' "$RUN/cfg/keeper.log") times"
 [ "$(grep -c "pane-converge: %1 restarted onto" "$RUN/cfg/keeper.log")" -eq 2 ] \
   && ok "converge → restarts log every time they happen (actions, not conditions)" \
   || bad "converge → restart log count $(grep -c 'pane-converge: %1 restarted onto' "$RUN/cfg/keeper.log")"
-unset FAKE_TMUX_PANES FAKE_TMUX_WORKING TMUX_LOG
+unset FAKE_TMUX_PANES FAKE_TMUX_WORKING TMUX_LOG CLAUDE_PROJECTS_DIR
 
 # PANE_CONVERGE=0 turns the step off; the status says so
 mk_pool convoff
