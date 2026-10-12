@@ -27,8 +27,13 @@ KEEPER_LOCK_STALE_SECS=1800
 # the keeper moves the launch pointer to another seat.
 AUTO_SWITCH_PCT=90
 
-# 1 = after switching, restart IDLE panes so they pick up the new seat at once
-# (mid-work panes are never touched; step 4b catches them once they go idle).
+# 1 = after switching, restart IDLE panes that are on a seat that CANNOT SERVE
+# them (limited at AUTO_SWITCH_PCT or above, ended, or a dead credential) so
+# they pick up the new seat at once. A pane on a healthy seat that is merely
+# not the active one stays where it is, and so does a pane launched with
+# CLAUDE_SEAT_OVERRIDE=1 unless its seat ended (2026-10-12: the active seat is
+# where NEW sessions go, not where every session must live). Mid-work panes
+# are never touched; step 4b catches them once they go idle.
 AUTO_SWITCH_RESTART_IDLE=1
 
 # Target selection. The pick is the seat whose weekly window resets SOONEST
@@ -46,8 +51,14 @@ AUTO_SWITCH_BOUNCE_SECS=1800
 
 # ── pane convergence (step 4b, tmux only) ───────────────────────────────────
 
-# 1 = each tick, restart idle tmux panes whose claude process is still pinned
-# to a seat other than the active one. 0 = never restart a pane automatically.
+# 1 = each tick, restart idle tmux panes whose claude process sits on a seat
+# that CANNOT SERVE it: limited (weekly or 5h at or above AUTO_SWITCH_PCT, read
+# from the usage cache), ended, or a dead/husk credential. A pane on a healthy
+# seat that is simply not the active one is left alone and logged as "left on
+# <seat> (healthy, not the active seat)". A pane whose claude carries
+# CLAUDE_SEAT_OVERRIDE=1 (an explicit pick of a reserved seat, set by Dazzle
+# and cl) moves only if its seat ENDED. An unmeasured seat counts as healthy.
+# 0 = never restart a pane automatically.
 PANE_CONVERGE=1
 
 # The tmux session whose panes converge. UNSET = pane convergence is a silent

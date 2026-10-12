@@ -3124,6 +3124,19 @@ panes_fixture() {  # panes_fixture <name>
   export FAKE_TMUX_WORKING="%2"
   export FAKE_TMUX_BACKGROUND="%4"
 }
+# Seat health as the keeper leaves it: pane-converge and the after-switch restart
+# read the USAGE CACHE (never the network) to ask "can the seat this pane is on
+# still serve it?" (2026-10-12). limit_seats writes a cache with each listed
+# seat at 95% weekly (over the 90 switch threshold); every other seat in the
+# fixture is left unmeasured, which the rule treats as healthy.
+limit_seats() {  # limit_seats <email>...
+  local e entries='{}'
+  for e in "$@"; do
+    entries="$(jq --arg e "$e" --arg wr "$(iso_in +2d)" --arg sr "$(iso_in +3H)" --arg ts "$(date +%s)" \
+      '. + {($e):{wk_u:"95",wk_r:$wr,se_u:"10",se_r:$sr,ts:"fixture",ts_epoch:$ts}}' <<<"$entries")"
+  done
+  printf '%s\n' "$entries" > "$RUN/cfg/usage-cache.json"
+}
 panes_teardown() { unset FAKE_TMUX_PANES FAKE_TMUX_WORKING FAKE_TMUX_BACKGROUND; }
 
 panes_fixture panes
@@ -3366,6 +3379,7 @@ grep -qE '%1 +skipped, this is the pane running the switch' <<<"$RI_SELF" \
 # by id ONLY (2026-10-10; on durban a title resume opens an fzf picker), so %5
 # is left running, no key sent, reported, and counted busy.
 panes_fixture resumebyid
+limit_seats wk@example.com alpha@example.com
 FAKE_TMUX_PANES="%1${US}/dev/ttys001${US}claude.exe${US}✳ rainbow rush game
 %5${US}/dev/ttys005${US}claude.exe${US}✳ untracked pane"
 export FAKE_TMUX_PANES
@@ -3423,6 +3437,7 @@ grep -q '%5 *skipped, no session id for "untracked pane": left running (resume w
   || bad "resume by id → no-id skip (got: $RB_DRY)"
 
 # pane-converge is the other caller of the same machinery: same id
+limit_seats wk@example.com alpha@example.com   # the dry run above measured live and refreshed the cache
 cat > "$FAKE_STATE/pool-ps.txt" <<POOLPS
 PID TT STAT TIME COMMAND
 101 s001 S+ 0:00 /usr/local/bin/claude CLAUDE_CONFIG_DIR=$RUN/.claude-pool/wk HOME=$RUN
@@ -3693,6 +3708,7 @@ panes_teardown
 # restart machinery, and every restart line is PINNED (explicit
 # CLAUDE_CONFIG_DIR=<active pool dir>), never PATH-dependent again.
 explains_fixture converge
+limit_seats wk@example.com alpha@example.com
 FAKE_TMUX_PANES="%1${US}/dev/ttys001${US}2.1.295${US}✳ rainbow rush game
 %2${US}/dev/ttys002${US}claude.exe${US}⠂ liquity agm
 %3${US}/dev/ttys003${US}claude.exe${US}
@@ -3800,6 +3816,116 @@ set -e
   && ok "pane-converge → no panes: explains itself and still emits the parseable summary" \
   || bad "pane-converge → empty case (got $PC_NONE_RC: $PC_NONE)"
 
+# --- 45b2. a pane moves ONLY off a seat that cannot serve it (2026-10-12) -------
+# Cédric started a Dazzle session explicitly on the cs seat (100% left); 50 s
+# later pane-converge moved it onto the ACTIVE seat (16% weekly left):
+# "I'm currently not able to run new sessions, which is disastrous". The rule:
+# converge and the after-switch restart move a pane only when its seat is
+# limited (>= AUTO_SWITCH_PCT, default 90), ended, or has a dead credential. A
+# healthy seat that is merely not the active one is left alone, and a pane
+# launched with CLAUDE_SEAT_OVERRIDE=1 (an explicit pick of a reserved seat) is
+# moved only when its seat ENDED. The claim here is primary.
+explains_fixture keeprule
+mkdir -p "$RUN/.claude-pool/gone" "$RUN/.claude-pool/husk"
+ex_exp=$(( ($(date +%s) + 86400) * 1000 ))
+printf '{"claudeAiOauth":{"accessToken":"TOK-GONE","refreshToken":"rt-gone","expiresAt":%s,"refreshTokenExpiresAt":%s}}' "$ex_exp" "$ex_exp" > "$RUN/.claude-pool/gone/.credentials.json"
+printf '{"oauthAccount":{"emailAddress":"gone@example.com"}}' > "$RUN/.claude-pool/gone/.claude.json"
+printf '{"claudeAiOauth":{"accessToken":"TOK-HUSK"}}' > "$RUN/.claude-pool/husk/.credentials.json"
+printf '{"oauthAccount":{"emailAddress":"husk@example.com"}}' > "$RUN/.claude-pool/husk/.claude.json"
+cat >> "$RUN/cfg/accounts" <<EOA
+gone@example.com|$RUN/.claude-pool/gone
+husk@example.com|$RUN/.claude-pool/husk
+EOA
+# billing: gone@ ended yesterday
+jq -n --arg ends "$(date -u -v-2d '+%Y-%m-%d')" \
+  '{accounts:{"gone@example.com":{plan:"Max 20x",status:"cancelled",ends:$ends}}}' > "$RUN/billing.json"
+export CLAUDE_BILLING_JSON="$RUN/billing.json"
+# wk limited at 95%, alpha HEALTHY at 30% (measured)
+jq -n --arg wr "$(iso_in +2d)" --arg sr "$(iso_in +3H)" --arg ts "$(date +%s)" \
+  '{"wk@example.com":{wk_u:"95",wk_r:$wr,se_u:"10",se_r:$sr,ts:"fixture",ts_epoch:$ts},
+    "alpha@example.com":{wk_u:"30",wk_r:$wr,se_u:"10",se_r:$sr,ts:"fixture",ts_epoch:$ts}}' > "$RUN/cfg/usage-cache.json"
+seed_session "limited pane" aaaa0001-0000-4000-8000-000000000001
+seed_session "healthy pane" aaaa0002-0000-4000-8000-000000000002
+seed_session "ended pane" aaaa0003-0000-4000-8000-000000000003
+seed_session "husk pane" aaaa0004-0000-4000-8000-000000000004
+seed_session "override healthy" aaaa0005-0000-4000-8000-000000000005
+seed_session "override limited" aaaa0006-0000-4000-8000-000000000006
+seed_session "override ended" aaaa0007-0000-4000-8000-000000000007
+FAKE_TMUX_PANES="%1${US}/dev/ttys001${US}claude.exe${US}✳ limited pane
+%2${US}/dev/ttys002${US}claude.exe${US}✳ healthy pane
+%3${US}/dev/ttys003${US}claude.exe${US}✳ ended pane
+%4${US}/dev/ttys004${US}claude.exe${US}✳ husk pane
+%5${US}/dev/ttys005${US}claude.exe${US}✳ override healthy
+%6${US}/dev/ttys006${US}claude.exe${US}✳ override limited
+%7${US}/dev/ttys007${US}claude.exe${US}✳ override ended"
+export FAKE_TMUX_PANES
+cat > "$FAKE_STATE/pool-ps.txt" <<POOLPS
+PID TT STAT TIME COMMAND
+101 s001 S+ 0:00 /usr/local/bin/claude CLAUDE_CONFIG_DIR=$RUN/.claude-pool/wk HOME=$RUN
+102 s002 S+ 0:00 /usr/local/bin/claude CLAUDE_CONFIG_DIR=$RUN/.claude-pool/alpha HOME=$RUN
+103 s003 S+ 0:00 /usr/local/bin/claude CLAUDE_CONFIG_DIR=$RUN/.claude-pool/gone HOME=$RUN
+104 s004 S+ 0:00 /usr/local/bin/claude CLAUDE_CONFIG_DIR=$RUN/.claude-pool/husk HOME=$RUN
+105 s005 S+ 0:00 /usr/local/bin/claude CLAUDE_CONFIG_DIR=$RUN/.claude-pool/alpha CLAUDE_SEAT_OVERRIDE=1 HOME=$RUN
+106 s006 S+ 0:00 /usr/local/bin/claude CLAUDE_CONFIG_DIR=$RUN/.claude-pool/wk CLAUDE_SEAT_OVERRIDE=1 HOME=$RUN
+107 s007 S+ 0:00 /usr/local/bin/claude CLAUDE_CONFIG_DIR=$RUN/.claude-pool/gone CLAUDE_SEAT_OVERRIDE=1 HOME=$RUN
+POOLPS
+KR_DRY_LOG="$ROOT/tmux-keepdry.log"; KR_LOG="$ROOT/tmux-keeplive.log"
+set +e
+KR_DRY="$(TMUX_LOG="$KR_DRY_LOG" "$SCRIPT" pane-converge --dry-run 2>&1)"
+KR_LIVE="$(TMUX_LOG="$KR_LOG" "$SCRIPT" pane-converge 2>&1)"
+set -e
+grep -q '^%1 on wk@example.com → would restart' <<<"$KR_DRY" \
+  && ok "keep rule → a pane on a LIMITED seat (95% >= 90) is restarted onto the active seat" \
+  || bad "keep rule → limited seat moves (got: $KR_DRY)"
+grep -q '^%2 left on alpha@example.com (healthy, not the active seat)$' <<<"$KR_DRY" \
+  && ! grep -q '^%2 .*would restart' <<<"$KR_DRY" \
+  && ok "keep rule → a pane on a HEALTHY non-active seat is left alone and reported as such" \
+  || bad "keep rule → healthy seat stays (got: $KR_DRY)"
+grep -q '^%3 on gone@example.com → would restart' <<<"$KR_DRY" \
+  && ok "keep rule → a pane on an ENDED seat is restarted" \
+  || bad "keep rule → ended seat moves (got: $KR_DRY)"
+grep -q '^%4 on husk@example.com → would' <<<"$KR_DRY" \
+  && ok "keep rule → a pane on a seat with a dead/husk credential is a mover" \
+  || bad "keep rule → husk seat moves (got: $KR_DRY)"
+grep -q '^%5 left on alpha@example.com' <<<"$KR_DRY" \
+  && ! grep -q '^%5 .*would restart' <<<"$KR_DRY" \
+  && ok "keep rule → an override pane on a reserved healthy seat is not moved" \
+  || bad "keep rule → override healthy stays (got: $KR_DRY)"
+grep -q '^%6 left on wk@example.com (explicit seat pick (CLAUDE_SEAT_OVERRIDE=1)' <<<"$KR_DRY" \
+  && ! grep -q '^%6 .*would restart' <<<"$KR_DRY" \
+  && ok "keep rule → an override pane stays even on a LIMITED seat: it is his explicit pick" \
+  || bad "keep rule → override limited stays (got: $KR_DRY)"
+grep -q '^%7 on gone@example.com → would restart' <<<"$KR_DRY" \
+  && ok "keep rule → an override pane moves only when its seat ENDED" \
+  || bad "keep rule → override ended moves (got: $KR_DRY)"
+# the dry run and the real run name the same set of movers
+KR_DRY_SET="$(grep -o '^%[0-9]* on .* → would restart' <<<"$KR_DRY" | cut -d' ' -f1 | sort | tr '\n' ' ')"
+KR_LIVE_SET="$(grep -o '^%[0-9]* restarted onto' <<<"$KR_LIVE" | cut -d' ' -f1 | sort | tr '\n' ' ')"
+KR_SENT_SET="$(grep -o 'send-keys -t %[0-9]* /quit' "$KR_LOG" | sed 's/.*-t //;s/ .*//' | sort | tr '\n' ' ')"
+[ -n "$KR_LIVE_SET" ] && [ "$KR_DRY_SET" = "$KR_LIVE_SET" ] && [ "$KR_LIVE_SET" = "$KR_SENT_SET" ] \
+  && ok "keep rule → dry-run lists exactly the panes the real run restarts and the keys go to (got: $KR_LIVE_SET)" \
+  || bad "keep rule → dry/live/keys sets differ (dry=[$KR_DRY_SET] live=[$KR_LIVE_SET] keys=[$KR_SENT_SET])"
+! grep -qE 'send-keys -t (%2|%5|%6) ' "$KR_LOG" \
+  && ok "keep rule → not one key to a healthy or override-protected pane" \
+  || bad "keep rule → touched a protected pane ($(grep send-keys "$KR_LOG"))"
+grep -q ' left=3 claim=primary@example.com$' <<<"$KR_LIVE" \
+  && ok "keep rule → the summary counts the panes it left (left=3), restarted/busy/divergent stay parseable" \
+  || bad "keep rule → summary (got: $KR_LIVE)"
+# the after-switch restart asks the same question. A networked switch-auto
+# measures LIVE (the fake usage API: wk 20% used, alpha 95%), so the verdicts
+# follow the live numbers: wk is now healthy and stays, alpha is limited and
+# moves (the dry run judges against the pick, wk, so %1 is already home)
+set +e
+KR_RI="$(FAKE_NEW_EMAIL=primary@example.com TMUX_LOG=/dev/null "$SCRIPT" switch-auto --dry-run --restart-idle 2>&1)"
+set -e
+KR_RI_SET="$(grep -E '^ +%[0-9]+ +would restart' <<<"$KR_RI" | awk '{print $1}' | sort | tr '\n' ' ')"
+[ "$KR_RI_SET" = "%2 %3 %4 %7 " ] \
+  && ! grep -qE '%1 +would restart' <<<"$KR_RI" \
+  && grep -qE '%5 +left on alpha@example.com' <<<"$KR_RI" \
+  && ok "keep rule → the after-switch restart asks the same question: the pick's own panes stay, limited/ended/husk move, override only on ended" \
+  || bad "keep rule → restart-idle set [$KR_RI_SET] (got: $KR_RI)"
+unset CLAUDE_BILLING_JSON FAKE_TMUX_PANES
+
 # --- 45c. the husk refusal: never trade a stale pane for a dead one (2026-08-16)
 # pane_restart_one now resolves the ACTIVE account before touching a pane. When
 # that account's pool credential is a HUSK (or nothing resolvable holds a
@@ -3808,6 +3934,7 @@ set -e
 # replaces. So the restart REFUSES (new rc 4) BEFORE even sending /quit, and
 # every caller says so loudly, naming the one login command that fixes it.
 explains_fixture huskpin
+limit_seats wk@example.com alpha@example.com
 FAKE_TMUX_PANES="%1${US}/dev/ttys001${US}claude.exe${US}✳ rainbow rush game"
 export FAKE_TMUX_PANES
 cat > "$FAKE_STATE/pool-ps.txt" <<POOLPS
@@ -3835,6 +3962,8 @@ HP_DRY="$(TMUX_LOG="$HP_LOG" "$SCRIPT" pane-converge --dry-run 2>&1)"
 HP_DRY_RC=$?
 HP_LIVE="$(TMUX_LOG="$HP_LOG" "$SCRIPT" pane-converge 2>&1)"
 HP_LIVE_RC=$?
+# the switch lands on wk, so the pane under test sits on the limited alpha seat (it is moved off alpha)
+sed -i.bak 's#/\.claude-pool/wk#/.claude-pool/alpha#' "$FAKE_STATE/pool-ps.txt"
 HP_RI="$(FAKE_NEW_EMAIL=wk@example.com "$SCRIPT" switch-auto --dry-run --restart-idle 2>&1)"
 set -e
 [ "$HP_DRY_RC" -eq 0 ] && [ "$HP_LIVE_RC" -eq 0 ] \
@@ -3875,6 +4004,7 @@ rm -f "$FAKE_STATE/pool-ps.txt"
 # nested-config trap, and its config_email answer IS the claim (~/.claude.json),
 # so only an explicit guard can catch it.
 explains_fixture lyingmap
+limit_seats wk@example.com alpha@example.com
 FAKE_TMUX_PANES="%1${US}/dev/ttys001${US}claude.exe${US}✳ rainbow rush game"
 export FAKE_TMUX_PANES
 cat > "$FAKE_STATE/pool-ps.txt" <<POOLPS
@@ -3893,6 +4023,8 @@ LM_DRY="$(TMUX_LOG="$LM_LOG" "$SCRIPT" pane-converge --dry-run 2>&1)"
 LM_DRY_RC=$?
 LM_LIVE="$(TMUX_LOG="$LM_LOG" "$SCRIPT" pane-converge 2>&1)"
 LM_LIVE_RC=$?
+# the switch lands on wk, so the pane under test sits on the limited alpha seat (it is moved off alpha)
+sed -i.bak 's#/\.claude-pool/wk#/.claude-pool/alpha#' "$FAKE_STATE/pool-ps.txt"
 LM_RI="$(FAKE_NEW_EMAIL=wk@example.com "$SCRIPT" switch-auto --dry-run --restart-idle 2>&1)"
 set -e
 [ "$LM_DRY_RC" -eq 0 ] && [ "$LM_LIVE_RC" -eq 0 ] \
@@ -3921,6 +4053,7 @@ grep -q 'would skip, accounts map says' <<<"$LM_RI" \
 # in this fixture is COMPLETE and whose config_email IS the claim, both
 # legacy checks would happily "pin" the nested-config trap onto every pane
 explains_fixture sharedmap
+limit_seats wk@example.com alpha@example.com
 FAKE_TMUX_PANES="%1${US}/dev/ttys001${US}claude.exe${US}✳ rainbow rush game"
 export FAKE_TMUX_PANES
 cat > "$FAKE_STATE/pool-ps.txt" <<POOLPS
@@ -3960,6 +4093,7 @@ rm -f "$FAKE_STATE/pool-ps.txt"
 # match is anchored to the bottom line, so a transcript QUOTING the phrases
 # (%5) changes nothing: that pane restarts normally.
 explains_fixture exitq
+limit_seats wk@example.com alpha@example.com
 SID_SP=44444444-4444-4444-8444-444444444444
 seed_session "draft pane" 66666666-6666-4666-8666-666666666666
 seed_session "predraft pane" 77777777-7777-4777-8777-777777777777

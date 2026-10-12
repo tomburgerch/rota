@@ -1910,6 +1910,11 @@ chmod +x "$ROOT/tmux-panes"
 
 US=$'\037'
 mk_pool converge
+# wk and team are over the switch threshold: a pane moves only off a seat that
+# cannot serve it (2026-10-12). The keeper's fetch writes the usage cache the
+# converge leaf reads.
+usage_fixture wk 95 10 ""
+usage_fixture team 95 10 ""
 # claim = alpha. %1 idle but pinned to wk (divergent, restartable); %2 pinned
 # to team and MID-WORK (divergent, must be waited out); %3 pinned to alpha
 # (already converged, no line, no count).
