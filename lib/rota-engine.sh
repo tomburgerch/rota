@@ -5645,8 +5645,8 @@ pane_restart_one() {  # pane_restart_one <pane-id> <resume-target>
 #     `claude --resume ""` drops the pane to a bare shell. Also done once.
 #   • The pane running this command is never restarted (it would kill the
 #     switch mid-flight).
-restart_idle_panes() {  # restart_idle_panes <dry-run 0|1> [<explicit 0|1>]
-  local dry="${1:-0}" explicit="${2:-0}"
+restart_idle_panes() {  # restart_idle_panes <dry-run 0|1> [<explicit 0|1>] [<claim-email>]
+  local dry="${1:-0}" explicit="${2:-0}" claim="${3:-}"
   if ! panes_scan; then
     # Silent when the restart is only the DEFAULT riding along with a switch:
     # a laptop has no such session and must not be nagged about it on
@@ -5671,13 +5671,23 @@ restart_idle_panes() {  # restart_idle_panes <dry-run 0|1> [<explicit 0|1>]
   # second ago, so every pane predates it and the flag would select all of them
   # anyway, while on a --dry-run it would select a different, smaller set, and a
   # dry run that lists fewer panes than the real run would then perform is worse
-  # than useless. The rule stays the simple one: restart every idle pane.
+  # than useless. The rule: restart every idle pane whose seat cannot serve it.
+  # the seat panes are judged against: the one the caller says the switch lands
+  # on (dry run), else the claim as it stands now (after the real switch)
+  [[ -n "$claim" ]] || claim="$(json_email "$HOME/.claude.json")"
   local pid title working prev tty name target
-  # shellcheck disable=SC2034  # `prev`/`tty` are read positionally; see above
+  # shellcheck disable=SC2034  # `prev` is read positionally; see above
   while IFS="$PANES_US" read -r pid title working prev tty; do
     [[ -n "$pid" ]] || continue
     if [[ -n "$self" && "$pid" == "$self" ]]; then
       printf '         %-5s %s\n' "$pid" "skipped, this is the pane running the switch"
+      continue
+    fi
+    # A pane moves only off a seat that cannot serve it (2026-10-12, see
+    # pane_should_stay). Asked BEFORE the mid-work skip so a healthy pane never
+    # reads as "will move when idle".
+    if pane_should_stay "$tty" "$claim"; then
+      (( PANE_KEEP_QUIET )) || printf '         %-5s %s\n' "$pid" "left on $PANE_KEEP_ID ($PANE_KEEP_WHY)"
       continue
     fi
     if [[ "$working" == "1" ]]; then
@@ -5790,6 +5800,114 @@ pane_dir_is_pool() {  # pane_dir_is_pool <dir>
   return 1
 }
 
+# ── may a pane STAY where it is? (2026-10-12) ─────────────────────────────────
+# The incident: Cédric started a Dazzle session explicitly on the cs seat (100%
+# left); 50 s later pane-converge restarted it onto the ACTIVE seat (tommy, 16%
+# weekly left), "I'm currently not able to run new sessions, which is
+# disastrous". Converge and the after-switch restart used to move every pane
+# that was not on the active seat. That is wrong: the active seat is where NEW
+# sessions go, not where every session must live. A pane moves ONLY when the
+# seat it is on cannot serve it:
+#   • the seat ENDED (billing.json date compare, rota_seat_ended)
+#   • its credential is dead/husked (cred_is_complete on the pool dir)
+#   • it is limited: weekly or 5h used at/over AUTO_SWITCH_PCT, the same
+#     threshold the keeper's auto-switch fires on (default 90), read from the
+#     usage cache only (NET=0, never the network). A window whose reset has
+#     passed counts as empty. An UNMEASURED seat is treated as healthy: when in
+#     doubt the pane stays, because a wrong stay costs nothing and a wrong move
+#     drops a session onto a worse seat.
+# A pane whose claude carries CLAUDE_SEAT_OVERRIDE=1 (an explicit pick of a
+# reserved seat, set by Dazzle and by cl) additionally survives a limited or
+# dead seat: only an ENDED seat moves it.
+# Everything else about moving a pane (mid-work skip, resume by id, empty
+# title, never this pane) is unchanged and applies after this question.
+
+# Does the claude on this tty carry CLAUDE_SEAT_OVERRIDE=1? Same ps walk as
+# pane_pin_dir.
+pane_seat_override() {  # pane_seat_override <pane-tty>  → 0 when overridden
+  local tty="${1:-}" short hit
+  [[ -n "$tty" ]] || return 1
+  short="${tty#/dev/}"
+  hit="$(pool_ps | awk -v t1="$short" -v t2="${short#tty}" '
+    NR == 1 && $1 == "PID" { next }
+    $2 == t1 || $2 == t2 {
+      cmd = $5; sub(".*/", "", cmd)
+      if (cmd !~ /^(claude(\.exe|-real)?|[0-9]+\.[0-9]+\.[0-9]+)$/) next
+      for (i = 6; i <= NF; i++)
+        if ($i == "CLAUDE_SEAT_OVERRIDE=1") { print "1"; exit }
+    }' 2>/dev/null || true)"
+  [[ "$hit" == "1" ]]
+}
+
+# Why can this seat not serve a pane? Returns 0 with PANE_SEAT_WHY set when it
+# cannot (ended / credential / limited); returns 1 when it can. Sets globals,
+# never prints, so collect_usage's memoisation survives (no command substitution).
+PANE_SEAT_ENDED=0; PANE_SEAT_WHY=""
+pane_seat_cannot_serve() {  # pane_seat_cannot_serve <pool-dir> <email>
+  local dir="${1:-}" id="${2:-}" i thr wk se saved_net="$NET"
+  PANE_SEAT_ENDED=0; PANE_SEAT_WHY=""
+  if rota_seat_ended "$BILLING_JSON" "$id"; then
+    PANE_SEAT_ENDED=1
+    PANE_SEAT_WHY="its seat ENDED $(rota_seat_field "$BILLING_JSON" "$id" 2)"
+    return 0
+  fi
+  if [[ -d "$dir" ]] && ! cred_is_complete "$dir/.credentials.json"; then
+    PANE_SEAT_WHY="its credential is dead or a husk"
+    return 0
+  fi
+  thr="${AUTO_SWITCH_PCT:-90}"; [[ "$thr" =~ ^[0-9]+$ ]] || thr=90
+  NET=0; collect_usage; NET="$saved_net"
+  for i in "${!U_EMAIL[@]}"; do
+    [[ "${U_EMAIL[$i]}" == "$id" ]] || continue
+    case "${U_STATE[$i]}" in live|cached|peer) ;; *) return 1 ;; esac
+    wk="${U_WKU[$i]%.*}"; se="${U_SEU[$i]%.*}"
+    if [[ "$wk" =~ ^[0-9]+$ ]] && (( ! ${U_WKX[$i]:-0} )) && (( wk >= thr )); then
+      PANE_SEAT_WHY="it is at weekly ${wk}% (switch threshold ${thr}%)"; return 0
+    fi
+    if [[ "$se" =~ ^[0-9]+$ ]] && (( ! ${U_SEX[$i]:-0} )) && (( se >= thr )); then
+      PANE_SEAT_WHY="it is at 5h ${se}% (switch threshold ${thr}%)"; return 0
+    fi
+    return 1
+  done
+  return 1
+}
+
+# The one question both restart paths ask. Returns 0 = LEAVE the pane alone
+# (PANE_KEEP_WHY says why, PANE_KEEP_ID names the seat), 1 = it may move
+# (PANE_KEEP_ID = the seat it is on, or "unpinned, no CLAUDE_CONFIG_DIR").
+# PANE_KEEP_QUIET=1 marks the reasons that are not news (already on the active
+# seat, pinned outside the pool): no output line for those.
+PANE_KEEP_WHY=""; PANE_KEEP_ID=""; PANE_KEEP_QUIET=0
+pane_should_stay() {  # pane_should_stay <pane-tty> <claim-email>
+  local tty="${1:-}" claim="${2:-}" dir id why
+  PANE_KEEP_WHY=""; PANE_KEEP_ID=""; PANE_KEEP_QUIET=0
+  dir="$(pane_pin_dir "$tty")"
+  if [[ -z "$dir" ]]; then
+    # no pin = on no seat at all under pool v2 (2026-08-16); on a pre-v2 box
+    # (state bare) an unpinned pane is on the right account already
+    pane_pin_resolve
+    PANE_KEEP_ID="unpinned, no CLAUDE_CONFIG_DIR"
+    if [[ "$PANE_PIN_STATE" == "bare" ]]; then PANE_KEEP_WHY="not pinned, pre-pool box"; PANE_KEEP_QUIET=1; return 0; fi
+    return 1
+  fi
+  if ! pane_dir_is_pool "$dir"; then
+    PANE_KEEP_ID="$(tilde "$dir")"; PANE_KEEP_WHY="pinned outside the pool"; PANE_KEEP_QUIET=1; return 0
+  fi
+  id="$(config_email "$dir")"
+  if [[ -z "$id" ]]; then PANE_KEEP_ID="$(tilde "$dir")"; PANE_KEEP_WHY="seat has no identity"; PANE_KEEP_QUIET=1; return 0; fi
+  PANE_KEEP_ID="$id"
+  if [[ "$id" == "$claim" ]]; then PANE_KEEP_WHY="already on the active seat"; PANE_KEEP_QUIET=1; return 0; fi
+  if ! pane_seat_cannot_serve "$dir" "$id"; then
+    PANE_KEEP_WHY="healthy, not the active seat"; return 0
+  fi
+  why="$PANE_SEAT_WHY"
+  if (( ! PANE_SEAT_ENDED )) && pane_seat_override "$tty"; then
+    PANE_KEEP_WHY="explicit seat pick (CLAUDE_SEAT_OVERRIDE=1); $why, but only an ended seat moves it"; return 0
+  fi
+  PANE_KEEP_WHY="$why"
+  return 1
+}
+
 cmd_pane_converge() {  # cmd_pane_converge [--dry-run]
   local dry=0 a
   for a in "$@"; do
@@ -5812,29 +5930,18 @@ cmd_pane_converge() {  # cmd_pane_converge [--dry-run]
     printf 'pane-converge: restarted=0 busy=0 divergent=0\n'
     return 0
   fi
-  local self="${TMUX_PANE:-}" restarted=0 busy=0 divergent=0
-  local pid title working prev tty dir id name target rrc
+  local self="${TMUX_PANE:-}" restarted=0 busy=0 divergent=0 left=0
+  local pid title working prev tty id name target rrc
   # shellcheck disable=SC2034  # `prev` is read positionally to reach `tty`
   while IFS="$PANES_US" read -r pid title working prev tty; do
     [[ -n "$pid" ]] || continue
-    dir="$(pane_pin_dir "$tty")"
-    if [[ -n "$dir" ]]; then
-      pane_dir_is_pool "$dir" || continue  # non-pool pin (scratch/login capture) → never touched
-      id="$(config_email "$dir")"
-      [[ -n "$id" ]] || continue           # dir has no identity → nothing to compare
-      [[ "$id" == "$claim" ]] && continue  # already on the active account
-    else
-      # no pin at all → divergent BY DEFINITION under pool v2 (2026-08-16,
-      # see the section comment: unpinned panes were the broken ones, and the
-      # old `continue` here is what kept them broken). EXCEPT on a pre-v2 box
-      # (pane_pin state `bare`: no resolvable claim, shared ~/.claude holds a
-      # live credential): there an unpinned pane IS on the right account, and
-      # a bare restart comes back unpinned, restarting it every tick would be
-      # a /quit loop that never converges anything.
-      pane_pin_resolve
-      [[ "$PANE_PIN_STATE" == "bare" ]] && continue
-      id="unpinned, no CLAUDE_CONFIG_DIR"
+    if pane_should_stay "$tty" "$claim"; then
+      (( PANE_KEEP_QUIET )) && continue
+      printf '%s left on %s (%s)\n' "$pid" "$PANE_KEEP_ID" "$PANE_KEEP_WHY"
+      left=$((left + 1))
+      continue
     fi
+    id="$PANE_KEEP_ID"
     divergent=$((divergent + 1))
     if [[ -n "$self" && "$pid" == "$self" ]]; then
       printf '%s still on %s, this is the pane running the converge; left alone\n' "$pid" "$id"
@@ -5897,8 +6004,9 @@ cmd_pane_converge() {  # cmd_pane_converge [--dry-run]
       busy=$((busy + 1))
     fi
   done <<<"$PANES_ROWS"
-  printf 'pane-converge: restarted=%d busy=%d divergent=%d claim=%s%s\n' \
-    "$restarted" "$busy" "$divergent" "$claim" "$( (( dry )) && printf ' (dry-run)' )"
+  printf 'pane-converge: restarted=%d busy=%d divergent=%d%s claim=%s%s\n' \
+    "$restarted" "$busy" "$divergent" "$( (( left )) && printf ' left=%d' "$left" )" \
+    "$claim" "$( (( dry )) && printf ' (dry-run)' )"
   return 0
 }
 
@@ -6443,7 +6551,9 @@ main() {
       if (( dry )); then
         echo "(dry-run, no switch performed)"
         (( quiet )) || render_panes_summary
-        if (( restart )); then restart_idle_panes 1 "$restart_explicit"; fi
+        # the claim is still the OLD seat in a dry run: judge the panes against
+        # the seat the real run would land on, so both lists are the same set
+        if (( restart )); then restart_idle_panes 1 "$restart_explicit" "$REC_EMAIL"; fi
         return 0
       fi
       # A CALL, not the old `exec`: the panes block is the part that only makes

@@ -49,7 +49,7 @@ rota login personal
 | Command | What it does |
 |---|---|
 | `rota usage` | One row per seat, in four buckets: ACTIVE (metered), ALTERNATIVES (have capacity), UNMEASURED (quota unknown, not spent) and UNAVAILABLE (spent, or the seat has ended). Shows both windows, when each resets, how fresh the number is, and which seat live sessions are billing to right now. `rota usage --record <seat> <weekly-used-%>` stores a number read by hand for a seat the usage API will not answer for. |
-| `rota switch` | Pick the best seat (soonest deadline with room left, where the deadline is `min(weekly reset, seat end)`) and make it active. `rota switch <seat>` names one. Idle sessions restart onto it; sessions mid-work are left alone and converge later. |
+| `rota switch` | Pick the best seat (soonest deadline with room left, where the deadline is `min(weekly reset, seat end)`) and make it active. `rota switch <seat>` names one. Idle sessions on a seat that can no longer serve them (limited, ended, dead credential) restart onto it; sessions on a healthy seat, and sessions mid-work, are left alone. |
 | `rota login <seat>` | Open Claude pinned to one seat so `/login` lands in the right directory. |
 | `rota status` | The pointer and every seat's credential health. `rota keeper-status` shows what the daemon did on its last tick, and its log. |
 | `rota billing` | The usage table plus what each seat costs and when it renews, from `~/.config/claude-failover/billing.json` (no API exposes this, so you maintain it; start from `config/billing.example.json`). An unmeasured seat reads `????????? UNMEASURED` rather than a percentage, and the `--record` command that would answer it is printed under the table. |
@@ -63,6 +63,10 @@ Everything else (`reconcile`, `normalize`, `cred-guard`, `cred-restore`, `adopt-
 - It does not change the account of a session that is already running.
 - It does not touch headless containers or CI runners (a per-container `CLAUDE_CONFIG_DIR` already solves that with one line of config).
 - It does not know what anything costs; `billing.json` is yours to keep.
+
+## Which sessions move
+
+The active seat is where *new* sessions go, not where every session must live. `rota switch`, the keeper's auto-switch and `rota pane-converge` restart a tmux pane only when the seat it is on cannot serve it: the seat is limited (weekly or 5h at or above `AUTO_SWITCH_PCT`, read from the usage cache, never the network), the seat has ended, or its credential is dead or a husk. A pane on a healthy seat that is just not the active one is left alone and reported as `left on <seat> (healthy, not the active seat)`. A pane whose claude carries `CLAUDE_SEAT_OVERRIDE=1` (an explicit pick of a reserved seat, set by Dazzle and by `cl`) moves only if its seat ended. A seat with no measurement counts as healthy: a wrong stay costs nothing, a wrong move drops a session onto a worse seat. Before this rule (2026-10-12) converge moved a session its owner had just started on a 100%-left seat onto the active seat that had 16% left. The mid-work skip, resume by session id, the empty-title skip and never restarting the pane that runs the command all still apply. `pane-converge --dry-run` lists exactly the panes a real run restarts.
 
 ## Exit questions on restart
 

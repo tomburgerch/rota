@@ -83,7 +83,7 @@
 # with the ENVIRONMENT winning over the file so a one-off run can override:
 #   AUTO_SWITCH_PCT=90  AUTO_SWITCH_RESTART_IDLE=1  KEEPALIVE_MIN=90
 #   KEEPER_DISABLE=0    WARM_AT=03:00               WARM_ACCOUNTS=all
-#   PANE_CONVERGE=1     0 = never restart divergent idle panes (step 4b)
+#   PANE_CONVERGE=1     0 = never restart panes off a seat that cannot serve them (step 4b)
 #   KEEPALIVE_ENABLED=0             1 = restore the pre-2026-08-16 nudging
 #   AUTO_SWITCH_TARGET_MAX_PCT=80   never switch ONTO an account above this
 #   AUTO_SWITCH_TARGET_MIN_LEFT_PCT=30  never switch onto an account with less
@@ -218,6 +218,10 @@ fi
 [[ -n "$_env_AUTO_SWITCH_BOUNCE_SECS" ]] && AUTO_SWITCH_BOUNCE_SECS="$_env_AUTO_SWITCH_BOUNCE_SECS"
 [[ -n "$_env_KEEPER_LOCK_STALE_SECS" ]] && KEEPER_LOCK_STALE_SECS="$_env_KEEPER_LOCK_STALE_SECS"
 [[ -n "$_env_PANE_CONVERGE" ]] && PANE_CONVERGE="$_env_PANE_CONVERGE"
+# The engine (a child process) decides whether a pane's seat can still serve it
+# (pane-converge, the after-switch restart) against the SAME threshold this
+# keeper switches on, so the two can never disagree about "limited".
+export AUTO_SWITCH_PCT
 
 tilde() { printf '%s' "${1/#$HOME/~}"; }
 
@@ -1547,6 +1551,13 @@ main() {
         pc_acct="$(sed -nE 's/.*(busy on|still on) ([^ ]*).*/\2/p' <<<"$pc_line")"
         log_once "converge-$pc_pane" "$pc_acct:$pc_line" "pane-converge: $pc_line"
       done < <(grep -E ' (busy on|still on) ' <<<"$pc_out" || true)
+      # panes deliberately left on a healthy / explicitly picked seat: one line
+      # per pane+reason, then quiet (a healthy seat can stand for days)
+      while IFS= read -r pc_line; do
+        [[ -n "$pc_line" ]] || continue
+        pc_pane="${pc_line%% *}"
+        log_once "converge-left-$pc_pane" "$pc_line" "pane-converge: $pc_line"
+      done < <(grep -E ' left on ' <<<"$pc_out" || true)
       if (( pc_restarted > 0 )); then
         st_converge="$pc_restarted"
         (( pc_busy > 0 )) && st_converge="$pc_restarted+busy:$pc_busy"
