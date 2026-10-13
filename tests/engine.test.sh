@@ -3951,6 +3951,51 @@ grep -q "would restart (CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" claude -
   && ok "pinned restart → a complete active credential puts CLAUDE_CONFIG_DIR=<its pool dir> on the sent line" \
   || bad "pinned restart → pin present (got: $HPOK)"
 
+# 45c2. a moved session's title follows its seat (2026-10-12): a pane titled
+# "<name> (<old seat>)" restarts with --name "<name> (<new seat alias>)", by alias
+# or by full label; a name with no seat suffix, or a bracket that is no seat,
+# is sent exactly as before (no --name).
+SID_SEAT=44444444-4444-4444-8444-444444444444
+SID_SEAT2=55555555-5555-4555-8555-555555555555
+SID_SEAT3=66666666-6666-4666-8666-666666666666
+seed_session "named pane (wk)" "$SID_SEAT"
+seed_session "mail pane (wk@example.com)" "$SID_SEAT2"
+seed_session "notes (draft)" "$SID_SEAT3"
+FAKE_TMUX_PANES="%1${US}/dev/ttys001${US}claude.exe${US}✳ named pane (wk)"$'\n'"%2${US}/dev/ttys002${US}claude.exe${US}✳ mail pane (wk@example.com)"$'\n'"%3${US}/dev/ttys003${US}claude.exe${US}✳ notes (draft)"
+cat > "$FAKE_STATE/pool-ps.txt" <<POOLPS2
+PID TT STAT TIME COMMAND
+101 s001 S+ 0:00 /usr/local/bin/claude CLAUDE_CONFIG_DIR=$RUN/.claude-pool/wk HOME=$RUN
+102 s002 S+ 0:00 /usr/local/bin/claude CLAUDE_CONFIG_DIR=$RUN/.claude-pool/wk HOME=$RUN
+103 s003 S+ 0:00 /usr/local/bin/claude CLAUDE_CONFIG_DIR=$RUN/.claude-pool/wk HOME=$RUN
+POOLPS2
+set +e
+SEAT_DRY="$("$SCRIPT" pane-converge --dry-run 2>&1)"
+set -e
+echo "  before/after relaunch lines for the rename fixture:"; grep "would restart" <<<"$SEAT_DRY" | sed 's/^/    /'
+grep -q "would restart (CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" claude --resume \"$SID_SEAT\" --name \"named pane (primary)\")" <<<"$SEAT_DRY" \
+  && ok "seat rename → a title ending in the old seat's alias is renamed to the new alias on the relaunch line" \
+  || bad "seat rename → alias form (got: $SEAT_DRY)"
+grep -q "claude --resume \"$SID_SEAT2\" --name \"mail pane (primary)\")" <<<"$SEAT_DRY" \
+  && ok "seat rename → the old seat's full label form is renamed too" \
+  || bad "seat rename → label form (got: $SEAT_DRY)"
+grep -q "claude --resume \"$SID_SEAT3\")" <<<"$SEAT_DRY" && ! grep -q 'notes (draft).*--name\|--name "notes' <<<"$SEAT_DRY" \
+  && ok "seat rename → a bracket that is no seat is left alone, no --name" \
+  || bad "seat rename → non-seat bracket (got: $SEAT_DRY)"
+SEAT_LOG="$ROOT/tmux-seat-rename.log"
+set +e
+TMUX_LOG="$SEAT_LOG" "$SCRIPT" pane-converge >/dev/null 2>&1
+set -e
+grep -q "tmux send-keys -t %1 CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" claude --resume \"$SID_SEAT\" --name \"named pane (primary)\" Enter" "$SEAT_LOG" \
+  && ok "seat rename → the SENT line carries the new name, the same one the plan printed" \
+  || bad "seat rename → sent line ($(grep 'send-keys' "$SEAT_LOG"))"
+unset FAKE_TMUX_PANES
+FAKE_TMUX_PANES="%1${US}/dev/ttys001${US}claude.exe${US}✳ rainbow rush game"
+export FAKE_TMUX_PANES
+cat > "$FAKE_STATE/pool-ps.txt" <<POOLPS
+PID TT STAT TIME COMMAND
+101 s001 S+ 0:00 /usr/local/bin/claude CLAUDE_CONFIG_DIR=$RUN/.claude-pool/wk HOME=$RUN
+POOLPS
+
 # now gut the ACTIVE account's pool credential to the husk shape (refreshToken
 # key with no value, expiresAt gone, the file the CLI leaves after a rejected
 # refresh) and watch every restart path refuse rather than relaunch onto it
