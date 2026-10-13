@@ -5562,14 +5562,44 @@ pane_target_is_session_id() {  # pane_target_is_session_id <target>
 # senders and every would-restart/restarted report line, so what is printed is
 # by construction what is sent. The target is what pane_resume_target
 # resolved, never a raw pane title.
-pane_resume_line() {  # pane_resume_line <resume-target>
+pane_resume_line() {  # pane_resume_line <resume-target> [<pane-name>]
   pane_pin_resolve
+  local rename=""
+  if [[ "$PANE_PIN_STATE" == "pin" && -n "${2:-}" ]]; then
+    rename="$(pane_seat_rename "${2:-}" "$(basename "$PANE_PIN_DIR")")"
+  fi
+  local name_flag=""
+  [[ -z "$rename" ]] || name_flag=" --name $(dq_arg "$rename")"
   if [[ "$PANE_PIN_STATE" == "pin" ]]; then
-    printf 'CLAUDE_CONFIG_DIR=%s claude --resume %s' \
-      "$(dq_arg "$PANE_PIN_DIR")" "$(dq_arg "${1:-}")"
+    printf 'CLAUDE_CONFIG_DIR=%s claude --resume %s%s' \
+      "$(dq_arg "$PANE_PIN_DIR")" "$(dq_arg "${1:-}")" "$name_flag"
   else
     printf 'claude --resume %s' "$(dq_arg "${1:-}")"
   fi
+}
+
+# A moved session's title follows its seat (2026-10-12). Sessions are named
+# "<name> (<seat alias>)" by cl and Dazzle; a restart onto another seat used to
+# keep the old suffix ("dazzle (gmail)" running on cs). Prints the renamed title
+# when <name> ends with " (<seat>)" where <seat> is the alias (pool dir name) or
+# the full label of ANOTHER seat in the pool, else prints nothing: a name with no
+# seat suffix, a bracket that is no seat ("notes (draft)") and a name already
+# carrying the new alias are left alone.
+pane_seat_rename() {  # pane_seat_rename <pane-name> <new-seat-alias>
+  local name="${1:-}" new="${2:-}" base suffix low newlow i
+  [[ -n "$name" && -n "$new" && "$name" =~ ^(.*[^[:space:]])[[:space:]]+\(([^()]+)\)$ ]] || return 0
+  base="${BASH_REMATCH[1]}"; suffix="${BASH_REMATCH[2]}"
+  low="$(printf '%s' "$suffix" | tr '[:upper:]' '[:lower:]')"
+  newlow="$(printf '%s' "$new" | tr '[:upper:]' '[:lower:]')"
+  [[ "$low" == "$newlow" ]] && return 0
+  for i in "${!DIRS[@]}"; do
+    if [[ "$low" == "$(basename "${DIRS[$i]}" | tr '[:upper:]' '[:lower:]')" \
+       || "$low" == "$(printf '%s' "${LABELS[$i]:-}" | tr '[:upper:]' '[:lower:]')" ]]; then
+      printf '%s (%s)' "$base" "$new"
+      return 0
+    fi
+  done
+  return 0
 }
 
 # The one loud sentence for the refuse state, shared by every caller, it must
@@ -5602,8 +5632,8 @@ pane_pin_refuse_reason() {
 # in the status line before /quit, or the exit question cancelled with one
 # Escape): busy, retried next tick · 8 the target is not a session id: no key
 # sent, the pane keeps running. Never "2": see the block comment above.
-pane_restart_one() {  # pane_restart_one <pane-id> <resume-target>
-  local pid="${1:-}" target="${2:-}"
+pane_restart_one() {  # pane_restart_one <pane-id> <resume-target> [<pane-name>]
+  local pid="${1:-}" target="${2:-}" pname="${3:-}"
   # no session id, no /quit: a title resume opens a picker (see pane_resume_target)
   pane_target_is_session_id "$target" || return 8
   pane_pin_resolve
@@ -5620,7 +5650,7 @@ pane_restart_one() {  # pane_restart_one <pane-id> <resume-target>
   case "$arc" in 0) ;; 5|6|7) return "$arc" ;; *) return 2 ;; esac
   # the resume line only ever goes to a shell: look once more right before it
   is_claude_cmd "$(tmuxc display-message -p -t "$pid" '#{pane_current_command}' </dev/null 2>/dev/null || true)" && return 2
-  tmuxc send-keys -t "$pid" "$(pane_resume_line "$target")" Enter </dev/null 2>/dev/null || return 3
+  tmuxc send-keys -t "$pid" "$(pane_resume_line "$target" "$pname")" Enter </dev/null 2>/dev/null || return 3
   return 0
 }
 
@@ -5714,14 +5744,14 @@ restart_idle_panes() {  # restart_idle_panes <dry-run 0|1> [<explicit 0|1>] [<cl
       if [[ "$PANE_PIN_STATE" == "refuse" ]]; then
         printf '         %-5s %s\n' "$pid" "would skip, $(pane_pin_refuse_reason)"
       else
-        printf '         %-5s %s\n' "$pid" "would restart → $(pane_resume_line "$target")"
+        printf '         %-5s %s\n' "$pid" "would restart → $(pane_resume_line "$target" "$name")"
       fi
       continue
     fi
     local rrc=0
-    pane_restart_one "$pid" "$target" || rrc=$?
+    pane_restart_one "$pid" "$target" "$name" || rrc=$?
     case "$rrc" in
-      0) printf '         %-5s %s\n' "$pid" "restarted → $(pane_resume_line "$target")" ;;
+      0) printf '         %-5s %s\n' "$pid" "restarted → $(pane_resume_line "$target" "$name")" ;;
       1) printf '         %-5s %s\n' "$pid" "skipped, send-keys failed (pane gone?)" ;;
       2) printf '         %-5s %s\n' "$pid" "skipped, still running claude after /quit; left alone" ;;
       8) printf '         %-5s %s\n' "$pid" "skipped, no session id for \"$name\": left running (resume would open a picker)" ;;
@@ -5973,15 +6003,15 @@ cmd_pane_converge() {  # cmd_pane_converge [--dry-run]
         printf '%s on %s → would NOT restart, %s\n' "$pid" "$id" "$(pane_pin_refuse_reason)"
         busy=$((busy + 1))
       else
-        printf '%s on %s → would restart (%s)\n' "$pid" "$id" "$(pane_resume_line "$target")"
+        printf '%s on %s → would restart (%s)\n' "$pid" "$id" "$(pane_resume_line "$target" "$name")"
         restarted=$((restarted + 1))
       fi
       continue
     fi
     rrc=0
-    pane_restart_one "$pid" "$target" || rrc=$?
+    pane_restart_one "$pid" "$target" "$name" || rrc=$?
     if (( rrc == 0 )); then
-      printf '%s restarted onto %s (was %s) → %s\n' "$pid" "$claim" "$id" "$(pane_resume_line "$target")"
+      printf '%s restarted onto %s (was %s) → %s\n' "$pid" "$claim" "$id" "$(pane_resume_line "$target" "$name")"
       restarted=$((restarted + 1))
     elif (( rrc == 5 )); then
       printf '%s still on %s, needs you: unsent feedback draft, send or discard it, then it moves\n' "$pid" "$id"
