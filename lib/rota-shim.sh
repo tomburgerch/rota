@@ -517,19 +517,17 @@ refuse_reserved_seat() {
 # Checked for BOTH the explicit-pin and the shim-resolved path, because the
 # breach came in through the explicit pin.
 check_reserved_seat() {
-  local dir="${1:-}"
+  local dir="${1:-}" login="${CLAUDE_SEAT_LOGIN:-}"
   shift || true
-  [ -n "$dir" ] || return 0
-  [ -n "${CLAUDE_SEAT_OVERRIDE:-}" ] && return 0
   # `rota login <seat>` sets CLAUDE_SEAT_LOGIN=1 for its one exec so a reserved seat
   # can still be logged in (a login spends no quota; 2026-10-17 it was refused over
-  # ssh, exit 9). It is unset here, before the real claude starts, so it never
-  # leaks into a child `claude` that session spawns, which stays guarded. A
-  # hand-typed CLAUDE_CONFIG_DIR=... claude has no such variable and is still refused.
-  if [ -n "${CLAUDE_SEAT_LOGIN:-}" ]; then
-    unset CLAUDE_SEAT_LOGIN
-    return 0
-  fi
+  # ssh, exit 9). It is unset FIRST, before any early return, so it never leaks into
+  # a child `claude` that session spawns, which stays guarded. A hand-typed
+  # CLAUDE_CONFIG_DIR=... claude has no such variable and is still refused.
+  unset CLAUDE_SEAT_LOGIN
+  [ -n "$dir" ] || return 0
+  [ -n "${CLAUDE_SEAT_OVERRIDE:-}" ] && return 0
+  [ -n "$login" ] && return 0
   local marker="$dir/$RESERVED_MARKER_NAME"
   [ -f "$marker" ] || return 0
   seat_invocation_is_a_session "$@" || return 0
