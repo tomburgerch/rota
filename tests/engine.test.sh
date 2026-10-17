@@ -1715,6 +1715,9 @@ bind_row="$(jq -c '.accounts[] | select(.email=="solo@example.com")' <<<"$JSON_O
 [ "$(jq -r '.five_hour.used_pct' <<<"$bind_row" 2>/dev/null)" = "34" ] \
   && ok "binding scoped (json) → five_hour is still five_hour.utilization" \
   || bad "binding scoped (json) → five_hour.used_pct is 34 (got: $bind_row)"
+[ "$(jq -c '.weekly_scoped' <<<"$bind_row" 2>/dev/null)" = "[{\"name\":\"Opus\",\"used_pct\":47,\"left_pct\":53,\"resets_at\":\"$WK_SCOPED_R\"}]" ] \
+  && ok "weekly_scoped (json) → the binding scoped entry is listed with used/left/reset" \
+  || bad "weekly_scoped (json) → one Opus entry, 47 used / 53 left (got: $(jq -c '.weekly_scoped' <<<"$bind_row" 2>/dev/null))"
 # the cache stores the binding NUMBER but not which limit produced it, so a --no-refresh
 # row must keep the 47 and drop the annotation rather than invent or stale one
 set +e
@@ -1730,6 +1733,9 @@ grep -qE '^    weekly  [█░]{15} +53% left · 47% used' <<<"$CACHED_OUT" \
 [ "$(jq -r '.accounts[0].weekly | [.kind,.scope] | @csv' <<<"$CACHED_JSON" 2>/dev/null)" = ',' ] \
   && ok "binding scoped (json) → a cached row reports kind/scope null, never a stale pair" \
   || bad "binding scoped (json) → cached kind/scope are null (got: $(jq -c '.accounts[0].weekly' <<<"$CACHED_JSON" 2>/dev/null))"
+[ "$(jq -c '.accounts[0].weekly_scoped' <<<"$CACHED_JSON" 2>/dev/null)" = "null" ] \
+  && ok "weekly_scoped (json) → a cached row has NO live data, so null, never a stale list" \
+  || bad "weekly_scoped (json) → cached row is null (got: $(jq -c '.accounts[0].weekly_scoped' <<<"$CACHED_JSON" 2>/dev/null))"
 
 # --- 22. weekly_all binds when IT is the higher one ---------------------------
 # Same mechanism, the ordinary case: the scoped entry is the small one (a live
@@ -1780,6 +1786,9 @@ ba_row="$(jq -c '.accounts[] | select(.email=="solo@example.com")' <<<"$JSON_OUT
 [ "$(jq -r '.weekly.used_pct' <<<"$ba_row" 2>/dev/null)" = "21" ] \
   && ok "binding all (json) → weekly.used_pct matches seven_day, as it must when weekly_all binds" \
   || bad "binding all (json) → weekly.used_pct is 21 (got: $ba_row)"
+[ "$(jq -c '.weekly_scoped' <<<"$ba_row" 2>/dev/null)" = "[{\"name\":\"Fable\",\"used_pct\":2,\"left_pct\":98,\"resets_at\":\"$WK_ALL_R\"}]" ] \
+  && ok "weekly_scoped (json) → a NON-binding Fable cap is still listed (2 used / 98 left)" \
+  || bad "weekly_scoped (json) → Fable listed though weekly_all binds (got: $(jq -c '.weekly_scoped' <<<"$ba_row" 2>/dev/null))"
 
 # --- 23. FALLBACK: no usable `limits` must behave exactly as before ------------
 # An older or differently-shaped response must not break the tool. Absent, empty, a
@@ -1820,6 +1829,9 @@ fb_case() {  # fb_case <label> <limits-json-fragment-or-empty>
   [ "$(jq -r '.accounts[0].weekly.resets_at' <<<"$FB_JSON" 2>/dev/null)" = "$FB_WK_R" ] \
     && ok "fallback [$label] (json) → weekly.resets_at is seven_day's own stamp" \
     || bad "fallback [$label] (json) → weekly.resets_at is seven_day's (got: $(jq -r '.accounts[0].weekly.resets_at' <<<"$FB_JSON" 2>/dev/null))"
+  [ "$(jq -c '.accounts[0].weekly_scoped' <<<"$FB_JSON" 2>/dev/null)" = "[]" ] \
+    && ok "fallback [$label] (json) → weekly_scoped is [] for a live response with no scoped entry" \
+    || bad "fallback [$label] (json) → weekly_scoped is [] (got: $(jq -c '.accounts[0].weekly_scoped' <<<"$FB_JSON" 2>/dev/null))"
 }
 fb_case "limits absent"    ''
 fb_case "limits empty"     ',"limits":[]'
@@ -1855,6 +1867,9 @@ ns_row="$(jq -c '.accounts[0]' <<<"$JSON_OUT" 2>/dev/null)"
 [ "$(jq -r '.weekly.kind' <<<"$ns_row" 2>/dev/null)" = "weekly_scoped" ] \
   && ok "null scope name (json) → weekly.kind still records that a scoped limit bound" \
   || bad "null scope name (json) → weekly.kind is weekly_scoped (got: $ns_row)"
+[ "$(jq -c '.weekly_scoped' <<<"$ns_row" 2>/dev/null)" = "[]" ] \
+  && ok "weekly_scoped (json) → a scoped entry with no usable name is left out, never listed as \"null\"" \
+  || bad "weekly_scoped (json) → nameless scoped entry omitted (got: $(jq -c '.weekly_scoped' <<<"$ns_row" 2>/dev/null))"
 
 # --- 24. the BINDING number drives the health floor and the recommendation -----
 # This is what FIX 2 is for. The active account's weekly_all sits at a comfortable 10%,
@@ -2968,7 +2983,10 @@ EX_JSON_PATHS="$(jq -S -r 'paths | join(".")' <<<"$EX_JSON" | sed -E 's/\.[0-9]+
 #   2026-09-26  ADDITIVE: `accounts.N.weekly_all{used_pct,remaining_pct,resets_at}`,
 #               the all-model weekly, null when the row never measured it. A spent
 #               SCOPED cap (Fable) binds `weekly` but the seat still runs Opus.
-EX_JSON_PATHS_WANT="accounts accounts.N accounts.N.active accounts.N.alias accounts.N.cached_at accounts.N.config_dir accounts.N.current accounts.N.data accounts.N.email accounts.N.five_hour accounts.N.five_hour.expired accounts.N.five_hour.fresh accounts.N.five_hour.remaining_pct accounts.N.five_hour.resets_at accounts.N.five_hour.used_pct accounts.N.label accounts.N.live accounts.N.loggedIn accounts.N.note accounts.N.quota_data accounts.N.quota_measured_at accounts.N.quota_source accounts.N.reason accounts.N.recommendable accounts.N.seat accounts.N.seat.ended accounts.N.seat.ends accounts.N.seat.status accounts.N.session accounts.N.session.expired accounts.N.session.fresh accounts.N.session.leftPct accounts.N.session.resetsAt accounts.N.session.resetsInSeconds accounts.N.session.usedPct accounts.N.stale accounts.N.stale_reason accounts.N.unmeasured accounts.N.weekly accounts.N.weekly.expired accounts.N.weekly.fresh accounts.N.weekly.kind accounts.N.weekly.leftPct accounts.N.weekly.projected_from accounts.N.weekly.remaining_pct accounts.N.weekly.resetsAt accounts.N.weekly.resetsInSeconds accounts.N.weekly.resets_at accounts.N.weekly.resets_at_projected accounts.N.weekly.scope accounts.N.weekly.usedPct accounts.N.weekly.used_pct accounts.N.weekly_all accounts.N.weekly_all.remaining_pct accounts.N.weekly_all.resets_at accounts.N.weekly_all.used_pct active active.auth_status active.auth_warning active.email active.fingerprint active.nested_config_warning active.source active.warning activeEmail floors floors.comfortable_pct floors.exhausted_pct floors.session_pct floors.weekly_pct peer recommendation recommendation.action recommendation.alias recommendation.best_alternative recommendation.best_alternative.email recommendation.best_alternative.weekly_left_pct recommendation.burn_down_hold recommendation.deadline_at recommendation.deadline_kind recommendation.deadline_projected recommendation.email recommendation.from_cached_numbers recommendation.label recommendation.mode recommendation.mode_forced recommendation.reason recommendation.weekly_fresh "
+#   2026-10-17  ADDITIVE: `accounts.N.weekly_scoped`, every SCOPED weekly entry as
+#               [{name,used_pct,left_pct,resets_at}], not just the binding one. null
+#               when the row has no live response, [] when the response had none.
+EX_JSON_PATHS_WANT="accounts accounts.N accounts.N.active accounts.N.alias accounts.N.cached_at accounts.N.config_dir accounts.N.current accounts.N.data accounts.N.email accounts.N.five_hour accounts.N.five_hour.expired accounts.N.five_hour.fresh accounts.N.five_hour.remaining_pct accounts.N.five_hour.resets_at accounts.N.five_hour.used_pct accounts.N.label accounts.N.live accounts.N.loggedIn accounts.N.note accounts.N.quota_data accounts.N.quota_measured_at accounts.N.quota_source accounts.N.reason accounts.N.recommendable accounts.N.seat accounts.N.seat.ended accounts.N.seat.ends accounts.N.seat.status accounts.N.session accounts.N.session.expired accounts.N.session.fresh accounts.N.session.leftPct accounts.N.session.resetsAt accounts.N.session.resetsInSeconds accounts.N.session.usedPct accounts.N.stale accounts.N.stale_reason accounts.N.unmeasured accounts.N.weekly accounts.N.weekly.expired accounts.N.weekly.fresh accounts.N.weekly.kind accounts.N.weekly.leftPct accounts.N.weekly.projected_from accounts.N.weekly.remaining_pct accounts.N.weekly.resetsAt accounts.N.weekly.resetsInSeconds accounts.N.weekly.resets_at accounts.N.weekly.resets_at_projected accounts.N.weekly.scope accounts.N.weekly.usedPct accounts.N.weekly.used_pct accounts.N.weekly_all accounts.N.weekly_all.remaining_pct accounts.N.weekly_all.resets_at accounts.N.weekly_all.used_pct accounts.N.weekly_scoped active active.auth_status active.auth_warning active.email active.fingerprint active.nested_config_warning active.source active.warning activeEmail floors floors.comfortable_pct floors.exhausted_pct floors.session_pct floors.weekly_pct peer recommendation recommendation.action recommendation.alias recommendation.best_alternative recommendation.best_alternative.email recommendation.best_alternative.weekly_left_pct recommendation.burn_down_hold recommendation.deadline_at recommendation.deadline_kind recommendation.deadline_projected recommendation.email recommendation.from_cached_numbers recommendation.label recommendation.mode recommendation.mode_forced recommendation.reason recommendation.weekly_fresh "
 [ "$EX_JSON_PATHS" = "$EX_JSON_PATHS_WANT" ] \
   && ok "json byte-identity → every published key path is exactly what the dashboard was promised" \
   || bad "json byte-identity → key paths drifted:
