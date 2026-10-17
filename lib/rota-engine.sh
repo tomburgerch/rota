@@ -2277,6 +2277,7 @@ weekly_binding() {  # weekly_binding <usage-json>
             | { name: ((try .scope.model.display_name catch null)
                        // (try .scope.name catch null)) } + {p: .percent, r: .resets_at}
             | select((.name|type)=="string" and .name != "")
+            # floor, on purpose: used() truncates ${u%.*}, so 47.6 is 47 used / 53 left everywhere
             | (([ (.p|floor), 100 ] | min) | if . < 0 then 0 else . end) as $u
             | {name:.name, used_pct:$u, left_pct:(100-$u), resets_at:(.r // null)} ]
           | tojson) ]
