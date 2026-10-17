@@ -730,10 +730,12 @@ cat <<'J'
   {"label":"fable@example.com","email":"fable@example.com","alias":"fable","active":false,"data":"live",
    "weekly":{"remaining_pct":0,"used_pct":100,"resets_at":"2099-09-28T15:59:00+00:00","kind":"weekly_scoped","scope":"Fable"},
    "weekly_all":{"used_pct":60,"remaining_pct":40,"resets_at":"2099-10-01T09:00:00+00:00"},
+   "weekly_scoped":[{"name":"Fable","used_pct":100,"left_pct":0,"resets_at":"2099-09-28T15:59:00+00:00"}],
    "five_hour":{"remaining_pct":84}},
   {"label":"nosc@example.com","email":"nosc@example.com","alias":"nosc","active":false,"data":"live",
    "weekly":{"remaining_pct":0,"used_pct":100,"resets_at":"2099-09-29T09:00:00+00:00","kind":"weekly_all","scope":null},
    "weekly_all":{"used_pct":100,"remaining_pct":0,"resets_at":"2099-09-29T09:00:00+00:00"},
+   "weekly_scoped":[],
    "five_hour":{"remaining_pct":97}},
   {"label":"plain@example.com","email":"plain@example.com","alias":"plain","active":true,"data":"live",
    "weekly":{"remaining_pct":70,"resets_at":"2099-09-30T09:00:00+00:00"},
@@ -765,6 +767,12 @@ check "scoped weekly (json): weekly_all is passed through" \
   '[ "$(python3 -c "import json,sys;print([a[\"weekly_all\"][\"remaining_pct\"] for a in json.loads(sys.argv[1])[\"accounts\"] if a[\"account\"]==\"fable@example.com\"][0])" "$JOUT")" = 40 ]'
 check "no weekly_all (json): null, never invented" \
   '[ "$(jrow "$JOUT" plain@example.com weekly_all)" = None ]'
+check "weekly_scoped (json): the Fable entry is passed through whole" \
+  '[ "$(python3 -c "import json,sys;print(json.dumps([a[\"weekly_scoped\"] for a in json.loads(sys.argv[1])[\"accounts\"] if a[\"account\"]==\"fable@example.com\"][0],sort_keys=True))" "$JOUT")" = "[{\"left_pct\": 0, \"name\": \"Fable\", \"resets_at\": \"2099-09-28T15:59:00+00:00\", \"used_pct\": 100}]" ]'
+check "weekly_scoped (json): [] stays [] when the engine saw no scoped entry" \
+  '[ "$(jrow "$JOUT" nosc@example.com weekly_scoped)" = "[]" ]'
+check "weekly_scoped (json): absent from an older engine -> null, never invented" \
+  '[ "$(jrow "$JOUT" plain@example.com weekly_scoped)" = None ]'
 check "scoped weekly: the recommendation still ranks on the binding cap (fable is not USE NEXT)" \
   '! grep -A1 "USE NEXT" <<<"$OUT" | grep -q "rota switch fable"'
 unset CLAUDE_BILLING_JSON

@@ -2244,10 +2244,16 @@ usage_field() { printf '%s' "$1" | jq -r "$2 // empty" 2>/dev/null || true; }
 # max, which is right for the ranking, but a SCOPED binding at 100% (the Fable cap
 # spent) says nothing about the all-model allowance: the seat still runs Opus. Display
 # surfaces need that second number to say so instead of calling the seat spent.
-WB_PCT=""; WB_RESET=""; WB_KIND=""; WB_SCOPE=""; WB_ALL_RESET=""; WB_ALL_PCT=""
+#
+# WB_SCOPED (2026-10-17) is EVERY scoped weekly entry, not just the binding one, as a
+# compact JSON array of {name, used_pct, left_pct, resets_at}: "[]" when the response
+# has a usable `limits` array with none, "" when there is no response to read at all.
+# The binding keeps feeding the ranking; this is display-only, for a surface that
+# wants to show the Fable cap while another cap binds.
+WB_PCT=""; WB_RESET=""; WB_KIND=""; WB_SCOPE=""; WB_ALL_RESET=""; WB_ALL_PCT=""; WB_SCOPED=""
 weekly_binding() {  # weekly_binding <usage-json>
   local json="${1:-}" row
-  WB_PCT=""; WB_RESET=""; WB_KIND=""; WB_SCOPE=""; WB_ALL_RESET=""; WB_ALL_PCT=""
+  WB_PCT=""; WB_RESET=""; WB_KIND=""; WB_SCOPE=""; WB_ALL_RESET=""; WB_ALL_PCT=""; WB_SCOPED=""
   [[ -n "$json" ]] || return 0
   command -v jq >/dev/null 2>&1 || return 0
   # `try … catch null` guards a scope that is present but not the expected object shape
@@ -2266,10 +2272,18 @@ weekly_binding() {  # weekly_binding <usage-json>
            (((try $b.scope.model.display_name catch null)
              // (try $b.scope.name catch null)) // "") end),
         (($all.resets_at) // ""),
-        (if $all == null then "" else ($all.percent|tostring) end) ]
+        (if $all == null then "" else ($all.percent|tostring) end),
+        ( [ $w[] | select(.scope != null)
+            | { name: ((try .scope.model.display_name catch null)
+                       // (try .scope.name catch null)) } + {p: .percent, r: .resets_at}
+            | select((.name|type)=="string" and .name != "")
+            # floor, on purpose: used() truncates ${u%.*}, so 47.6 is 47 used / 53 left everywhere
+            | (([ (.p|floor), 100 ] | min) | if . < 0 then 0 else . end) as $u
+            | {name:.name, used_pct:$u, left_pct:(100-$u), resets_at:(.r // null)} ]
+          | tojson) ]
     | join("\u001f")' 2>/dev/null || true)"
   [[ -n "$row" ]] || return 0
-  IFS=$'\x1f' read -r WB_PCT WB_RESET WB_KIND WB_SCOPE WB_ALL_RESET WB_ALL_PCT <<<"$row"
+  IFS=$'\x1f' read -r WB_PCT WB_RESET WB_KIND WB_SCOPE WB_ALL_RESET WB_ALL_PCT WB_SCOPED <<<"$row"
 }
 
 # "  (binding: Opus)" for a SCOPED binding limit, "" otherwise, so a weekly number that
@@ -3043,7 +3057,7 @@ peer_fill() {
       U_WKR[i]="$p_wkr"; U_SER[i]="$p_ser"; U_SDR[i]="$p_wkr"
       # the peer publishes the binding NUMBER but not which limit produced it, so
       # the row carries no scope annotation rather than a borrowed or invented one
-      U_WKK[i]=""; U_WKS[i]=""; U_WAU[i]=""; U_WAR[i]=""
+      U_WKK[i]=""; U_WKS[i]=""; U_WAU[i]=""; U_WAR[i]=""; U_WSC[i]=""
       U_WKX[i]=0; U_SEX[i]=0
       window_expired "$p_wkr" && U_WKX[i]=1
       window_expired "$p_ser" && U_SEX[i]=1
@@ -3321,7 +3335,7 @@ COLLECTED=0
 COLLECTED_NET=0            # was the completed collection allowed to use the network?
 SHARED_TWIN_SLOT=-1        # slot whose credential bytes are identical to the shared one
 S_JSON=""; S_HTTP=""; S_WKU=""; S_WKR=""; S_SEU=""; S_SER=""
-S_WKK=""; S_WKS=""; S_SDR=""; S_WAU=""; S_WAR=""
+S_WKK=""; S_WKS=""; S_SDR=""; S_WAU=""; S_WAR=""; S_WSC=""
 collect_usage() {
   (( COLLECTED )) && return 0
   COLLECTED=1
@@ -3339,12 +3353,12 @@ collect_usage() {
   PEER_HOST=""; PEER_GENERATED=""
   U_EMAIL=(); U_STATE=(); U_WKU=(); U_WKR=(); U_SEU=(); U_SER=()
   U_WKX=(); U_SEX=(); U_WHY=(); U_TS=(); U_VIA=(); U_DUP=()
-  U_WKK=(); U_WKS=(); U_SDR=(); U_SRC=(); U_MEAS=(); U_WKP=(); U_WKPF=(); U_WAU=(); U_WAR=()
+  U_WKK=(); U_WKS=(); U_SDR=(); U_SRC=(); U_MEAS=(); U_WKP=(); U_WKPF=(); U_WAU=(); U_WAR=(); U_WSC=()
   for i in "${!DIRS[@]}"; do
     U_EMAIL[i]=""; U_STATE[i]="none"; U_WKU[i]=""; U_WKR[i]=""; U_SEU[i]=""; U_SER[i]=""
     U_WKX[i]=0; U_SEX[i]=0; U_WHY[i]=""; U_TS[i]=""; U_VIA[i]=""; U_DUP[i]=-1
     U_WKK[i]=""; U_WKS[i]=""; U_SDR[i]=""; U_AGE[i]=""; U_SRC[i]=""; U_MEAS[i]=""
-    U_WKP[i]=""; U_WKPF[i]=""; U_WAU[i]=""; U_WAR[i]=""
+    U_WKP[i]=""; U_WKPF[i]=""; U_WAU[i]=""; U_WAR[i]=""; U_WSC[i]=""
   done
 
   # the shared credential FIRST: it is both the identity fingerprint and the row
@@ -3367,6 +3381,7 @@ collect_usage() {
         [[ -n "$S_SDR" ]] || S_SDR="$WB_ALL_RESET"
       fi
       [[ -n "$WB_ALL_PCT" ]] && { S_WAU="$WB_ALL_PCT"; S_WAR="$WB_ALL_RESET"; }
+      S_WSC="$WB_SCOPED"
     fi
   fi
 
@@ -3521,6 +3536,7 @@ collect_usage() {
         [[ -n "${U_SDR[$i]}" ]] || U_SDR[i]="$WB_ALL_RESET"
       fi
       [[ -n "$WB_ALL_PCT" ]] && { U_WAU[i]="$WB_ALL_PCT"; U_WAR[i]="$WB_ALL_RESET"; }
+      U_WSC[i]="$WB_SCOPED"
       if [[ -z "${U_WKU[$i]}${U_SEU[$i]}" ]]; then
         # schema differs from expectation, surface the real keys (usage data is not secret)
         echo "  [$alabel] unexpected usage schema; top-level keys: $(printf '%s' "$json" | jq -r 'keys|join(",")' 2>/dev/null)" >&2
@@ -3600,7 +3616,7 @@ collect_usage() {
       U_WKU[i]="$C_WKU"; U_WKR[i]="$C_WKR"; U_SEU[i]="$C_SEU"; U_SER[i]="$C_SER"
       # the cache stores the binding NUMBER but not which limit produced it, so a cached
       # row carries no scope annotation rather than a stale or invented one
-      U_WKK[i]=""; U_WKS[i]=""; U_SDR[i]="$C_WKR"; U_WAU[i]=""; U_WAR[i]=""
+      U_WKK[i]=""; U_WKS[i]=""; U_SDR[i]="$C_WKR"; U_WAU[i]=""; U_WAR[i]=""; U_WSC[i]=""
       U_TS[i]="$C_TS$(cache_age "$C_TE")"
       U_AGE[i]="$C_TE"
       # ts_epoch is when the number was MEASURED, which is the only honest answer
@@ -3892,7 +3908,7 @@ adopt_shared_numbers() {
   # the binding limit's identity travels with its number, or the row would annotate the
   # shared credential's scoped figure with the slot's own (now discarded) provenance
   U_WKK[SHARED_SLOT]="$S_WKK"; U_WKS[SHARED_SLOT]="$S_WKS"; U_SDR[SHARED_SLOT]="$S_SDR"
-  U_WAU[SHARED_SLOT]="$S_WAU"; U_WAR[SHARED_SLOT]="$S_WAR"
+  U_WAU[SHARED_SLOT]="$S_WAU"; U_WAR[SHARED_SLOT]="$S_WAR"; U_WSC[SHARED_SLOT]="$S_WSC"
   U_WKX[SHARED_SLOT]=0; U_SEX[SHARED_SLOT]=0
   U_STATE[SHARED_SLOT]="live"
   # a LIVE local fetch outranks anything borrowed, so a peer row for this slot is
@@ -6087,6 +6103,14 @@ json_usage() {
     if [[ -n "$(remaining "${U_WAU[$i]:-}")" ]] && ! window_expired "${U_WAR[$i]:-}"; then
       wa="$(remaining "${U_WAU[$i]}")"; wa_used="$(used "${U_WAU[$i]}")"
     fi
+    # weekly_scoped (2026-10-17), ADDITIVE: every scoped weekly entry (the Fable cap
+    # and any sibling), whatever binds. null when this row has no live response
+    # (cached, peer, recorded), [] when the live response carried none.
+    wsc="null"
+    if [[ "${U_STATE[$i]}" == "live" && -n "${U_WSC[$i]:-}" ]] \
+       && jq -e 'type=="array"' <<<"${U_WSC[$i]}" >/dev/null 2>&1; then
+      wsc="${U_WSC[$i]}"
+    fi
     # ── the camelCase view, ADDITIVE (2026-08-06) ────────────────────────────
     # A phone renderer needs three things this object did not carry: whether the
     # account can be switched to at all (loggedIn, the same rule `status` prints,
@@ -6147,6 +6171,7 @@ json_usage() {
       --arg wk_scope "${U_WKS[$i]}" \
       --arg wa_reset "${U_WAR[$i]:-}" \
       --argjson wa "$wa" --argjson wa_used "$wa_used" \
+      --argjson wsc "$wsc" \
       --arg cached_at "${U_TS[$i]}" \
       --arg src "${U_SRC[$i]:-}" \
       --arg meas "${U_MEAS[$i]:-}" \
@@ -6179,6 +6204,7 @@ json_usage() {
         weekly_all:(if $wa == null then null else
                     {used_pct:$wa_used, remaining_pct:$wa,
                      resets_at:(if $wa_reset=="" then null else $wa_reset end)} end),
+        weekly_scoped:$wsc,
         five_hour:{remaining_pct:$se, used_pct:$se_used, resets_at:(if $se_reset=="" then null else $se_reset end), expired:($se_exp==1), fresh:$se_fresh},
         session:{leftPct:$se, usedPct:$se_used,
                  resetsAt:(if $se_reset=="" then null else $se_reset end),

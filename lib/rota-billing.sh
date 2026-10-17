@@ -361,6 +361,12 @@ for a in usage.get('accounts', []):
         'weekly_kind': w.get('kind'),
         'weekly_scope': w.get('scope'),
         'weekly_all': a.get('weekly_all'),
+        # ── EVERY SCOPED WEEKLY, NOT ONLY THE BINDING ONE (2026-10-17) ───────
+        # [{name, used_pct, left_pct, resets_at}] straight from the engine: the
+        # Fable cap and any sibling, even while another cap binds. [] means the live
+        # response had none; None means there was no live response (cached/peer
+        # rows, or an engine that predates the field): never invented.
+        'weekly_scoped': a.get('weekly_scoped'),
         # ── WHERE DID THIS NUMBER COME FROM, AND WHEN ────────────────────────
         # quota_data is live | cached | peer | none. quota_source names the peer
         # box when the engine had to read the seat's numbers over ssh (this box
