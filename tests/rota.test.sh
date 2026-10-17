@@ -108,11 +108,11 @@ chmod +x "$TMP/shimpath/claude"
 printf 'owner=airmond-runner\n' > "$TMP/home/.claude-pool/work/RESERVED"
 via_shim() { script -q /dev/null env PATH="$TMP/shimpath:$PATH" CLAUDE_SHIM_DIRS="$TMP/pathbin" "$@" < /dev/null 2>&1; }
 OUT="$(via_shim "$R" login work)"
-check "login on a reserved seat reaches the real claude, not exit 9" 'grep -q "stub-claude CLAUDE_CONFIG_DIR=$TMP/home/.claude-pool/work" <<<"$OUT" && ! grep -q REFUSED <<<"$OUT"'
+check "login on a reserved seat reaches the real claude, with no warning" 'grep -q "stub-claude CLAUDE_CONFIG_DIR=$TMP/home/.claude-pool/work" <<<"$OUT" && ! grep -q -e REFUSED -e "WARNING: .* RESERVED" <<<"$OUT"'
 check "login on a reserved seat says to /login and exit" 'grep -q "RESERVED: /login, then exit" <<<"$OUT"'
 check "the login bypass does not reach the real claude's env" 'grep -q "login=unset" <<<"$OUT"'
 OUT="$(via_shim env CLAUDE_CONFIG_DIR="$TMP/home/.claude-pool/work" claude)"
-check "a hand-pinned interactive session on the same reserved seat is still refused" 'grep -q REFUSED <<<"$OUT" && ! grep -q stub-claude <<<"$OUT"'
+check "a hand-pinned interactive session on the same reserved seat warns, then reaches the real claude" 'grep -q "WARNING: work is a RESERVED seat" <<<"$OUT" && grep -q stub-claude <<<"$OUT" && ! grep -q REFUSED <<<"$OUT"'
 OUT="$("$R" login work)"
 check "login starts in ~/code by default" 'grep -q "cwd=$(cd "$TMP/home/code" && pwd -P)\$" <<<"$OUT"'
 OUT="$(ROTA_LOGIN_CWD="$TMP/elsewhere" "$R" login work)"

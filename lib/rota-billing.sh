@@ -20,7 +20,7 @@
 # pushed to a server that runs against it around the clock, one handed to a
 # colleague. Quota cannot tell you that, so those seats are marked RESERVED and
 # held out of the ranking. A seat is reserved if it carries a RESERVED file in
-# its own config dir (the same file the shim reads when it refuses to open a
+# its own config dir (the same file the shim reads when it warns on opening a
 # session there) or is named in $CFG_DIR/reserved as `alias [owner] [why...]`.
 #
 # UNMEASURED IS NOT SPENT. A seat whose only number describes a weekly window
@@ -127,8 +127,8 @@ bill = billing.get('accounts', {})
 #
 # Two sources, UNIONED - never "markers else config":
 #   1. a RESERVED file inside the seat's own config dir, which is also what the
-#      shim reads when it refuses to open a session there, so the table and the
-#      thing that actually refuses cannot drift apart
+#      shim reads when it warns on opening a session there, so the table and the
+#      thing that actually warns cannot drift apart
 #   2. $CFG_DIR/reserved, one `alias [owner] [why...]` per line
 # The union matters: the first box to grow a marker file would otherwise
 # silently un-reserve every seat named only in the config.

@@ -465,6 +465,21 @@ resolve_pool_dir() {
 # every one of those paths runs through it, including the explicit-pin branch
 # below.
 #
+# 2026-10-17 DECISION: WARN, DO NOT BLOCK. Until then this guard REFUSED an
+# interactive session on a reserved seat (exit 9) unless CLAUDE_SEAT_OVERRIDE=1.
+# That cost more than it saved: a reserved seat that cannot be opened is a seat
+# nobody can use, even when its owner has room and the human knows exactly what
+# they are doing (the same day `rota login` was refused over ssh). Cedric, verbatim:
+# "In general, I would rather have a warning than just a reservation and not be
+# able to use it." So the shim now prints a loud WARNING to stderr and then runs
+# the real claude, exit code passed through. No prompt either: a prompt would hang
+# every non-interactive launcher (launchd, tmux send-keys, ssh -t scripts). The
+# reservation stays DATA and keeps its teeth everywhere AUTOMATIC: the ranking and
+# picker exclusion (seat_is_reserved in lib/rota-ranking.sh), the keeper's
+# warming, the usage nudge and the floor alarm all still skip or watch a reserved
+# seat. Only the hard block at launch is gone; a human who picks the seat by hand
+# is trusted, and told.
+#
 # The reservation is a marker file in the seat itself, so it is data rather
 # than a constant in one script's head:
 #
@@ -473,13 +488,13 @@ resolve_pool_dir() {
 #         why=this credential is pushed to the always-on runners
 RESERVED_MARKER_NAME="${CLAUDE_RESERVED_MARKER:-RESERVED}"
 
-# ONLY AN INTERACTIVE SESSION IS REFUSED. The seat has legitimate users on this
-# box and breaking them would be far worse than the bug: the pool keeper probes
+# ONLY AN INTERACTIVE SESSION IS WARNED ABOUT. The seat has legitimate users on this
+# box and the warning must never be noise on them: the pool keeper probes
 # with `claude -p`, and the login check and the failover run
 # `claude auth status`. Every one of those is a short read that spends nothing,
 # and a seat whose health can no longer be probed is a worse outage than the
 # one this prevents. What burned the quota was a long interactive session, and
-# that is the only shape this stops.
+# that is the only shape worth a warning.
 seat_invocation_is_a_session() {
   local a
   for a in "$@"; do
@@ -498,32 +513,32 @@ seat_invocation_is_a_session() {
   return 0
 }
 
-refuse_reserved_seat() {
+warn_reserved_seat() {
   local dir="$1" marker="$2" owner why
   owner="$(sed -n 's/^owner=//p' "$marker" 2>/dev/null | head -1)"
   why="$(sed -n 's/^why=//p' "$marker" 2>/dev/null | head -1)"
   {
-    printf '\n  REFUSED: %s is a RESERVED seat.\n\n' "$(basename "$dir")"
+    printf '\n  WARNING: %s is a RESERVED seat. Continuing anyway.\n\n' "$(basename "$dir")"
     printf '    owner: %s\n' "${owner:-unknown}"
     [ -n "$why" ] && printf '    why:   %s\n' "$why"
-    printf '\n  An interactive session here spends quota that seat needs. On 2026-08-21\n'
-    printf '  a pane burned a reserved seat to 0%% for a week and nothing said so.\n\n'
+    printf '\n  This session spends quota the owner may need. On 2026-08-21 a pane burned\n'
+    printf '  a reserved seat to 0%% for a week and nothing said so.\n\n'
     printf '  See what has room:   rota usage\n'
-    printf '  Or say you meant it: CLAUDE_SEAT_OVERRIDE=1 claude ...\n\n'
+    printf '  Silence this:        CLAUDE_SEAT_OVERRIDE=1 claude ...\n\n'
   } >&2
-  exit 9
+  return 0
 }
 
-# Checked for BOTH the explicit-pin and the shim-resolved path, because the
+# Warns (never blocks), checked for BOTH the explicit-pin and the shim-resolved path, because the
 # breach came in through the explicit pin.
 check_reserved_seat() {
   local dir="${1:-}" login="${CLAUDE_SEAT_LOGIN:-}"
   shift || true
   # `rota login <seat>` sets CLAUDE_SEAT_LOGIN=1 for its one exec so a reserved seat
   # can still be logged in (a login spends no quota; 2026-10-17 it was refused over
-  # ssh, exit 9). It is unset FIRST, before any early return, so it never leaks into
-  # a child `claude` that session spawns, which stays guarded. A hand-typed
-  # CLAUDE_CONFIG_DIR=... claude has no such variable and is still refused.
+  # ssh, exit 9, back when the guard blocked). It is unset FIRST, before any early
+  # return, so it never leaks into a child `claude` that session spawns, which stays guarded. A hand-typed
+  # CLAUDE_CONFIG_DIR=... claude has no such variable and still gets the warning.
   unset CLAUDE_SEAT_LOGIN
   [ -n "$dir" ] || return 0
   [ -n "${CLAUDE_SEAT_OVERRIDE:-}" ] && return 0
@@ -531,15 +546,15 @@ check_reserved_seat() {
   local marker="$dir/$RESERVED_MARKER_NAME"
   [ -f "$marker" ] || return 0
   seat_invocation_is_a_session "$@" || return 0
-  refuse_reserved_seat "$dir" "$marker"
+  warn_reserved_seat "$dir" "$marker"
 }
 
 [ -n "${CLAUDE_SHIM_DISABLE:-}" ]   && exec_real "$@"
 [ -n "${CLAUDE_SHIM_RESOLVING:-}" ] && exec_real "$@"
 # The reserved check goes BEFORE the explicit-pin passthrough. A hand-typed
 # `CLAUDE_CONFIG_DIR=~/.claude-pool/runner claude` is precisely how the seat was
-# taken, so "an explicit pin always wins" must not mean it wins against the
-# reservation too.
+# taken, so "an explicit pin always wins" must not mean it skips the
+# warning too.
 if [ -n "${CLAUDE_CONFIG_DIR+set}" ]; then
   check_reserved_seat "$CLAUDE_CONFIG_DIR" "$@"
   exec_real "$@"

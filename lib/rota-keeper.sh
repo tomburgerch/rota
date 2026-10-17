@@ -1114,8 +1114,8 @@ check_reserved_seats() {
   #
   # A PANE BURNED A RESERVED SEAT TO 0% ON 2026-08-21 AND NOTHING ANNOUNCED IT.
   # It was found days later, from a `rota billing` run for an unrelated reason.
-  # The shim now refuses interactive sessions on a reserved seat
-  # (lib/rota-shim.sh), but a guard only covers the ways it knows about, this is
+  # The shim warns on interactive sessions on a reserved seat
+  # (lib/rota-shim.sh, no longer blocks since 2026-10-17), and a guard only covers the ways it knows about, this is
   # the backstop that notices the quota going regardless of HOW.
   #
   # State-change only, via notify_once/log_once: a reserved seat sitting under

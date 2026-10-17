@@ -106,9 +106,9 @@ cmd_login() {
   printf 'rota: you are logging in seat %s (%s); run /login inside this session.\n' "$seat" "$dir"
   # A reserved seat still has to be loggable-in: a login spends no quota, and a dead
   # chain on a reserved seat is exactly when the owner needs it. 2026-10-17: over
-  # `ssh -t ballito 'rota login gmail'` the shim REFUSED (exit 9), because this exec
+  # `ssh -t ballito 'rota login gmail'` the shim REFUSED (exit 9, back when it blocked), because this exec
   # is an interactive `claude` on a seat carrying a RESERVED marker. The dedicated
-  # CLAUDE_SEAT_LOGIN=1 (honoured by the shim for this one exec, then stripped) is
+  # CLAUDE_SEAT_LOGIN=1 (honoured by the shim for this one exec, then stripped, so no warning) is
   # used instead of CLAUDE_SEAT_OVERRIDE=1 because the override also means "an
   # explicit pick, work here" to pane-converge, Dazzle and `cl`; a login is not that.
   if [ -f "$dir/${CLAUDE_RESERVED_MARKER:-RESERVED}" ]; then

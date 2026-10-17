@@ -10,7 +10,7 @@
 # ── WHAT THIS GUARDS ───────────────────────────────────────────────────────
 #
 # A reserved seat went to 0% on 2026-08-21 and was found DAYS LATER, by
-# accident. The shim now refuses interactive sessions on a reserved seat, but a
+# accident. The shim warns on interactive sessions on a reserved seat (it no longer blocks), and a
 # guard only covers the ways it knows about, this alarm is the backstop that
 # notices the quota going regardless of how.
 #

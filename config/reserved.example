@@ -19,8 +19,8 @@
 # Blank lines and anything after a # are ignored.
 #
 # A seat is ALSO reserved if it carries a RESERVED file in its own config dir
-# (see `rota reserve`, and the shim which reads the same file when it refuses to
-# open a session there). The two sources are UNIONED, never "markers else this
+# (see `rota reserve`, and the shim which reads the same file when it warns on
+# opening a session there). The two sources are UNIONED, never "markers else this
 # file" - otherwise the first box to grow a marker would silently un-reserve
 # every seat named only here.
 #
