@@ -16,12 +16,16 @@
 # and spent a reserved seat's whole weekly quota. The rule existed in prose and
 # as one script's hardcoded list of aliases, and nothing enforced it.
 #
-# BUT THE DANGEROUS FAILURE OF THIS GUARD IS THE OTHER DIRECTION. Refusing too
-# much would break the seat's LEGITIMATE users, the pool keeper's `claude -p`
-# probe, the login check and the failover's `claude auth status`, and a seat
-# whose health can no longer be probed is a worse outage than the one this
-# prevents. So there are more assertions below about what must STILL RUN than
-# about what must be refused, and each of them names the caller it protects.
+# 2026-10-17: the guard WARNS, it no longer blocks ("I would rather have a
+# warning than just a reservation and not be able to use it"). An interactive
+# session on a reserved seat prints the warning to stderr and then reaches the
+# real claude, whose exit code passes through. No exit 9, no prompt.
+#
+# THE OTHER DIRECTION STILL MATTERS: a warning on the seat's LEGITIMATE users
+# (the pool keeper's `claude -p` probe, the login check, the failover's
+# `claude auth status`) is noise in logs that nobody reads. So there are more
+# assertions below about what must stay SILENT than about what must warn, and
+# each of them names the caller it protects.
 set -uo pipefail
 
 PASS=0
@@ -43,10 +47,12 @@ mkdir -p "$POOL/runner" "$POOL/spare" "$WORK/bin"
 printf 'owner=always-on-runner\nwhy=this credential is pushed to the always-on runners\n' \
   > "$POOL/runner/RESERVED"
 
-# The FAKE real-claude. If this ever prints, the shim let the call through.
+# The FAKE real-claude. RAN proves the shim reached it; the exit code is
+# FAKE_CLAUDE_RC (default 0) so passthrough can be asserted.
 cat > "$WORK/bin/claude" <<'STUB'
 #!/usr/bin/env bash
 echo "RAN"
+exit "${FAKE_CLAUDE_RC:-0}"
 STUB
 chmod +x "$WORK/bin/claude"
 
@@ -62,7 +68,7 @@ run_tty() {
   local seat="$1"; shift
   script -q /dev/null env \
     CLAUDE_SHIM_DIRS="$WORK/bin" CLAUDE_CONFIG_DIR="$POOL/$seat" \
-    CLAUDE_SEAT_OVERRIDE="${CLAUDE_SEAT_OVERRIDE:-}" \
+    CLAUDE_SEAT_OVERRIDE="${CLAUDE_SEAT_OVERRIDE:-}" FAKE_CLAUDE_RC="${FAKE_CLAUDE_RC:-0}" \
     bash "$SHIM" "$@" < /dev/null 2>&1
 }
 # …and WITHOUT one, which is what a launchd job or a piped probe has.
@@ -72,6 +78,7 @@ run_notty() {
     bash "$SHIM" "$@" < /dev/null 2>&1
 }
 ran()     { printf '%s' "$1" | grep -q 'RAN'; }
+warned()  { printf '%s' "$1" | grep -q 'WARNING: .* is a RESERVED seat'; }
 refused() { printf '%s' "$1" | grep -q 'REFUSED'; }
 
 # ── PREFLIGHT: the harness really does hand the child a tty ────────────────
@@ -83,18 +90,32 @@ printf '%s' "$TTYCHK" | grep -q 'HASTTY' \
   && ok "(harness preflight: run_tty really gives the child a tty)" \
   || bad "harness cannot allocate a tty, every refusal assertion below is meaningless: $TTYCHK"
 
-# ── IT REFUSES THE THING THAT BURNED THE SEAT ──────────────────────────────
+# ── IT WARNS ON THE THING THAT BURNED THE SEAT, THEN RUNS ──────────────────
 OUT="$(run_tty runner)"
-refused "$OUT" && ok "an interactive session on a reserved seat is refused" \
-  || bad "must refuse an interactive session on a reserved seat: $OUT"
-ran "$OUT" && bad "it refused but ALSO ran claude anyway: $OUT" \
-  || ok "…and the real claude never runs"
+warned "$OUT" && ok "an interactive session on a reserved seat prints the WARNING" \
+  || bad "must warn on an interactive session on a reserved seat: $OUT"
+ran "$OUT" && ok "…and the real claude STILL runs (a warning, not a block)" \
+  || bad "the warning must not stop claude: $OUT"
+refused "$OUT" && bad "it still says REFUSED: $OUT" || ok "…and nothing says REFUSED any more"
 printf '%s' "$OUT" | grep -q 'always-on-runner' \
-  && ok "…and the refusal names the OWNER, so it is actionable" \
-  || bad "the refusal must name the owner: $OUT"
+  && ok "…and the warning names the OWNER, so it is actionable" \
+  || bad "the warning must name the owner: $OUT"
+printf '%s' "$OUT" | grep -q 'pushed to the always-on runners' \
+  && ok "…and the WHY" || bad "the warning must carry the why: $OUT"
+printf '%s' "$OUT" | grep -q 'rota usage' \
+  && ok "…and points at rota usage for alternatives" \
+  || bad "the warning must name rota usage: $OUT"
 printf '%s' "$OUT" | grep -q 'CLAUDE_SEAT_OVERRIDE' \
-  && ok "…and names the one way past it" \
-  || bad "the refusal must name the override: $OUT"
+  && ok "…and names the way to silence it" \
+  || bad "the warning must name the override: $OUT"
+# The warning goes to STDERR so it never pollutes claude's stdout.
+ERRONLY="$(script -q /dev/null env CLAUDE_SHIM_DIRS="$WORK/bin" CLAUDE_CONFIG_DIR="$POOL/runner" \
+  bash -c "bash '$SHIM' 2>/dev/null" < /dev/null 2>&1)"
+warned "$ERRONLY" && bad "the warning leaked to stdout: $ERRONLY" || ok "…and it is written to stderr only"
+RC="$(script -q /dev/null env CLAUDE_SHIM_DIRS="$WORK/bin" CLAUDE_CONFIG_DIR="$POOL/runner" FAKE_CLAUDE_RC=7 \
+  bash -c "bash '$SHIM' >/dev/null 2>&1; echo rc=\$?" < /dev/null 2>&1 | tr -d '\r' | sed -n 's/.*rc=//p')"
+[ "$RC" = "7" ] && ok "…and claude's exit code passes through (7 stays 7, never 9)" \
+  || bad "exit code must pass through, got: $RC"
 
 # THE EXPLICIT PIN IS THE PATH THE BREACH CAME IN THROUGH. The shim's own rule
 # is "an explicit CLAUDE_CONFIG_DIR always wins, change nothing", so the guard
@@ -104,12 +125,12 @@ ok "(the cases above all take the explicit-pin path, which is how it happened)"
 
 # ── AND IT MUST NOT BREAK THE SEAT'S REAL USERS ────────────────────────────
 OUT="$(run_tty runner -p 'ping')"
-ran "$OUT" && ok "headless --print still runs (the pool keeper's health probe)" \
-  || bad "MUST NOT break the keeper's \`claude -p\` probe: $OUT"
+ran "$OUT" && ! warned "$OUT" && ok "headless --print runs with NO warning (the pool keeper's health probe)" \
+  || bad "MUST NOT break or nag the keeper's claude -p probe: $OUT"
 
 OUT="$(run_tty runner auth status)"
-ran "$OUT" && ok "auth status still runs (the login check, the failover)" \
-  || bad "MUST NOT break \`claude auth status\`: $OUT"
+ran "$OUT" && ! warned "$OUT" && ok "auth status runs with NO warning (the login check, the failover)" \
+  || bad "MUST NOT break or nag claude auth status: $OUT"
 
 OUT="$(run_tty runner mcp list)"
 ran "$OUT" && ok "mcp subcommands still run" || bad "must not break mcp: $OUT"
@@ -118,20 +139,20 @@ OUT="$(run_tty runner --version)"
 ran "$OUT" && ok "--version still runs" || bad "must not break --version: $OUT"
 
 OUT="$(run_notty runner)"
-ran "$OUT" && ok "no TTY still runs, nothing is going to sit there spending quota" \
-  || bad "must not refuse a non-interactive invocation: $OUT"
+ran "$OUT" && ! warned "$OUT" && ok "no TTY runs with NO warning, nothing is going to sit there spending quota" \
+  || bad "must not warn on a non-interactive invocation: $OUT"
 
 OUT="$(CLAUDE_SEAT_OVERRIDE=1 run_tty runner)"
-ran "$OUT" && ok "CLAUDE_SEAT_OVERRIDE=1 lets a deliberate session through" \
-  || bad "the override must work: $OUT"
+ran "$OUT" && ! warned "$OUT" && ok "CLAUDE_SEAT_OVERRIDE=1 runs a deliberate session with NO warning" \
+  || bad "the override must silence the warning: $OUT"
 
 # `rota login <seat>` sets CLAUDE_SEAT_LOGIN=1 for its one exec, so a reserved seat can
 # still be logged in (a login spends no quota). Only that variable; the hand-typed pin
-# above stays refused, and the variable is stripped before the real claude starts.
+# above still warns, and the variable is stripped before the real claude starts.
 OUT="$(CLAUDE_SEAT_LOGIN=1 script -q /dev/null env CLAUDE_SHIM_DIRS="$WORK/bin" CLAUDE_CONFIG_DIR="$POOL/runner" \
   bash "$SHIM" < /dev/null 2>&1)"
-ran "$OUT" && ok "CLAUDE_SEAT_LOGIN=1 lets \`rota login\` through on a reserved seat" \
-  || bad "the login bypass must work: $OUT"
+ran "$OUT" && ! warned "$OUT" && ok "CLAUDE_SEAT_LOGIN=1 runs rota login on a reserved seat with NO warning" \
+  || bad "the login bypass must work silently: $OUT"
 cat > "$WORK/bin/claude" <<'STUB'
 #!/usr/bin/env bash
 echo "RAN login=${CLAUDE_SEAT_LOGIN:-unset}"
@@ -146,20 +167,20 @@ printf '#!/usr/bin/env bash\necho "RAN"\n' > "$WORK/bin/claude"
 OUT="$(run_tty spare)"
 ran "$OUT" && ok "an unreserved seat is completely unaffected" \
   || bad "must not touch an unreserved seat: $OUT"
-refused "$OUT" && bad "refused an unreserved seat: $OUT" || ok "…and is never refused"
+warned "$OUT" && bad "warned on an unreserved seat: $OUT" || ok "…and is never warned about"
 
 # AN UNRECOGNISED FIRST ARG MUST COUNT AS A SESSION. If a new interactive mode
 # ships, the guard should cover it by default rather than exempt it silently,
 # the failure mode of this whole task was a rule that existed and did not apply.
 OUT="$(run_tty runner --some-future-interactive-flag)"
-refused "$OUT" && ok "an unrecognised invocation is treated as a session, not exempted" \
+warned "$OUT" && ran "$OUT" && ok "an unrecognised invocation is treated as a session (warned, then run), not exempted" \
   || bad "an unknown arg must default to guarded: $OUT"
 
 # ── THE MARKER IS WHAT DECIDES, so removing it releases the seat ───────────
 rm -f "$POOL/runner/RESERVED"
 OUT="$(run_tty runner)"
-ran "$OUT" && ok "releasing the marker releases the seat" \
-  || bad "with no marker the seat must be free: $OUT"
+ran "$OUT" && ! warned "$OUT" && ok "releasing the marker silences the warning" \
+  || bad "with no marker the seat must be free and quiet: $OUT"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

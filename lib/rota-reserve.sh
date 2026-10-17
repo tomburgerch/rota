@@ -13,11 +13,11 @@
 # enforced it, because a constant in one script is invisible to every other
 # launch path. The seat directory itself is the one thing every path touches, so
 # the reservation lives there: lib/rota-shim.sh reads it on every `claude`
-# launch and refuses an interactive session, and lib/rota-keeper.sh reads it
+# launch and warns on an interactive session, and lib/rota-keeper.sh reads it
 # each tick and alarms once when the seat drops under its floor.
 #
 # What a reservation does NOT do: headless `--print`, the `auth`/`mcp`/`config`
-# subcommands and the keeper's own health probes all still run. Refusing those
+# subcommands and the keeper's own health probes all still run. Blocking those
 # would break the seat's legitimate users, and a seat whose health cannot be
 # probed is a worse outage than the one this prevents.
 set -euo pipefail
@@ -59,5 +59,5 @@ seat="$1"; owner="${2:-}"; why="${3:-}"
 } > "$POOL_ROOT/$seat/$MARKER"
 
 printf 'reserved %s for %s\n' "$seat" "$owner"
-printf '  an interactive `claude` on this seat now refuses (CLAUDE_SEAT_OVERRIDE=1 to force)\n'
+printf '  an interactive `claude` on this seat now WARNS (CLAUDE_SEAT_OVERRIDE=1 silences it)\n'
 printf '  headless --print, auth/mcp subcommands and the pool keeper probes are unaffected\n'
