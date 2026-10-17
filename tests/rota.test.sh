@@ -17,7 +17,7 @@ for s in rota-engine.sh rota-keeper.sh rota-cred-guard.sh rota-billing.sh; do
   printf '#!/usr/bin/env bash\necho "%s: $*"\n' "$s" > "$FAKE/lib/$s"; chmod +x "$FAKE/lib/$s"
 done
 # Stub claude: prints the config dir it was launched with.
-printf '#!/usr/bin/env bash\necho "stub-claude CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR:-unset}"\n' > "$TMP/pathbin/claude"
+printf '#!/usr/bin/env bash\necho "stub-claude CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR:-unset} login=${CLAUDE_SEAT_LOGIN:-unset} cwd=$(pwd -P)"\n' > "$TMP/pathbin/claude"
 chmod +x "$TMP/pathbin/claude"
 
 export PATH="$TMP/pathbin:$PATH"
@@ -97,6 +97,29 @@ check "login by alias: execs claude with CLAUDE_CONFIG_DIR=<dir>, ~ expanded" \
 OUT="$("$R" login work@example.com)"
 check "login by label works too" 'grep -q "stub-claude CLAUDE_CONFIG_DIR=$TMP/home/.claude-pool/work" <<<"$OUT"'
 check "login banner says to run /login" 'grep -q "/login" <<<"$OUT"'
+
+# --- login on a RESERVED seat (2026-10-17: `ssh -t ballito rota login gmail` exited 9) ---
+# Drive the REAL shim: a wrapper named `claude` on PATH runs lib/rota-shim.sh, which finds
+# the stub above through CLAUDE_SHIM_DIRS. `script` gives it the tty an ssh -t login has.
+printf 'work@example.com|~/.claude-pool/work\n' > "$TMP/cfg/accounts"
+mkdir -p "$TMP/shimpath" "$TMP/home/code" "$TMP/elsewhere"
+printf '#!/usr/bin/env bash\nexec bash "%s" "$@"\n' "$ROOT/lib/rota-shim.sh" > "$TMP/shimpath/claude"
+chmod +x "$TMP/shimpath/claude"
+printf 'owner=airmond-runner\n' > "$TMP/home/.claude-pool/work/RESERVED"
+via_shim() { script -q /dev/null env PATH="$TMP/shimpath:$PATH" CLAUDE_SHIM_DIRS="$TMP/pathbin" "$@" < /dev/null 2>&1; }
+OUT="$(via_shim "$R" login work)"
+check "login on a reserved seat reaches the real claude, not exit 9" 'grep -q "stub-claude CLAUDE_CONFIG_DIR=$TMP/home/.claude-pool/work" <<<"$OUT" && ! grep -q REFUSED <<<"$OUT"'
+check "login on a reserved seat says to /login and exit" 'grep -q "RESERVED: /login, then exit" <<<"$OUT"'
+check "the login bypass does not reach the real claude's env" 'grep -q "login=unset" <<<"$OUT"'
+OUT="$(via_shim env CLAUDE_CONFIG_DIR="$TMP/home/.claude-pool/work" claude)"
+check "a hand-pinned interactive session on the same reserved seat is still refused" 'grep -q REFUSED <<<"$OUT" && ! grep -q stub-claude <<<"$OUT"'
+OUT="$("$R" login work)"
+check "login starts in ~/code by default" 'grep -q "cwd=$(cd "$TMP/home/code" && pwd -P)\$" <<<"$OUT"'
+OUT="$(ROTA_LOGIN_CWD="$TMP/elsewhere" "$R" login work)"
+check "ROTA_LOGIN_CWD overrides the login cwd" 'grep -q "cwd=$(cd "$TMP/elsewhere" && pwd -P)\$" <<<"$OUT"'
+OUT="$(ROTA_LOGIN_CWD="$TMP/nope" "$R" login work)"
+check "a missing login cwd falls back to the current dir" 'grep -q "cwd=$(pwd -P)\$" <<<"$OUT"'
+rm "$TMP/home/.claude-pool/work/RESERVED"
 
 # seat dir missing -> pool-init is called first; the stub engine does not create it, so exit 2
 printf 'personal@example.com|~/.claude-pool/personal\n' >> "$TMP/cfg/accounts"

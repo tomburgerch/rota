@@ -125,6 +125,23 @@ OUT="$(CLAUDE_SEAT_OVERRIDE=1 run_tty runner)"
 ran "$OUT" && ok "CLAUDE_SEAT_OVERRIDE=1 lets a deliberate session through" \
   || bad "the override must work: $OUT"
 
+# `rota login <seat>` sets CLAUDE_SEAT_LOGIN=1 for its one exec, so a reserved seat can
+# still be logged in (a login spends no quota). Only that variable; the hand-typed pin
+# above stays refused, and the variable is stripped before the real claude starts.
+OUT="$(CLAUDE_SEAT_LOGIN=1 script -q /dev/null env CLAUDE_SHIM_DIRS="$WORK/bin" CLAUDE_CONFIG_DIR="$POOL/runner" \
+  bash "$SHIM" < /dev/null 2>&1)"
+ran "$OUT" && ok "CLAUDE_SEAT_LOGIN=1 lets \`rota login\` through on a reserved seat" \
+  || bad "the login bypass must work: $OUT"
+cat > "$WORK/bin/claude" <<'STUB'
+#!/usr/bin/env bash
+echo "RAN login=${CLAUDE_SEAT_LOGIN:-unset}"
+STUB
+OUT="$(CLAUDE_SEAT_LOGIN=1 run_tty runner)"
+printf '%s' "$OUT" | grep -q 'login=unset' \
+  && ok "…and the bypass is stripped before the real claude runs" \
+  || bad "CLAUDE_SEAT_LOGIN must not leak to the real claude: $OUT"
+printf '#!/usr/bin/env bash\necho "RAN"\n' > "$WORK/bin/claude"
+
 # ── AN UNRESERVED SEAT IS UNTOUCHED ────────────────────────────────────────
 OUT="$(run_tty spare)"
 ran "$OUT" && ok "an unreserved seat is completely unaffected" \
