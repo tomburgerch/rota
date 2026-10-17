@@ -51,6 +51,8 @@ credential that exists twice kills itself.
 
 - `rota login <seat>` opens Claude pinned to that seat's directory; type
   `/login` there. One login per seat per machine, once.
+  It also works on a RESERVED seat (the shim lets this one exec through);
+  /login, then exit, and start no work there. It starts in `~/code`.
 - If you typed `/login` in an ordinary pane by mistake, stop. The keeper homes
   the displaced login into the right directory on its first tick after that
   pane exits (it never moves a credential a live process holds). A second

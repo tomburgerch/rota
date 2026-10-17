@@ -521,6 +521,15 @@ check_reserved_seat() {
   shift || true
   [ -n "$dir" ] || return 0
   [ -n "${CLAUDE_SEAT_OVERRIDE:-}" ] && return 0
+  # `rota login <seat>` sets CLAUDE_SEAT_LOGIN=1 for its one exec so a reserved seat
+  # can still be logged in (a login spends no quota; 2026-10-17 it was refused over
+  # ssh, exit 9). It is unset here, before the real claude starts, so it never
+  # leaks into a child `claude` that session spawns, which stays guarded. A
+  # hand-typed CLAUDE_CONFIG_DIR=... claude has no such variable and is still refused.
+  if [ -n "${CLAUDE_SEAT_LOGIN:-}" ]; then
+    unset CLAUDE_SEAT_LOGIN
+    return 0
+  fi
   local marker="$dir/$RESERVED_MARKER_NAME"
   [ -f "$marker" ] || return 0
   seat_invocation_is_a_session "$@" || return 0

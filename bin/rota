@@ -104,7 +104,21 @@ cmd_login() {
     [ -d "$dir" ] || die "seat '$seat' resolves to $dir, which still does not exist after pool-init" 2
   fi
   printf 'rota: you are logging in seat %s (%s); run /login inside this session.\n' "$seat" "$dir"
-  exec env CLAUDE_CONFIG_DIR="$dir" claude
+  # A reserved seat still has to be loggable-in: a login spends no quota, and a dead
+  # chain on a reserved seat is exactly when the owner needs it. 2026-10-17: over
+  # `ssh -t ballito 'rota login gmail'` the shim REFUSED (exit 9), because this exec
+  # is an interactive `claude` on a seat carrying a RESERVED marker. The dedicated
+  # CLAUDE_SEAT_LOGIN=1 (honoured by the shim for this one exec, then stripped) is
+  # used instead of CLAUDE_SEAT_OVERRIDE=1 because the override also means "an
+  # explicit pick, work here" to pane-converge, Dazzle and `cl`; a login is not that.
+  if [ -f "$dir/${CLAUDE_RESERVED_MARKER:-RESERVED}" ]; then
+    printf 'rota: seat %s is RESERVED: /login, then exit. Do not start work in this session.\n' "$seat"
+  fi
+  # Start in ~/code, not $HOME: over ssh the cwd is $HOME, and Claude Code then asks
+  # to trust the whole home folder (2026-10-17). ROTA_LOGIN_CWD overrides it.
+  local wd="${ROTA_LOGIN_CWD:-$HOME/code}"
+  [ -d "$wd" ] && cd "$wd"
+  exec env CLAUDE_CONFIG_DIR="$dir" CLAUDE_SEAT_LOGIN=1 claude
 }
 
 cmd_keeper_status() {
