@@ -5574,6 +5574,13 @@ pane_target_is_session_id() {  # pane_target_is_session_id <target>
   [[ "${1:-}" =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ ]]
 }
 
+# `command claude`, never a bare `claude` (2026-10-18): the line is typed into
+# the pane's INTERACTIVE shell, and on durban/ballito `claude` there is a shell
+# FUNCTION (zshrc, routes to claude-resume-picker) that rejects --name
+# ("unknown option") and left pane %19 at a bare shell. `command` skips
+# functions and aliases and reaches the PATH binary (the pinning shim). rota
+# does not depend on `cl` anywhere else, and `cl --pane` would pull in a second
+# launcher with its own seat logic, so the minimal bypass matches rota's style.
 # The exact line a restarted pane is asked to type. ONE builder, shared by the
 # senders and every would-restart/restarted report line, so what is printed is
 # by construction what is sent. The target is what pane_resume_target
@@ -5587,10 +5594,10 @@ pane_resume_line() {  # pane_resume_line <resume-target> [<pane-name>]
   local name_flag=""
   [[ -z "$rename" ]] || name_flag=" --name $(dq_arg "$rename")"
   if [[ "$PANE_PIN_STATE" == "pin" ]]; then
-    printf 'CLAUDE_CONFIG_DIR=%s claude --resume %s%s' \
+    printf 'CLAUDE_CONFIG_DIR=%s command claude --resume %s%s' \
       "$(dq_arg "$PANE_PIN_DIR")" "$(dq_arg "${1:-}")" "$name_flag"
   else
-    printf 'claude --resume %s' "$(dq_arg "${1:-}")"
+    printf 'command claude --resume %s' "$(dq_arg "${1:-}")"
   fi
 }
 
@@ -5633,6 +5640,32 @@ pane_pin_refuse_reason() {
   fi
 }
 
+# Is the seat a restart would land on (the active claim's pool dir) unable to
+# serve? Same test and same threshold as pane_seat_cannot_serve (ended, dead
+# credential, weekly or 5h used at/over AUTO_SWITCH_PCT, i.e. at most 10% left
+# by default), so "walled" means one thing for leaving a seat and for landing
+# on one. 2026-10-18: pane %19 was restarted onto tommy with 0% of its 5h left.
+# Returns 0 = walled (PANE_TARGET_WHY says why), 1 = fine or unmeasured.
+PANE_TARGET_WHY=""
+pane_target_walled() {  # pane_target_walled [<landing-email>]
+  PANE_TARGET_WHY=""
+  pane_pin_resolve
+  [[ "$PANE_PIN_STATE" == "pin" && -n "$PANE_PIN_DIR" ]] || return 1
+  # a dry run before the move names the seat the switch WILL land on; the
+  # claim in ~/.claude.json is still the one being left then
+  local id dir="$PANE_PIN_DIR" slot; id="${1:-}"
+  if [[ -n "$id" ]]; then
+    slot="$(slot_for_email "$id")"
+    [[ "$slot" != "-1" ]] && dir="${DIRS[$slot]}"
+  else
+    id="$(json_email "$HOME/.claude.json")"
+  fi
+  [[ -n "$id" ]] || return 1
+  pane_seat_cannot_serve "$dir" "$id" || return 1
+  PANE_TARGET_WHY="target seat $id: $PANE_SEAT_WHY"
+  return 0
+}
+
 # The one restart sequence, shared by restart_idle_panes and pane-converge so
 # the mechanism can never fork: /quit, wait for the shell (bounded, a pane
 # that never lets go is LEFT ALONE, never force-killed), then resume the
@@ -5654,6 +5687,7 @@ pane_restart_one() {  # pane_restart_one <pane-id> <resume-target> [<pane-name>]
   pane_target_is_session_id "$target" || return 8
   pane_pin_resolve
   [[ "$PANE_PIN_STATE" == "refuse" ]] && return 4
+  pane_target_walled && return 9
   local arc=0
   case "$(pane_screen_kind "$pid")" in
     draft) return 5 ;;
@@ -5759,6 +5793,8 @@ restart_idle_panes() {  # restart_idle_panes <dry-run 0|1> [<explicit 0|1>] [<cl
       pane_pin_resolve
       if [[ "$PANE_PIN_STATE" == "refuse" ]]; then
         printf '         %-5s %s\n' "$pid" "would skip, $(pane_pin_refuse_reason)"
+      elif pane_target_walled "$claim"; then
+        printf '         %-5s %s\n' "$pid" "would skip, $PANE_TARGET_WHY; left running"
       else
         printf '         %-5s %s\n' "$pid" "would restart → $(pane_resume_line "$target" "$name")"
       fi
@@ -5772,6 +5808,7 @@ restart_idle_panes() {  # restart_idle_panes <dry-run 0|1> [<explicit 0|1>] [<cl
       2) printf '         %-5s %s\n' "$pid" "skipped, still running claude after /quit; left alone" ;;
       8) printf '         %-5s %s\n' "$pid" "skipped, no session id for \"$name\": left running (resume would open a picker)" ;;
       4) printf '         %-5s %s\n' "$pid" "skipped, $(pane_pin_refuse_reason)" ;;
+      9) pane_target_walled || true; printf '         %-5s %s\n' "$pid" "skipped, $PANE_TARGET_WHY; left running" ;;
       5) printf '         %-5s %s\n' "$pid" "needs you: unsent feedback draft, send or discard it, then it moves" ;;
       6) printf '         %-5s %s\n' "$pid" "skipped, pane is showing a question or picker; left alone" ;;
       7) printf '         %-5s %s\n' "$pid" "skipped, background work running; moves when it finishes" ;;
@@ -6018,6 +6055,9 @@ cmd_pane_converge() {  # cmd_pane_converge [--dry-run]
       if [[ "$PANE_PIN_STATE" == "refuse" ]]; then
         printf '%s on %s → would NOT restart, %s\n' "$pid" "$id" "$(pane_pin_refuse_reason)"
         busy=$((busy + 1))
+      elif pane_target_walled; then
+        printf '%s on %s → would NOT restart, %s; left running\n' "$pid" "$id" "$PANE_TARGET_WHY"
+        busy=$((busy + 1))
       else
         printf '%s on %s → would restart (%s)\n' "$pid" "$id" "$(pane_resume_line "$target" "$name")"
         restarted=$((restarted + 1))
@@ -6040,6 +6080,11 @@ cmd_pane_converge() {  # cmd_pane_converge [--dry-run]
       busy=$((busy + 1))
     elif (( rrc == 8 )); then
       printf '%s still on %s, no session id for "%s": left running (resume would open a picker)\n' "$pid" "$id" "$name"
+      busy=$((busy + 1))
+    elif (( rrc == 9 )); then
+      # target seat walled (2026-10-18): a stale pane beats one stranded on a wall
+      pane_target_walled || true
+      printf '%s still on %s, %s; left running, will retry next tick\n' "$pid" "$id" "$PANE_TARGET_WHY"
       busy=$((busy + 1))
     elif (( rrc == 4 )); then
       # husk refusal (2026-08-16): a stale pane beats a guaranteed-dead one

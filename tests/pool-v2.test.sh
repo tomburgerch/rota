@@ -1952,7 +1952,7 @@ grep -q "pane-converge: %2 busy on $(email_of team)" "$RUN/cfg/keeper.log" \
   && ok "converge → the mid-work divergent pane is logged as busy, not touched" \
   || bad "converge → busy logged (log: $(tail -5 "$RUN/cfg/keeper.log"))"
 grep -q 'send-keys -t %1 /quit Enter' "$CONV_TMUX_LOG" \
-  && grep -q "send-keys -t %1 CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/alpha\" claude --resume \"$CONV_SID\" Enter" "$CONV_TMUX_LOG" \
+  && grep -q "send-keys -t %1 CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/alpha\" command claude --resume \"$CONV_SID\" Enter" "$CONV_TMUX_LOG" \
   && ok "converge → the divergent idle pane got /quit + a PINNED resume by session id" \
   || bad "converge → restart keystrokes ($(cat "$CONV_TMUX_LOG"))"
 ! grep -qE 'send-keys -t (%2|%3|%4)' "$CONV_TMUX_LOG" \
