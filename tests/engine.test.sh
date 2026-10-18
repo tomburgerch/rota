@@ -3254,7 +3254,7 @@ set -e
 # depend on the pane shell's PATH reaching the shim (the five dead "Please run
 # /login" panes were bare lines resolved past it). The claim here is primary.
 [ "$RI_DEF_RC" -eq 0 ] \
-  && grep -q "%1 *would restart → CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" claude --resume \"$SID_RR\"" <<<"$RI_DEF" \
+  && grep -q "%1 *would restart → CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" command claude --resume \"$SID_RR\"" <<<"$RI_DEF" \
   && ok "restart default → a BARE switch lists the restart plan (no flag needed any more), PINNED to the active pool dir" \
   || bad "restart default → bare switch restarts idle panes, pinned (got $RI_DEF_RC: $RI_DEF)"
 grep -q 'RESTART IDLE' <<<"$RI_DEF" \
@@ -3268,7 +3268,7 @@ grep -q 'RESTART IDLE' <<<"$RI_DEF" \
   || bad "--restart-idle → alias accepted (got $RI_DRY_RC: $RI_DRY)"
 [ "$RI_DRY_RC" -eq 0 ] && ok "restart-idle → --dry-run exits 0" \
   || bad "restart-idle → --dry-run exits 0 (got $RI_DRY_RC: $RI_DRY)"
-grep -q "%1 *would restart → CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" claude --resume \"$SID_RR\"" <<<"$RI_DRY" \
+grep -q "%1 *would restart → CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" command claude --resume \"$SID_RR\"" <<<"$RI_DRY" \
   && ok "restart-idle → lists the idle pane, glyph stripped, line pinned to the active pool dir (2026-08-16)" \
   || bad "restart-idle → lists the idle pane (got: $RI_DRY)"
 grep -qE '%2 +skipped, mid-work' <<<"$RI_DRY" \
@@ -3313,7 +3313,7 @@ grep -q 'tmux send-keys -t %1 /quit Enter' "$RI_LOG" \
   || bad "restart-idle → /quit sent to %1 ($(cat "$RI_LOG"))"
 # the switch just moved the claim to wk, so the pin resolves AFTER the move:
 # the restarted pane must land on the account just switched TO, explicitly
-grep -q "tmux send-keys -t %1 CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/wk\" claude --resume \"$SID_RR\" Enter" "$RI_LOG" \
+grep -q "tmux send-keys -t %1 CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/wk\" command claude --resume \"$SID_RR\" Enter" "$RI_LOG" \
   && ok "restart-idle → then resumed BY NAME, pinned to the account just switched to (not PATH-dependent)" \
   || bad "restart-idle → pinned resume-by-name sent to %1 ($(cat "$RI_LOG"))"
 ! grep -q -- '--continue' "$RI_LOG" \
@@ -3322,7 +3322,7 @@ grep -q "tmux send-keys -t %1 CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/wk\" claude 
 ! grep -qE 'send-keys -t (%2|%3|%4)' "$RI_LOG" \
   && ok "restart-idle → the two mid-work panes and the untitled pane are never sent anything" \
   || bad "restart-idle → touched a pane it must not ($(grep -E 'send-keys -t (%2|%3|%4)' "$RI_LOG"))"
-grep -qE "%1 +restarted → CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/wk\" claude --resume \"$SID_RR\"" <<<"$RI_LIVE" \
+grep -qE "%1 +restarted → CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/wk\" command claude --resume \"$SID_RR\"" <<<"$RI_LIVE" \
   && ok "restart-idle → every pane gets a per-pane result line, showing the pinned line actually sent" \
   || bad "restart-idle → per-pane result lines (got: $RI_LIVE)"
 grep -q 'idle panes restarted (default; --new-only to skip)' <<<"$RI_LIVE" \
@@ -3341,7 +3341,7 @@ set -e
 [ "$SWB_RC" -eq 0 ] && ok "bare switch-all → exits 0" \
   || bad "bare switch-all → exit 0 (got $SWB_RC: $SWB_OUT)"
 grep -q 'tmux send-keys -t %1 /quit Enter' "$SWB_LOG" \
-  && grep -q "tmux send-keys -t %1 CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/wk\" claude --resume \"$SID_RR\" Enter" "$SWB_LOG" \
+  && grep -q "tmux send-keys -t %1 CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/wk\" command claude --resume \"$SID_RR\" Enter" "$SWB_LOG" \
   && ok "bare switch-all → restarts the idle pane BY DEFAULT (/quit + resume-by-name, pinned to the new claim)" \
   || bad "bare switch-all → default pinned restart ($(cat "$SWB_LOG"))"
 ! grep -qE 'send-keys -t (%2|%3|%4)' "$SWB_LOG" \
@@ -3434,7 +3434,7 @@ RB_DRY="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" switch-auto --dry-run --r
 RB_DRY_RC=$?
 set -e
 [ "$RB_DRY_RC" -eq 0 ] \
-  && grep -q "%1 *would restart → CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" claude --resume \"$RB_B\"" <<<"$RB_DRY" \
+  && grep -q "%1 *would restart → CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" command claude --resume \"$RB_B\"" <<<"$RB_DRY" \
   && ok "resume by id → the plan resumes the session id in the pane's own record, by id, not by title" \
   || bad "resume by id → record id in the plan (got $RB_DRY_RC: $RB_DRY)"
 ! grep -q "$RB_A" <<<"$RB_DRY" \
@@ -3464,7 +3464,7 @@ POOLPS
 set +e
 RB_PC="$("$SCRIPT" pane-converge --dry-run 2>&1)"
 set -e
-grep -q "%1 on wk@example.com → would restart (CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" claude --resume \"$RB_B\")" <<<"$RB_PC" \
+grep -q "%1 on wk@example.com → would restart (CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" command claude --resume \"$RB_B\")" <<<"$RB_PC" \
   && grep -q '^%5 still on wk@example.com, no session id for "untracked pane": left running (resume would open a picker)$' <<<"$RB_PC" \
   && grep -q '^pane-converge: restarted=1 busy=1 divergent=2 claim=primary@example.com (dry-run)$' <<<"$RB_PC" \
   && ok "resume by id → pane-converge resolves the same id; the id-less pane is reported and counted busy" \
@@ -3478,7 +3478,7 @@ RB_PCLIVE="$(TMUX_LOG="$RB_PCLOG" "$SCRIPT" pane-converge 2>&1)"
 RB_PCLIVE_RC=$?
 set -e
 [ "$RB_PCLIVE_RC" -eq 0 ] \
-  && grep -q "tmux send-keys -t %1 CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" claude --resume \"$RB_B\" Enter" "$RB_PCLOG" \
+  && grep -q "tmux send-keys -t %1 CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" command claude --resume \"$RB_B\" Enter" "$RB_PCLOG" \
   && ok "resume by id → live pane-converge still restarts a title-resolves-to-id pane with --resume \"<uuid>\"" \
   || bad "resume by id → live converge %1 (got $RB_PCLIVE_RC: $(cat "$RB_PCLOG"))"
 ! grep -q 'send-keys -t %5' "$RB_PCLOG" \
@@ -3499,7 +3499,7 @@ RB_LIVE="$(TMUX_LOG="$RB_LOG" FAKE_NEW_EMAIL=wk@example.com FAKE_LAG=0 \
 RB_LIVE_RC=$?
 set -e
 [ "$RB_LIVE_RC" -eq 0 ] \
-  && grep -q "tmux send-keys -t %1 CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/wk\" claude --resume \"$RB_B\" Enter" "$RB_LOG" \
+  && grep -q "tmux send-keys -t %1 CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/wk\" command claude --resume \"$RB_B\" Enter" "$RB_LOG" \
   && ok "resume by id → the line sent to the pane carries the session id" \
   || bad "resume by id → sent line (got $RB_LIVE_RC: $(cat "$RB_LOG"))"
 ! grep -q 'send-keys -t %5' "$RB_LOG" \
@@ -3512,7 +3512,7 @@ set -e
 ! grep -q 'claude --resume "rainbow rush game"' "$RB_LOG" \
   && ok "resume by id → the resolvable title itself never reaches a pane" \
   || bad "resume by id → title sent ($(grep 'send-keys' "$RB_LOG"))"
-grep -qE "%1 +restarted → CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/wk\" claude --resume \"$RB_B\"" <<<"$RB_LIVE" \
+grep -qE "%1 +restarted → CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/wk\" command claude --resume \"$RB_B\"" <<<"$RB_LIVE" \
   && ok "resume by id → the result line shows the id that was sent (one resolution per pane)" \
   || bad "resume by id → result line (got: $RB_LIVE)"
 rm -f "$RUN/.claude-pool/primary/sessions"/*.json "$FAKE_STATE/pidps-ttys001.txt"
@@ -3762,7 +3762,7 @@ PC_DRY_RC=$?
 set -e
 [ "$PC_DRY_RC" -eq 0 ] && ok "pane-converge → --dry-run exits 0" \
   || bad "pane-converge → --dry-run exits 0 (got $PC_DRY_RC: $PC_DRY)"
-grep -q "%1 on wk@example.com → would restart (CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" claude --resume \"$SID_RR\")" <<<"$PC_DRY" \
+grep -q "%1 on wk@example.com → would restart (CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" command claude --resume \"$SID_RR\")" <<<"$PC_DRY" \
   && ok "pane-converge → names the divergent idle pane, its account, and the PINNED resume it would send" \
   || bad "pane-converge → divergent idle pane listed (got: $PC_DRY)"
 grep -q '%2 busy on alpha@example.com, mid-work is never restarted; converges when idle' <<<"$PC_DRY" \
@@ -3773,7 +3773,7 @@ grep -q '%3 still on wk@example.com, empty pane title' <<<"$PC_DRY" \
   || bad "pane-converge → untitled pane reported (got: $PC_DRY)"
 # the 2026-08-16 flip: the UNPINNED pane is now DIVERGENT (it can be on no
 # account at all), so it earns a would-restart line like any stale pin
-grep -q "%5 on unpinned, no CLAUDE_CONFIG_DIR → would restart (CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" claude --resume \"$SID_UL\")" <<<"$PC_DRY" \
+grep -q "%5 on unpinned, no CLAUDE_CONFIG_DIR → would restart (CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" command claude --resume \"$SID_UL\")" <<<"$PC_DRY" \
   && ok "pane-converge → an UNPINNED idle pane counts as divergent and gets the pinned restart (2026-08-16)" \
   || bad "pane-converge → unpinned pane must be divergent (got: $PC_DRY)"
 ! grep -qE '%(4|6) ' <<<"$PC_DRY" \
@@ -3803,16 +3803,16 @@ set -e
 [ "$PC_LIVE_RC" -eq 0 ] && ok "pane-converge → a live run exits 0 (a busy pane is a wait, not an error)" \
   || bad "pane-converge → live exits 0 (got $PC_LIVE_RC: $PC_LIVE)"
 grep -q 'tmux send-keys -t %1 /quit Enter' "$PC_LOG" \
-  && grep -q "tmux send-keys -t %1 CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" claude --resume \"$SID_RR\" Enter" "$PC_LOG" \
+  && grep -q "tmux send-keys -t %1 CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" command claude --resume \"$SID_RR\" Enter" "$PC_LOG" \
   && ok "pane-converge → the divergent idle pane is restarted through the same /quit + PINNED resume-by-name" \
   || bad "pane-converge → pinned restart sent to %1 ($(cat "$PC_LOG"))"
-grep -q "tmux send-keys -t %5 CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" claude --resume \"$SID_UL\" Enter" "$PC_LOG" \
+grep -q "tmux send-keys -t %5 CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" command claude --resume \"$SID_UL\" Enter" "$PC_LOG" \
   && ok "pane-converge → the UNPINNED idle pane is restarted too, today's broken-forever shape now heals" \
   || bad "pane-converge → unpinned pane restarted ($(cat "$PC_LOG"))"
 ! grep -qE 'send-keys -t (%2|%3|%4|%6)' "$PC_LOG" \
   && ok "pane-converge → every other pane is left untouched" \
   || bad "pane-converge → touched a protected pane ($(grep -E 'send-keys' "$PC_LOG"))"
-grep -q "%1 restarted onto primary@example.com (was wk@example.com) → CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" claude --resume \"$SID_RR\"" <<<"$PC_LIVE" \
+grep -q "%1 restarted onto primary@example.com (was wk@example.com) → CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" command claude --resume \"$SID_RR\"" <<<"$PC_LIVE" \
   && ok "pane-converge → the restart line names both accounts (onto the claim, was the stale pin)" \
   || bad "pane-converge → restart line (got: $PC_LIVE)"
 grep -q '%5 restarted onto primary@example.com (was unpinned, no CLAUDE_CONFIG_DIR) →' <<<"$PC_LIVE" \
@@ -3821,6 +3821,37 @@ grep -q '%5 restarted onto primary@example.com (was unpinned, no CLAUDE_CONFIG_D
 grep -q '^pane-converge: restarted=2 busy=2 divergent=4 claim=primary@example.com$' <<<"$PC_LIVE" \
   && ok "pane-converge → live summary matches the dry-run plan" \
   || bad "pane-converge → live summary (got: $PC_LIVE)"
+
+# 2026-10-18: pane %19 was restarted onto tommy whose 5h window had 0% left. A
+# restart must not land on a walled TARGET seat: the same fixture, but the claim
+# (primary) is at 5h 100% used, so pane-converge leaves every divergent pane
+# running and sends no key at all. The weekly side is the same test.
+jq --arg sr "$(iso_in +3H)" --arg wr "$(iso_in +2d)" --arg ts "$(date +%s)" \
+  '. + {"primary@example.com":{wk_u:"10",wk_r:$wr,se_u:"100",se_r:$sr,ts:"fixture",ts_epoch:$ts}}' \
+  "$RUN/cfg/usage-cache.json" > "$RUN/cfg/usage-cache.json.new" && mv "$RUN/cfg/usage-cache.json.new" "$RUN/cfg/usage-cache.json"
+PC_WALL_LOG="$ROOT/tmux-pcwall.log"
+set +e
+PC_WALL="$(TMUX_LOG="$PC_WALL_LOG" "$SCRIPT" pane-converge 2>&1)"
+PC_WALL_DRY="$("$SCRIPT" pane-converge --dry-run 2>&1)"
+set -e
+! grep -q 'send-keys' "$PC_WALL_LOG" 2>/dev/null \
+  && ok "pane-converge → target seat at 5h 0% left: not one key is sent (no /quit, no resume)" \
+  || bad "pane-converge → walled target must not be restarted onto ($(grep 'send-keys' "$PC_WALL_LOG"))"
+grep -q '%1 still on wk@example.com, target seat primary@example.com: it is at 5h 100% (switch threshold 90%); left running' <<<"$PC_WALL" \
+  && ok "pane-converge → the skip is logged, naming the target seat and its wall" \
+  || bad "pane-converge → walled-target skip line (got: $PC_WALL)"
+grep -q '%1 on wk@example.com → would NOT restart, target seat primary@example.com: it is at 5h 100%' <<<"$PC_WALL_DRY" \
+  && ok "pane-converge → --dry-run tells the same truth about a walled target" \
+  || bad "pane-converge → dry-run walled target (got: $PC_WALL_DRY)"
+grep -q '^pane-converge: restarted=0 ' <<<"$PC_WALL" \
+  && ok "pane-converge → walled target: summary says restarted=0" \
+  || bad "pane-converge → walled-target summary (got: $PC_WALL)"
+# weekly wall too
+jq '.["primary@example.com"].wk_u = "95" | .["primary@example.com"].se_u = "10"' "$RUN/cfg/usage-cache.json" > "$RUN/cfg/usage-cache.json.new" && mv "$RUN/cfg/usage-cache.json.new" "$RUN/cfg/usage-cache.json"
+PC_WALLW="$("$SCRIPT" pane-converge --dry-run 2>&1)"
+grep -q 'would NOT restart, target seat primary@example.com: it is at weekly 95%' <<<"$PC_WALLW" \
+  && ok "pane-converge → a weekly-walled target is refused the same way" \
+  || bad "pane-converge → weekly-walled target (got: $PC_WALLW)"
 
 # nothing to do → says so, with the zeroed summary a keeper can still parse
 panes_teardown
@@ -3965,7 +3996,7 @@ POOLPS
 set +e
 HPOK="$("$SCRIPT" pane-converge --dry-run 2>&1)"
 set -e
-grep -q "would restart (CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" claude --resume \"$SID_RR\")" <<<"$HPOK" \
+grep -q "would restart (CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" command claude --resume \"$SID_RR\")" <<<"$HPOK" \
   && ok "pinned restart → a complete active credential puts CLAUDE_CONFIG_DIR=<its pool dir> on the sent line" \
   || bad "pinned restart → pin present (got: $HPOK)"
 
@@ -3990,7 +4021,7 @@ set +e
 SEAT_DRY="$("$SCRIPT" pane-converge --dry-run 2>&1)"
 set -e
 echo "  before/after relaunch lines for the rename fixture:"; grep "would restart" <<<"$SEAT_DRY" | sed 's/^/    /'
-grep -q "would restart (CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" claude --resume \"$SID_SEAT\" --name \"named pane (primary)\")" <<<"$SEAT_DRY" \
+grep -q "would restart (CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" command claude --resume \"$SID_SEAT\" --name \"named pane (primary)\")" <<<"$SEAT_DRY" \
   && ok "seat rename → a title ending in the old seat's alias is renamed to the new alias on the relaunch line" \
   || bad "seat rename → alias form (got: $SEAT_DRY)"
 grep -q "claude --resume \"$SID_SEAT2\" --name \"mail pane (primary)\")" <<<"$SEAT_DRY" \
@@ -4003,7 +4034,7 @@ SEAT_LOG="$ROOT/tmux-seat-rename.log"
 set +e
 TMUX_LOG="$SEAT_LOG" "$SCRIPT" pane-converge >/dev/null 2>&1
 set -e
-grep -q "tmux send-keys -t %1 CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" claude --resume \"$SID_SEAT\" --name \"named pane (primary)\" Enter" "$SEAT_LOG" \
+grep -q "tmux send-keys -t %1 CLAUDE_CONFIG_DIR=\"$RUN/.claude-pool/primary\" command claude --resume \"$SID_SEAT\" --name \"named pane (primary)\" Enter" "$SEAT_LOG" \
   && ok "seat rename → the SENT line carries the new name, the same one the plan printed" \
   || bad "seat rename → sent line ($(grep 'send-keys' "$SEAT_LOG"))"
 unset FAKE_TMUX_PANES
@@ -4208,7 +4239,7 @@ grep -q '%2 still on wk@example.com, needs you: unsent feedback draft, send or d
   && ok "exit questions → a status line listing '2 shells, 1 monitor' skips BEFORE /quit: no key at all" \
   || bad "exit questions → shells pre-check ($(grep 'send-keys -t %4' "$EQ_LOG") / $EQ_OUT)"
 grep -q '^tmux send-keys -t %5 /quit Enter$' "$EQ_LOG" \
-  && grep -q '^tmux send-keys -t %5 CLAUDE_CONFIG_DIR=.* claude --resume "'"$SID_SP"'" Enter$' "$EQ_LOG" \
+  && grep -q '^tmux send-keys -t %5 CLAUDE_CONFIG_DIR=.* command claude --resume "'"$SID_SP"'" Enter$' "$EQ_LOG" \
   && ! grep -qE '^tmux send-keys -t %5 (Escape|2|1|3)' "$EQ_LOG" \
   && grep -q '%5 restarted onto primary@example.com' <<<"$EQ_OUT" \
   && ok "exit questions → scrollback QUOTING the phrases above a normal prompt triggers nothing: restarted normally" \
