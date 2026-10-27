@@ -800,5 +800,15 @@ cp "$TMP/engine.good" "$LIB/rota-engine.sh"; chmod +x "$LIB/rota-engine.sh"
 OUT="$("$LIB/rota-billing.sh" 2>/dev/null)"
 check "refused: an engine that does not say refused changes nothing" 'grep -A1 "USE NEXT" <<<"$OUT" | grep -q "rota switch personal" && ! grep -q "REFUSED" <<<"$OUT"'
 
+# (review) a refused ACTIVE seat: never "you are already on it", and the withheld seat is named
+sed "s|\"label\":\"work@example.com\",\"email\":\"work@example.com\",\"alias\":\"work\",\"active\":true,\"data\":\"live\",|&\"seat\":{\"status\":\"active\",\"ends\":null,\"ended\":false,\"refused\":true,\"refused_at\":\"2026-08-24T09:44:00+02:00\"},|" \
+  "$TMP/engine.good" > "$LIB/rota-engine.sh"; chmod +x "$LIB/rota-engine.sh"
+OUT="$("$LIB/rota-billing.sh" 2>/dev/null)"
+check "refused active: USE NEXT is another seat"             'grep -A1 "USE NEXT" <<<"$OUT" | grep -q "rota switch personal"'
+check "refused active: never says you are already on it"     '! grep -q "already on it" <<<"$OUT"'
+check "refused active: a REFUSED line names the withheld seat" 'grep -E "^ +REFUSED " <<<"$OUT" | grep -q "work"'
+check "refused active: and says it is the seat you are on"   'grep -E "^ +REFUSED " <<<"$OUT" | grep -q "the seat you are on"'
+cp "$TMP/engine.good" "$LIB/rota-engine.sh"; chmod +x "$LIB/rota-engine.sh"
+
 printf 'billing.test.sh: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

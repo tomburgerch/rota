@@ -2554,18 +2554,8 @@ cache_flush() {
 # that dies half way. See rota_cache_mark_refused (rota-ranking.sh) for the shape
 # and for why a later live fetch clears it without anyone having to.
 cache_mark_refused() {  # cache_mark_refused <email> <iso-now>
-  [[ -n "${1:-}" ]] || return 0
   command -v jq >/dev/null 2>&1 || return 0
-  mkdir -p "$CFG_DIR"
-  local data merged
-  data="$(cat "$USAGE_CACHE" 2>/dev/null || echo '{}')"
-  jq -e . <<<"$data" >/dev/null 2>&1 || data='{}'
-  if merged="$(rota_cache_mark_refused "$data" "$1" "${2:-}" 403)"; then
-    printf '%s' "$merged" > "$USAGE_CACHE.tmp.$$" 2>/dev/null \
-      && mv "$USAGE_CACHE.tmp.$$" "$USAGE_CACHE" || rm -f "$USAGE_CACHE.tmp.$$"
-  else
-    cache_merge_warn
-  fi
+  rota_cache_write_refused "$USAGE_CACHE" "${1:-}" "${2:-}" 403 || cache_merge_warn
 }
 
 C_WKU=""; C_WKR=""; C_SEU=""; C_SER=""; C_TS=""; C_TE=""; C_WKR_SEEN=""
@@ -2973,7 +2963,9 @@ peer_row() {  # peer_row <payload> <email>
         (.five_hour_left_pct  // .five_hour.remaining_pct // ""),
         (.five_hour_resets_at // .five_hour.resets_at     // ""),
         (.quota_data          // .data                    // ""),
-        (.quota_measured_at   // "") ]
+        (.quota_measured_at   // ""),
+        ((.seat.refused // .seat_refused // false) | tostring),
+        (.seat.refused_at // .seat_refused_at // "") ]
     | map(tostring) | join("\u001f")' <<<"$1" 2>/dev/null || true
 }
 
@@ -3041,7 +3033,17 @@ peer_fill() {
       [[ -n "$email" ]] || continue
       row="$(peer_row "$payload" "$email")"
       [[ -n "$row" ]] || continue
-      IFS=$'\x1f' read -r p_wkl p_wkr p_sel p_ser p_state p_meas <<<"$row"
+      IFS=$'\x1f' read -r p_wkl p_wkr p_sel p_ser p_state p_meas p_ref p_refat <<<"$row"
+      # ⚠️ A SEAT REFUSED ON THE PEER IS REFUSED HERE, whether or not this box holds
+      # a credential for it and whatever numbers come with it. In memory only: the
+      # usage cache means "what THIS box measured". Only a live 200 here lifts it
+      # (the loop only visits rows with no live local reading, so a seat this box
+      # can measure is never overruled by a peer's claim).
+      if [[ "$p_ref" == "true" && -z "${U_REFUSED[$i]}" ]]; then
+        U_REFUSED[i]="${p_refat:-$RUN_MEASURED_AT}"
+        U_WHY[i]="$(refused_why "$i") (reported by $host)"
+        used_any=1
+      fi
       # VALIDATED here, before anything numeric happens to them, see peer_pct
       p_uwk=""; p_use=""
       p_pct="$(peer_pct "$p_wkl")"; [[ -n "$p_pct" ]] && p_uwk="$((100 - p_pct))"
@@ -3432,6 +3434,10 @@ collect_usage() {
     # --no-refresh, a 429 and a peer row all still know the seat was refused. Only
     # a live HTTP 200 with numbers (below) lifts it.
     U_REFUSED[i]="$(rota_seat_refused_at "$USAGE_CACHE" "$email")"
+    # the keeper keys the cache by the accounts-file LABEL, this file by the dir's
+    # identity: the same string on a reconciled pool, but a crossed dir must not
+    # hide a refusal, so the label is read too
+    [[ -n "${U_REFUSED[$i]}" || "$alabel" == "$email" ]] || U_REFUSED[i]="$(rota_seat_refused_at "$USAGE_CACHE" "$alabel")"
 
     # v2: shared slot is credential-free / stashes are read-only history, the
     # v1 SELF-HEAL ON READ (heal_pool_credential, 2026-08-07) is short-circuited
@@ -3501,7 +3507,12 @@ collect_usage() {
           if [[ -z "$C_WKU$C_SEU" ]] || window_expired "$C_WKR"; then wake_dormant=1; fi
         fi
       fi
-      if [[ -z "$json" ]] && { [[ "$http" != "429" ]] || [[ -n "$tok_expired_ago" ]] || (( wake_dormant )); }; then
+      # A REFUSED seat is never nudged: the nudge rotates a stale token and cannot
+      # undo an organisation disabling subscription access, so it only spends a
+      # haiku token (and risks the credential) every run. Already marked, or this
+      # very fetch said 403 on an in-date token.
+      if [[ -z "$json" ]] && ! seat_refused "$i" && ! rota_refusal_applies "$http" "$json" "$credfile" \
+         && { [[ "$http" != "429" ]] || [[ -n "$tok_expired_ago" ]] || (( wake_dormant )); }; then
         # a stored token only rotates when a session USES the account, so spend one
         # haiku token, the CLI refreshes + persists the credential itself. cwd=/ plus
         # this exact prompt marks the run as a synthetic session, so anything that
@@ -3601,7 +3612,7 @@ collect_usage() {
     # exactly as before. Recorded in the usage cache at once, so it outlives this
     # run and any healthy-looking cached row; the U_WHY text is set by the pass
     # after the loop, from U_REFUSED, so a cache-only run words it identically.
-    if [[ "$http" == "403" && -z "$json" && -z "$tok_expired_ago" ]]; then
+    if rota_refusal_applies "$http" "$json" "$credfile"; then
       [[ -n "${U_REFUSED[$i]}" ]] || U_REFUSED[i]="$RUN_MEASURED_AT"
       cache_mark_refused "$email" "${U_REFUSED[$i]}"
     fi
@@ -3972,6 +3983,9 @@ adopt_shared_numbers() {
   U_WAU[SHARED_SLOT]="$S_WAU"; U_WAR[SHARED_SLOT]="$S_WAR"; U_WSC[SHARED_SLOT]="$S_WSC"
   U_WKX[SHARED_SLOT]=0; U_SEX[SHARED_SLOT]=0
   U_STATE[SHARED_SLOT]="live"
+  # live numbers lifted the refusal on disk (cache_put below rebuilds the row);
+  # keep the in-memory state in step, or the row would be live AND refused
+  U_REFUSED[SHARED_SLOT]=""
   # a LIVE local fetch outranks anything borrowed, so a peer row for this slot is
   # replaced outright, provenance and age included, not merely overwritten
   U_SRC[SHARED_SLOT]=""; U_AGE[SHARED_SLOT]=""; U_MEAS[SHARED_SLOT]="$RUN_MEASURED_AT"
@@ -4136,6 +4150,9 @@ BURN_WKL=""; BURN_SEL=""; BURN_CACHED=0; BURN_BLOCKED=0
 active_burndown_hold() {   # 0 = hold the active account, 1 = let the ranking decide
   BURN_WKL=""; BURN_SEL=""; BURN_CACHED=0; BURN_BLOCKED=0
   (( SHARED_SLOT >= 0 )) || return 1
+  # a REFUSED active seat is never held, exactly like an ended one: staying on it
+  # is staying on an account that answers every request with 403
+  seat_refused "$SHARED_SLOT" && return 1
   case "${U_STATE[$SHARED_SLOT]}" in
     live)        ;;
     cached|peer) BURN_CACHED=1 ;;   # borrowed or remembered, either way not this run's
@@ -4972,6 +4989,10 @@ render_usage_table() {
       render_active_window "5h" "${U_SEU[$SHARED_SLOT]}" "${U_SER[$SHARED_SLOT]}" "${U_SEX[$SHARED_SLOT]}"
     fi
     render_verbose_detail "$SHARED_SLOT"
+    # the numbers above are cached and look fine; the refusal is the fact that
+    # matters about the seat you are ON, so it is said on the active row itself
+    seat_refused "$SHARED_SLOT" \
+      && printf '    %s\n' "$(paint "$CLR_RED" "REFUSED (usage API HTTP 403 since ${U_REFUSED[$SHARED_SLOT]}): this account cannot use Claude Code, the quota above cannot be spent. Switch away.")"
   else
     printf '%s   %s\n' "$(paint "$CLR_BOLD$CLR_CYAN" '▶ ACTIVE')" \
       "$(paint "$CLR_YELLOW" "${SHARED_EMAIL:-UNKNOWN, could not identify the shared ~/.claude credential}")"
@@ -6010,6 +6031,9 @@ pane_seat_cannot_serve() {  # pane_seat_cannot_serve <pool-dir> <email>
   # never land on one: read straight from the usage cache, no network.
   local refused_at; refused_at="$(rota_seat_refused_at "$USAGE_CACHE" "$id")"
   if [[ -n "$refused_at" ]]; then
+    # PANE_SEAT_ENDED=1: a seat that answers 403 can serve nothing, so an explicit
+    # CLAUDE_SEAT_OVERRIDE=1 pick does not protect it, same as an ended seat
+    PANE_SEAT_ENDED=1
     PANE_SEAT_WHY="its seat is REFUSED (usage API HTTP 403 since $refused_at), the account cannot use Claude Code"
     return 0
   fi

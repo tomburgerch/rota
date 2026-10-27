@@ -831,6 +831,20 @@ if ended_out:
     print(f"\n  {c('ENDED', '1;31')}   {c(detail, '2')}")
     print(f"     {c('the subscription is over, so that quota cannot be spent by anyone; there is no flag that ranks it', '2')}")
 
+# A REFUSED seat (usage API HTTP 403) drops out of USE NEXT, so say so, like the
+# ended seats above: its row still shows a healthy bar, and an omission nobody
+# explains reads as a bug. When it is the seat you are ON, say that too (and
+# never "you are already on it": that sentence is only printed for a pick).
+refused_out = [r for r in rows if r['seat_refused'] and not r['seat_ended']]
+if refused_out:
+    detail = '  ·  '.join(
+        f"{r['alias'] or r['account']} ({r['weekly_left_pct']}% left, refused"
+        f"{' since ' + fmt(parse_ts(r.get('seat_refused_at'))) if parse_ts(r.get('seat_refused_at')) else ''}"
+        f"{', the seat you are on: switch away' if r['active_now'] else ''})"
+        for r in refused_out)
+    print(f"\n  {c('REFUSED', '1;31')}   {c(detail, '2')}")
+    print(f"     {c('the usage API answers HTTP 403: the account cannot use Claude Code, so the quota it reports cannot be spent; there is no flag that ranks it', '2')}")
+
 missing = [r['account'] for r in rows if r['status'] == 'unknown']
 if missing:
     print(c(f"  billing unknown for: {', '.join(missing)}; add to {os.environ['BILLING_JSON']}", '33'))

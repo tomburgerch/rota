@@ -595,6 +595,45 @@ run_keeper "${keeper_env[@]}" CLAUDE_FAILOVER_USAGE_CMD=
   && ok "keeper refused → a later HTTP 200 clears the marker" \
   || bad "keeper refused → marker not cleared (got: $(jq -c --arg e "$(email_of wk)" '.[$e]' "$RUN/cfg/usage-cache.json"))"
 
+# (review) the keeper's claim itself REFUSED: it leaves it, like an ended claim
+mk_pool kclaimrefused
+for rf_a in alpha primary wk team; do
+  usage_fixture "$rf_a" 30 10 "$(iso_in +2H)" "$(iso_in +3d)"
+  mv "$FAKE_STATE/usage-$(email_of "$rf_a").json" "$FAKE_STATE/usage-TOK-$rf_a.json"
+done
+printf '403' > "$FAKE_STATE/usage-TOK-alpha.code"; rm -f "$FAKE_STATE/usage-TOK-alpha.json"
+run_keeper "${keeper_env[@]}" CLAUDE_FAILOVER_USAGE_CMD=
+grep -q "switch=to:" "$RUN/cfg/keeper-status" \
+  && [ "$(jq -r '.oauthAccount.emailAddress' "$RUN/.claude.json")" != "$(email_of alpha)" ] \
+  && ok "keeper refused claim → the keeper switches AWAY from a refused active claim (no percentage needed)" \
+  || bad "keeper refused claim → must leave it (status: $(cat "$RUN/cfg/keeper-status"), log: $OUT)"
+grep -E "auto-switch: .*→" "$RUN/cfg/keeper.log" | grep -q "REFUSED" \
+  && ok "keeper refused claim → the log names REFUSED as the trigger, not a threshold" \
+  || bad "keeper refused claim → trigger wording (log: $(cat "$RUN/cfg/keeper.log"))"
+
+# (review) a 200 with NO numbers does not clear a refusal (matches the engine)
+mk_pool knonumbers
+for rf_a in alpha primary wk team; do
+  usage_fixture "$rf_a" 30 10 "$(iso_in +2H)" "$(iso_in +3d)"
+  mv "$FAKE_STATE/usage-$(email_of "$rf_a").json" "$FAKE_STATE/usage-TOK-$rf_a.json"
+done
+printf '403' > "$FAKE_STATE/usage-TOK-wk.code"; rm -f "$FAKE_STATE/usage-TOK-wk.json"
+run_keeper "${keeper_env[@]}" CLAUDE_FAILOVER_USAGE_CMD=
+rm -f "$FAKE_STATE/usage-TOK-wk.code"; printf '{}' > "$FAKE_STATE/usage-TOK-wk.json"
+run_keeper "${keeper_env[@]}" CLAUDE_FAILOVER_USAGE_CMD=
+[ -n "$(jq -r --arg e "$(email_of wk)" '.[$e].refused_at // empty' "$RUN/cfg/usage-cache.json" 2>/dev/null)" ] \
+  && ok "keeper refused → a 200 carrying no numbers does not clear the refusal" \
+  || bad "keeper refused → empty 200 cleared the marker (got: $(jq -c --arg e "$(email_of wk)" '.[$e]' "$RUN/cfg/usage-cache.json"))"
+
+# (review) one rule for both writers: an EXPIRED token's 403 is not a refusal
+mk_pool kexpired
+cred_json TOK-wk "$(( ($(date +%s) - 3600) * 1000 ))" > "$RUN/.claude-pool/wk/.credentials.json"
+printf '403' > "$FAKE_STATE/usage-TOK-wk.code"
+run_keeper "${keeper_env[@]}" CLAUDE_FAILOVER_USAGE_CMD=
+[ -z "$(jq -r --arg e "$(email_of wk)" '.[$e].refused_at // empty' "$RUN/cfg/usage-cache.json" 2>/dev/null)" ] \
+  && ok "keeper refused → a 403 on an EXPIRED token is not recorded as a refusal (same rule as the engine)" \
+  || bad "keeper refused → expired-token 403 was marked (got: $(cat "$RUN/cfg/usage-cache.json" 2>/dev/null))"
+
 # ── 5a2. AN UNTOUCHED WINDOW STILL HAS A DEADLINE, AND THIS PICKER SEES IT ───
 #
 # The usage API answers `resets_at: null` for any weekly window whose

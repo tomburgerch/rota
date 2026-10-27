@@ -304,6 +304,43 @@ rota_cache_mark_refused() {  # rota_cache_mark_refused <cache-json> <email> <iso
   printf '%s' "$out"
 }
 
+# ONE rule for "is this fetch outcome a refusal", used by BOTH writers (the
+# engine's collect_usage and the keeper's fetch_usage), so they cannot disagree:
+# HTTP 403, no JSON body, and a stored access token that is still IN DATE. A 403
+# on an EXPIRED token is left to the stale-token path exactly as before (the
+# vendor's answer to a dead token is not evidence about the account), and every
+# other code (401, 429, 000) is not a refusal at all.
+rota_refusal_applies() {  # rota_refusal_applies <http> <json-body> <credentials-file>
+  [[ "${1:-}" == "403" && -z "${2:-}" ]] || return 1
+  local exp now
+  if [[ -r "${3:-}" ]] && command -v jq >/dev/null 2>&1; then
+    exp="$(jq -r '.claudeAiOauth.expiresAt // empty' "$3" 2>/dev/null || true)"
+    if [[ "$exp" =~ ^[0-9]+$ ]]; then
+      (( exp > 100000000000 )) && exp=$(( exp / 1000 ))
+      now="$(date +%s)"
+      (( now > exp )) && return 1
+    fi
+  fi
+  return 0
+}
+
+# Record the refusal in the cache FILE: read, skip when the seat is already
+# marked (the first sighting is the one that matters, and there is no reason to
+# rewrite the whole cache every minute for it), merge, atomic write. Shared by the
+# engine and the keeper. Returns 0 when the cache holds the marker afterwards
+# (written now or already there), non-zero only when jq refused.
+rota_cache_write_refused() {  # rota_cache_write_refused <cache-file> <email> <iso-now> [http]
+  local file="${1:-}" data merged
+  [[ -n "$file" && -n "${2:-}" ]] || return 0
+  [[ -z "$(rota_seat_refused_at "$file" "$2")" ]] || return 0
+  data="$(cat "$file" 2>/dev/null || echo '{}')"
+  jq -e . <<<"$data" >/dev/null 2>&1 || data='{}'
+  merged="$(rota_cache_mark_refused "$data" "$2" "${3:-}" "${4:-403}")" || return 1
+  mkdir -p "$(dirname "$file")" 2>/dev/null || true
+  printf '%s' "$merged" > "$file.tmp.$$" 2>/dev/null \
+    && mv "$file.tmp.$$" "$file" || { rm -f "$file.tmp.$$"; return 1; }
+}
+
 # When was this seat first seen refused? Prints the ISO instant, or NOTHING when
 # the seat is not refused (no cache file, no jq, no row, no marker all read the
 # same as "not refused": a quota tool must not start failing for want of a cache).

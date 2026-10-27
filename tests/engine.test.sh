@@ -3957,6 +3957,20 @@ KR_SENT_SET="$(grep -o 'send-keys -t %[0-9]* /quit' "$KR_LOG" | sed 's/.*-t //;s
 ! grep -qE 'send-keys -t (%2|%5|%6) ' "$KR_LOG" \
   && ok "keep rule → not one key to a healthy or override-protected pane" \
   || bad "keep rule → touched a protected pane ($(grep send-keys "$KR_LOG"))"
+
+# A REFUSED seat (usage API 403, latch t_tmembv) cannot serve a pane, and an
+# explicit CLAUDE_SEAT_OVERRIDE=1 pick does not protect it: a seat that answers
+# 403 can serve nothing, so it moves like an ENDED seat (decision 2026-10-27).
+jq '."alpha@example.com" += {refused_at:"2026-10-27T09:00:00Z", refused_http:"403"}' "$RUN/cfg/usage-cache.json" > "$RUN/cfg/uc.tmp" && mv "$RUN/cfg/uc.tmp" "$RUN/cfg/usage-cache.json"
+set +e
+KR_DRY2="$(TMUX_LOG="$ROOT/tmux-keepdry2.log" "$SCRIPT" pane-converge --dry-run 2>&1)"
+set -e
+grep -q '^%2 on alpha@example.com → would restart' <<<"$KR_DRY2" \
+  && ok "refused × panes → a pane on a REFUSED seat is restarted" \
+  || bad "refused × panes → refused seat moves (got: $KR_DRY2)"
+grep -q '^%5 on alpha@example.com → would restart' <<<"$KR_DRY2" \
+  && ok "refused × panes → a CLAUDE_SEAT_OVERRIDE=1 pane on a REFUSED seat moves too (like an ended one)" \
+  || bad "refused × panes → override on refused moves (got: $KR_DRY2)"
 grep -q ' left=3 claim=primary@example.com$' <<<"$KR_LIVE" \
   && ok "keep rule → the summary counts the panes it left (left=3), restarted/busy/divergent stay parseable" \
   || bad "keep rule → summary (got: $KR_LIVE)"
@@ -6025,6 +6039,110 @@ for rf_code in 401 429; do
     && ok "HTTP $rf_code → nothing written to the cache as a refusal" \
     || bad "HTTP $rf_code → cache refused_at must be absent"
 done
+
+
+# --- 60b. review round: active seat, peers, shared slot, nudge, rewrite ----------
+# (1) the ACTIVE seat refused: never held in burn-down, the ranking moves off it.
+rf_active() {  # rf_active <name> <refuse 0|1>
+  sa_fixture "$1" 30 "$(iso_in +2d)" 30
+  jq '.["primary@example.com"].wk_u = "40"' "$RUN/cfg/usage-cache.json" > "$RUN/cfg/uc.tmp" && mv "$RUN/cfg/uc.tmp" "$RUN/cfg/usage-cache.json"
+  printf '{"seven_day":{"utilization":30,"resets_at":"%s"},"five_hour":{"utilization":20,"resets_at":"%s"}}' \
+    "$(iso_in +2d)" "$(iso_in +3H)" > "$RUN/state/usage-TOK-SA-WK.json"
+  (( $2 )) && printf '403' > "$RUN/state/usage-TOK-SA-PRIMARY.code"
+  RFA_JSON="$(FAKE_NEW_EMAIL=primary@example.com CLAUDE_FAILOVER_MODE=burn-down "$SCRIPT" usage --json 2>>"$ERRLOG")"
+}
+rf_active refusedactive-ctl 0
+[ "$(jq -r '.recommendation.burn_down_hold' <<<"$RFA_JSON")" = true ] \
+  && ok "refused active (control) → a healthy active seat IS held in burn-down" \
+  || bad "refused active (control) → hold (got: $(jq -c '.recommendation' <<<"$RFA_JSON"))"
+rf_active refusedactive 1
+[ "$(jq -r '.recommendation.burn_down_hold' <<<"$RFA_JSON")" = false ] \
+  && [ "$(jq -r '.recommendation.email' <<<"$RFA_JSON")" = "wk@example.com" ] \
+  && ok "refused active → never held in burn-down; the ranking moves off it to the next seat" \
+  || bad "refused active → no hold (got: $(jq -c '.recommendation' <<<"$RFA_JSON"))"
+[ "$(prow primary@example.com "$RFA_JSON" | jq -r '.recommendable')" = false ] \
+  && ok "refused active → the active row itself is not recommendable" \
+  || bad "refused active → active row (got: $(prow primary@example.com "$RFA_JSON"))"
+
+# (2) a peer that reports a seat refused: refused here too, though this box holds
+# no credential for it; a peer's good numbers never override it.
+peer_fixture refusedpeer 85
+peer_json "$(iso_at -30S)" remotealias remote@example.com:73:88 local@example.com:73:88 \
+  | jq -c '.accounts |= map(. + {seat:{refused:true, refused_at:"2026-10-27T08:00:00Z"}})' > "$RUN/state/peer-peerbox.json"
+RP_JSON="$(ROTA_PEERS=peerbox FAKE_NEW_EMAIL=local@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
+RP_REMOTE="$(prow remote@example.com "$RP_JSON")"
+[ "$(jq -r '.seat.refused' <<<"$RP_REMOTE")" = true ] && [ "$(jq -r '.recommendable' <<<"$RP_REMOTE")" = false ] \
+  && [ "$(jq -r '.recommendation.email' <<<"$RP_JSON")" != "remote@example.com" ] \
+  && ok "refused peer → a seat refused on the peer is refused here, excluded from the ranking" \
+  || bad "refused peer → (got: $RP_REMOTE / rec: $(jq -c '.recommendation' <<<"$RP_JSON"))"
+[ "$(jq -r '.seat.refused_at' <<<"$RP_REMOTE")" = "2026-10-27T08:00:00Z" ] \
+  && ok "refused peer → the peer's first-seen instant is carried" \
+  || bad "refused peer → refused_at (got: $(jq -c '.seat' <<<"$RP_REMOTE"))"
+RP_LOCAL="$(prow local@example.com "$RP_JSON")"
+[ "$(jq -r '.seat.refused' <<<"$RP_LOCAL")" = false ] \
+  && ok "refused peer → a LIVE 200 on this box outranks the peer's claim about a seat it can measure" \
+  || bad "refused peer → local live wins (got: $RP_LOCAL)"
+[ ! -s "$RUN/cfg/usage-cache.json" ] || [ -z "$(jq -r '."remote@example.com".refused_at // empty' "$RUN/cfg/usage-cache.json")" ] \
+  && ok "refused peer → the peer's refusal is not written into this box's own cache" \
+  || bad "refused peer → peer refusal leaked into the local cache"
+
+# (3) the SHARED slot: adopt_shared_numbers goes live, in-memory refusal must follow the disk
+sa_fixture refusedshared 30 "$(iso_in +2d)" 30
+jq '.["primary@example.com"] += {refused_at:"2026-10-27T08:00:00Z", refused_http:"403"}' "$RUN/cfg/usage-cache.json" > "$RUN/cfg/uc.tmp" && mv "$RUN/cfg/uc.tmp" "$RUN/cfg/usage-cache.json"
+printf '{"seven_day":{"utilization":40,"resets_at":"%s"},"five_hour":{"utilization":20,"resets_at":"%s"}}' \
+  "$(iso_in +2d)" "$(iso_in +3H)" > "$RUN/state/usage-TOK-SA-SHARED.json"
+printf '403' > "$RUN/state/usage-TOK-SA-PRIMARY.code"
+RS_JSON="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
+RS_ROW="$(prow primary@example.com "$RS_JSON")"
+if [ "$(jq -r '.data' <<<"$RS_ROW")" = live ]; then
+  [ "$(jq -r '.seat.refused' <<<"$RS_ROW")" = false ] \
+    && ok "refused shared slot → adopted LIVE numbers clear the in-memory refusal too" \
+    || bad "refused shared slot → live but still refused (got: $RS_ROW)"
+else
+  bad "refused shared slot → fixture did not go live via the shared credential (got: $RS_ROW)"
+fi
+
+# (6) no wasted nudge on a seat already refused, nor on a fresh 403; 401 still nudges
+sa_fixture refusednudge 30 "$(iso_in +2d)" 30
+printf '403' > "$RUN/state/usage-TOK-SA-WK.code"
+FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --json >/dev/null 2>>"$ERRLOG"
+FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --json >/dev/null 2>>"$ERRLOG"
+! grep -q '^wk$' "$RUN/state/nudges" 2>/dev/null \
+  && ok "refused × nudge → a 403 seat is never sent the haiku nudge" \
+  || bad "refused × nudge → nudged (nudges: $(cat "$RUN/state/nudges" 2>/dev/null))"
+sa_fixture refusednudge401 30 "$(iso_in +2d)" 30
+printf '401' > "$RUN/state/usage-TOK-SA-WK.code"
+FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --json >/dev/null 2>>"$ERRLOG"
+grep -q '^wk$' "$RUN/state/nudges" 2>/dev/null \
+  && ok "refused × nudge → a 401 seat is still nudged (unchanged)" \
+  || bad "refused × nudge → 401 must still nudge (nudges: $(cat "$RUN/state/nudges" 2>/dev/null || echo none))"
+
+# (7) the marker is not rewritten when it is already set
+sa_fixture refusednorewrite 30 "$(iso_in +2d)" 30
+printf '403' > "$RUN/state/usage-TOK-SA-WK.code"
+FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --json >/dev/null 2>>"$ERRLOG"
+RF_INO1="$(ls -i "$RUN/cfg/usage-cache.json" | awk '{print $1}')"
+FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --json >/dev/null 2>>"$ERRLOG"
+RF_INO2="$(ls -i "$RUN/cfg/usage-cache.json" | awk '{print $1}')"
+[ "$RF_INO1" = "$RF_INO2" ] \
+  && ok "refused × cache → a seat already marked is not rewritten on every 403" \
+  || bad "refused × cache → cache rewritten although the marker was already set"
+
+# (4) one predicate for both writers
+RP_OUT="$(bash -c '
+  source "$1/lib/rota-ranking.sh" 2>/dev/null || exit 3
+  d="$(mktemp -d)"; now=$(date +%s)
+  printf "{\"claudeAiOauth\":{\"accessToken\":\"t\",\"expiresAt\":%s000}}" $((now+3600)) > "$d/fresh.json"
+  printf "{\"claudeAiOauth\":{\"accessToken\":\"t\",\"expiresAt\":%s000}}" $((now-3600)) > "$d/old.json"
+  r=""
+  rota_refusal_applies 403 "" "$d/fresh.json" && r="${r}A"
+  rota_refusal_applies 403 "" "$d/old.json"   || r="${r}B"
+  rota_refusal_applies 401 "" "$d/fresh.json" || r="${r}C"
+  rota_refusal_applies 403 "{}" "$d/fresh.json" || r="${r}D"
+  printf %s "$r"' _ "$REPO_ROOT" 2>/dev/null)"
+[ "$RP_OUT" = ABCD ] \
+  && ok "refusal predicate → 403 + no JSON + in-date token only (expired token, other codes, a 200 body are not refusals)" \
+  || bad "refusal predicate → rota_refusal_applies (got: '$RP_OUT')"
 
 restore_home
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
