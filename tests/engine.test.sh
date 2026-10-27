@@ -4900,23 +4900,46 @@ H3_SECS=$(( $(date +%s) - H3_START ))
   && ok "step deadline → and the peers behind the spent budget are skipped, not dialled" \
   || bad "step deadline → expected 1 dial once the budget was gone, got $(ssh_count)"
 
+# THE BUDGET IS WALL CLOCK, NOT A TICK COUNT. The watchdog used to count 0.2s
+# ticks, and a tick is a fork of `sleep` plus a `kill -0`: ~340ms on durban
+# 2026-10-27, so an 8s budget waited ~13.6s and the default 10s ~17s. The
+# deadline is now a background `sleep <budget>`, late by at most one tick; +3
+# here covers that tick, the run itself under load and the whole-second clock.
+peer_fixture peerwallclock
+: > "$RUN/state/peer-slow-peerbox"
+WC_START="$(date +%s)"
+ROTA_PEER_TIMEOUT=8 ROTA_PEERS=peerbox "$SCRIPT" usage --json >/dev/null 2>&1 || true
+WC_SECS=$(( $(date +%s) - WC_START ))
+[ "$WC_SECS" -le 11 ] \
+  && ok "watchdog → a hanging peer at an 8s budget costs at most budget+3s of wall clock (${WC_SECS}s)" \
+  || bad "watchdog → an 8s budget must not overrun by more than 3s (took ${WC_SECS}s)"
+
 # NEGATIVE CACHING. Caching only successes meant an unreachable peer was
 # re-dialled on every single invocation, so for as long as ballito was asleep
 # every `cdt accounts` on the laptop stalled for the full bound. That is a worse
 # daily experience than the blank table this feature exists to fix.
+#
+# ⚠️ RUNS 2 AND 3 ARE TIMED ON THEIR OWN, WITH A BUDGET THAT A STALL CANNOT HIDE IN.
+# This used to time all three runs against "≤ 4s" with a 2s timeout, so the one
+# run that SHOULD wait (run 1) ate most of the margin and the assertion went red
+# on an unloaded box: 3 of 10 (t_56f8nx, durban 2026-10-27). Now run 1 pays the
+# 2s dial, and runs 2 and 3 run under a 10s timeout and must finish in 5s
+# together: a cache miss costs ≥10s EACH, a cache hit ~0.3s, so load cannot
+# move a correct run across the line and a broken cache cannot stay under it.
 peer_fixture peerfailcache
 : > "$RUN/state/peer-slow-peerbox"
+ROTA_PEER_TIMEOUT=2 ROTA_PEERS=peerbox "$SCRIPT" usage --json >/dev/null 2>&1 || true
 NC_START="$(date +%s)"
-for _ in 1 2 3; do
-  ROTA_PEER_TIMEOUT=2 ROTA_PEERS=peerbox "$SCRIPT" usage --json >/dev/null 2>&1 || true
+for _ in 2 3; do
+  ROTA_PEER_TIMEOUT=10 ROTA_PEERS=peerbox "$SCRIPT" usage --json >/dev/null 2>&1 || true
 done
 NC_SECS=$(( $(date +%s) - NC_START ))
 [ "$(ssh_count)" -eq 1 ] \
   && ok "failure cache → a dead peer is dialled ONCE across three runs, not three times" \
   || bad "failure cache → expected 1 dial across three runs, got $(ssh_count)"
-[ "$NC_SECS" -le 4 ] \
-  && ok "failure cache → so runs 2 and 3 cost nothing at all (${NC_SECS}s for all three)" \
-  || bad "failure cache → runs after the first must not stall (took ${NC_SECS}s)"
+[ "$NC_SECS" -le 5 ] \
+  && ok "failure cache → so runs 2 and 3 cost nothing at all (${NC_SECS}s for both, at a 10s timeout)" \
+  || bad "failure cache → runs after the first must not stall (runs 2 and 3 took ${NC_SECS}s at a 10s timeout)"
 [ "$(jq -r '.peerbox.failed' "$RUN/cfg/peer-usage-cache.json" 2>/dev/null)" = true ] \
   && ok "failure cache → the failure is recorded with its own stamp, next to the payload entries" \
   || bad "failure cache → nothing written to peer-usage-cache.json: $(cat "$RUN/cfg/peer-usage-cache.json" 2>/dev/null)"

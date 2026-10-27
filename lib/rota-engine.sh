@@ -2749,9 +2749,8 @@ peer_hosts() {
 # dial whatever is left of the step's deadline. With one peer the two are the
 # same number, so the single-peer path is byte-for-byte what it always was.
 peer_ssh() {  # peer_ssh <host> <out-file> <budget-secs>   → 0 when it produced something
-  local host="$1" out="$2" budget="${3:-$PEER_TIMEOUT}" pid ticks=0 max
+  local host="$1" out="$2" budget="${3:-$PEER_TIMEOUT}" pid timer
   (( budget > 0 )) || return 1
-  max=$(( budget * 5 ))          # the watch loop ticks every 0.2s
   local remote='PATH="$HOME/.local/bin:$PATH"; export PATH; '
   remote+='ROTA_PEERS= rota accounts --json --no-refresh --local 2>/dev/null '
   remote+='|| ROTA_PEERS= rota usage --json --no-refresh 2>/dev/null'
@@ -2761,11 +2760,19 @@ peer_ssh() {  # peer_ssh <host> <out-file> <budget-secs>   → 0 when it produce
   ssh -o BatchMode=yes -o ConnectTimeout=4 -o StrictHostKeyChecking=accept-new \
       -o LogLevel=ERROR -- "$host" "$remote" > "$out" 2>/dev/null &
   pid=$!
-  while (( ticks < max )); do
+  # ⚠️ THE DEADLINE IS A TIMER, NOT A TICK COUNT. This loop used to stop after
+  # budget*5 ticks of `sleep 0.2`, but a tick is also a fork of `sleep` and two
+  # `kill -0`s: ~340ms on durban 2026-10-27, so budgets of 1/2/4s waited
+  # 1.8/3.4/6.8s, the default 10s ceiling was really ~17s, and load made it worse.
+  # A background `sleep <budget>` runs on wall clock, so the wait ends within one
+  # tick of the budget however slow the ticks are.
+  sleep "$budget" & timer=$!
+  while kill -0 "$timer" 2>/dev/null; do
     kill -0 "$pid" 2>/dev/null || break
     sleep 0.2
-    ticks=$((ticks + 1))
   done
+  kill "$timer" 2>/dev/null || true
+  wait "$timer" 2>/dev/null || true
   if kill -0 "$pid" 2>/dev/null; then
     # No graceful path is implied here: TERM immediately followed by KILL IS a
     # kill, and it kills the LOCAL ssh only. The `rota accounts` it started keeps
