@@ -4905,6 +4905,8 @@ H3_SECS=$(( $(date +%s) - H3_START ))
 # 2026-10-27, so an 8s budget waited ~13.6s and the default 10s ~17s. The
 # deadline is now a background `sleep <budget>`, late by at most one tick; +3
 # here covers that tick, the run itself under load and the whole-second clock.
+# Teeth depend on the box: the old loop goes red here only where a tick costs
+# over ~275ms (durban: 13-15s, red), and an idle fast box can pass it (~8.4s).
 peer_fixture peerwallclock
 : > "$RUN/state/peer-slow-peerbox"
 WC_START="$(date +%s)"
