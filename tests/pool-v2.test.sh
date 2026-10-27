@@ -155,8 +155,11 @@ for a in "$@"; do
   prev="$a"
 done
 f="${FAKE_STATE:-/nonexistent}/usage-$token.json"
+c="${FAKE_STATE:-/nonexistent}/usage-$token.code"
 if [ -n "$token" ] && [ -f "$f" ]; then
   printf '%s\n200' "$(cat "$f")"
+elif [ -n "$token" ] && [ -f "$c" ]; then
+  printf '\n%s' "$(cat "$c")"
 else
   printf '\n000'
 fi
@@ -558,6 +561,39 @@ run_keeper "${keeper_env[@]}"
 grep -q 'switch=no-target' "$RUN/cfg/keeper-status" \
   && ok "keeper → never switches ONTO an account above 80% (hysteresis ceiling)" \
   || bad "keeper → >80% targets refused (status: $(cat "$RUN/cfg/keeper-status"))"
+
+
+# ── 5b. a REFUSED seat (usage API HTTP 403) is never an auto-switch target ───
+# latch t_tmembv. The seat with the SOONEST reset answers the usage API with 403
+# (its org disabled Claude subscription access): the keeper must neither switch
+# onto it nor forget the refusal on the next tick, and a later 200 clears it.
+# Real curl path (CLAUDE_FAILOVER_USAGE_CMD emptied) so the HTTP code is seen.
+mk_pool krefused
+for rf_a in alpha primary wk team; do
+  usage_fixture "$rf_a" 50 10 "$(iso_in +2H)" "$(iso_in +3d)"
+  mv "$FAKE_STATE/usage-$(email_of "$rf_a").json" "$FAKE_STATE/usage-TOK-$rf_a.json"
+done
+usage_fixture alpha 91 50 "$(iso_in +2H)" "$(iso_in +3d)"; mv "$FAKE_STATE/usage-$(email_of alpha).json" "$FAKE_STATE/usage-TOK-alpha.json"
+usage_fixture primary 34 10 "$(iso_in +2H)" "$(iso_in +2d)"; mv "$FAKE_STATE/usage-$(email_of primary).json" "$FAKE_STATE/usage-TOK-primary.json"
+rm -f "$FAKE_STATE/usage-TOK-wk.json"
+printf '403' > "$FAKE_STATE/usage-TOK-wk.code"
+run_keeper "${keeper_env[@]}" CLAUDE_FAILOVER_USAGE_CMD=
+grep -q "switch=to:$(email_of primary)" "$RUN/cfg/keeper-status" \
+  && ok "keeper refused → the 403 seat is not the target; the next-soonest seat is" \
+  || bad "keeper refused → pick (status: $(cat "$RUN/cfg/keeper-status"), log: $OUT)"
+[ -n "$(jq -r --arg e "$(email_of wk)" '.[$e].refused_at // empty' "$RUN/cfg/usage-cache.json" 2>/dev/null)" ] \
+  && ok "keeper refused → the 403 is recorded in the usage cache (refused_at), for every other reader" \
+  || bad "keeper refused → cache marker (got: $(cat "$RUN/cfg/usage-cache.json" 2>/dev/null))"
+grep -q "refused" "$RUN/cfg/keeper.log" \
+  && ok "keeper refused → the log names the refusal" \
+  || bad "keeper refused → log line (got: $(cat "$RUN/cfg/keeper.log" 2>/dev/null))"
+# a later 200 clears it (the merge writer rebuilds the row without the marker)
+rm -f "$FAKE_STATE/usage-TOK-wk.code"
+usage_fixture wk 40 10 "$(iso_in +2H)" "$(iso_in +3d)"; mv "$FAKE_STATE/usage-$(email_of wk).json" "$FAKE_STATE/usage-TOK-wk.json"
+run_keeper "${keeper_env[@]}" CLAUDE_FAILOVER_USAGE_CMD=
+[ -z "$(jq -r --arg e "$(email_of wk)" '.[$e].refused_at // empty' "$RUN/cfg/usage-cache.json" 2>/dev/null)" ] \
+  && ok "keeper refused → a later HTTP 200 clears the marker" \
+  || bad "keeper refused → marker not cleared (got: $(jq -c --arg e "$(email_of wk)" '.[$e]' "$RUN/cfg/usage-cache.json"))"
 
 # ── 5a2. AN UNTOUCHED WINDOW STILL HAS A DEADLINE, AND THIS PICKER SEES IT ───
 #

@@ -5945,6 +5945,87 @@ grep -q 'already spent' <<<"$(jq -r '.stale_reason' <<<"$DW_STUCK2")" \
   && ok "dormant × 429 → the second run's stuck reason says the wake was already spent, with the TTL" \
   || bad "dormant × 429 → stamped reason (got: $(jq -r '.stale_reason' <<<"$DW_STUCK2"))"
 
+
+# --- 60. a REFUSED seat (usage API HTTP 403) is never recommended -----------------
+# latch t_tmembv, 2026-09-06 21:50. A seat whose org disabled Claude subscription
+# access still authenticates and its cached quota looks healthy, but every request
+# fails with 403 oauth_org_not_allowed. The usage API answers 403 for exactly that
+# seat (keeper log: `usage fetch tartare@codeandstate.com: HTTP 403`, repeatedly,
+# from the day after the seat ended). Before the fix a 403 was filed under "stored
+# token is stale", the cached row kept looking healthy, and switch-auto's second
+# (allow_cached) pass ranked the seat FIRST on 2-day-old numbers.
+# sa_fixture: wk has the soonest reset (+2d, 30% used) and alpha the later one
+# (+5d, 30% used); primary is the active seat at 99%. Nothing is live except what
+# a scenario arms with a usage-TOK-*.json / .code fixture.
+rf_pick() { grep -o 'optimizer pick: [a-z]*@example.com' <<<"$1" | head -1 | sed 's/.*pick: //'; }
+sa_fixture refusedswitch 30 "$(iso_in +2d)" 30
+printf '403' > "$RUN/state/usage-TOK-SA-WK.code"
+set +e
+OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" switch-auto --dry-run 2>&1)"
+RC=$?
+set -e
+[ "$(rf_pick "$OUT")" = "alpha@example.com" ] \
+  && ok "refused × switch-auto (cached pass) → the 403 seat is NOT the pick although its cached reset is soonest" \
+  || bad "refused × switch-auto → must pick alpha (got: $OUT)"
+RF_JSON="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
+RF_WK="$(prow wk@example.com "$RF_JSON")"
+[ "$(jq -r '.seat.refused' <<<"$RF_WK")" = true ] \
+  && ok "refused × usage --json → seat.refused is true" \
+  || bad "refused × usage --json → seat.refused (got: $RF_WK)"
+[ "$(jq -r '.recommendable' <<<"$RF_WK")" = false ] && [ "$(jq -r '.recommendation.email' <<<"$RF_JSON")" != "wk@example.com" ] \
+  && ok "refused × usage --json → not recommendable, not the recommendation" \
+  || bad "refused × usage --json → recommendable (got: $RF_WK)"
+grep -q 'refused' <<<"$(jq -r '.stale_reason' <<<"$RF_WK")" && ! grep -q 'stale' <<<"$(jq -r '.stale_reason' <<<"$RF_WK")" \
+  && ok "refused × usage --json → the reason says REFUSED (HTTP 403), never 'stale token'" \
+  || bad "refused × usage --json → reason (got: $(jq -r '.stale_reason' <<<"$RF_WK"))"
+[ -n "$(jq -r '."wk@example.com".refused_at // empty' "$RUN/cfg/usage-cache.json")" ] \
+  && ok "refused → the usage cache records WHEN the refusal was first seen" \
+  || bad "refused → usage-cache refused_at (got: $(jq -c '."wk@example.com"' "$RUN/cfg/usage-cache.json"))"
+# PERSISTENCE: a later run that never reaches the network still knows
+rm -f "$RUN/state/usage-TOK-SA-WK.code"
+RF_JSON2="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --no-refresh --json 2>>"$ERRLOG")"
+RF_WK2="$(prow wk@example.com "$RF_JSON2")"
+[ "$(jq -r '.seat.refused' <<<"$RF_WK2")" = true ] && [ "$(jq -r '.recommendable' <<<"$RF_WK2")" = false ] \
+  && ok "refused × --no-refresh → still refused on cache alone (a refusal outlives a healthy-looking cached row)" \
+  || bad "refused × --no-refresh → persistence (got: $RF_WK2)"
+set +e
+OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" switch-auto --dry-run 2>&1)"
+set -e
+[ "$(rf_pick "$OUT")" = "alpha@example.com" ] \
+  && ok "refused × later switch-auto on a dead network → still not the pick" \
+  || bad "refused × later switch-auto → must pick alpha (got: $OUT)"
+# CLEARING: a later successful live fetch (200 with numbers) lifts it
+printf '{"seven_day":{"utilization":30,"resets_at":"%s"},"five_hour":{"utilization":20,"resets_at":"%s"}}' \
+  "$(iso_in +2d)" "$(iso_in +3H)" > "$RUN/state/usage-TOK-SA-WK.json"
+RF_JSON3="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
+RF_WK3="$(prow wk@example.com "$RF_JSON3")"
+[ "$(jq -r '.seat.refused' <<<"$RF_WK3")" = false ] && [ "$(jq -r '.recommendation.email' <<<"$RF_JSON3")" = "wk@example.com" ] \
+  && ok "refused × a later HTTP 200 → the refusal is cleared and the seat ranks again" \
+  || bad "refused × 200 clears (got: $RF_WK3 / rec: $(jq -c '.recommendation' <<<"$RF_JSON3"))"
+[ -z "$(jq -r '."wk@example.com".refused_at // empty' "$RUN/cfg/usage-cache.json")" ] \
+  && ok "refused × a later HTTP 200 → refused_at is gone from the cache" \
+  || bad "refused × 200 → cache still carries refused_at"
+
+# REGRESSION: 401 and 429 are NOT refusals; they behave exactly as before.
+for rf_code in 401 429; do
+  sa_fixture "refused$rf_code" 30 "$(iso_in +2d)" 30
+  printf '%s' "$rf_code" > "$RUN/state/usage-TOK-SA-WK.code"
+  set +e
+  OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" switch-auto --dry-run 2>&1)"
+  set -e
+  [ "$(rf_pick "$OUT")" = "wk@example.com" ] \
+    && ok "HTTP $rf_code × switch-auto → unchanged: the cached soonest-reset seat is still the pick" \
+    || bad "HTTP $rf_code × switch-auto → must still pick wk (got: $OUT)"
+  RF_JSON="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
+  RF_WK="$(prow wk@example.com "$RF_JSON")"
+  [ "$(jq -r '.seat.refused' <<<"$RF_WK")" = false ] && ! grep -q 'refused' <<<"$(jq -r '.stale_reason' <<<"$RF_WK")" \
+    && ok "HTTP $rf_code → not marked refused" \
+    || bad "HTTP $rf_code → must not be refused (got: $RF_WK)"
+  [ -z "$(jq -r '."wk@example.com".refused_at // empty' "$RUN/cfg/usage-cache.json")" ] \
+    && ok "HTTP $rf_code → nothing written to the cache as a refusal" \
+    || bad "HTTP $rf_code → cache refused_at must be absent"
+done
+
 restore_home
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

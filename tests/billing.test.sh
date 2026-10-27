@@ -778,5 +778,27 @@ check "scoped weekly: the recommendation still ranks on the binding cap (fable i
 unset CLAUDE_BILLING_JSON
 cp "$TMP/engine.good" "$LIB/rota-engine.sh"; chmod +x "$LIB/rota-engine.sh"
 
+
+# --- a REFUSED seat (usage API HTTP 403) is never USE NEXT ---------------------
+# latch t_tmembv. A seat whose org disabled Claude subscription access still
+# authenticates and its cached quota looks healthy, but every request fails with
+# 403 oauth_org_not_allowed. The engine publishes seat.refused / seat.refused_at
+# (the usage cache remembers a 403 past a "healthy" cached row); billing must
+# neither recommend the seat nor let its green bar be the only signal.
+# `personal` is the fixture's best seat by quota AND soonest reset, so if the
+# refusal cannot displace it here nothing about the exclusion works.
+sed "s|\"config_dir\":\"$TMP/pool/personal\",|\"config_dir\":\"$TMP/pool/personal\",\"seat\":{\"status\":\"active\",\"ends\":null,\"ended\":false,\"refused\":true,\"refused_at\":\"2026-08-24T09:44:00+02:00\"},|" \
+  "$TMP/engine.good" > "$LIB/rota-engine.sh"; chmod +x "$LIB/rota-engine.sh"
+rm -rf "$TMP/pool"
+OUT="$("$LIB/rota-billing.sh" 2>/dev/null)"
+JOUT="$("$LIB/rota-billing.sh" --json 2>/dev/null)"
+check "refused: the row says REFUSED (HTTP 403 since ...)"  'grep "personal@example.com" <<<"$OUT" | grep -q "REFUSED (HTTP 403 since"'
+check "refused: USE NEXT does not pick it"                  '! grep -A1 "USE NEXT" <<<"$OUT" | grep -q "rota switch personal"'
+check "refused: USE NEXT falls to the next seat (work)"     'grep -A1 "USE NEXT" <<<"$OUT" | grep -q "rota switch work"'
+check "refused (json): seat_refused is published"           '[ "$(jrow "$JOUT" personal@example.com seat_refused)" = True ]'
+cp "$TMP/engine.good" "$LIB/rota-engine.sh"; chmod +x "$LIB/rota-engine.sh"
+OUT="$("$LIB/rota-billing.sh" 2>/dev/null)"
+check "refused: an engine that does not say refused changes nothing" 'grep -A1 "USE NEXT" <<<"$OUT" | grep -q "rota switch personal" && ! grep -q "REFUSED" <<<"$OUT"'
+
 printf 'billing.test.sh: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
