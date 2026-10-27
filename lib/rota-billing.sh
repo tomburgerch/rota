@@ -389,6 +389,13 @@ for a in usage.get('accounts', []):
         # only field that means the account is actually done.
         'unmeasured': bool(a.get('unmeasured')),
         'seat_ended': bool(seat_ended),
+        # ── REFUSED (usage API HTTP 403, latch t_tmembv) ─────────────────────
+        # The seat authenticates and its cached quota looks healthy, but the
+        # account cannot use Claude Code. The engine owns the fact (it lives in
+        # the usage cache); billing only reads it back, like seat_ended. An older
+        # engine publishes neither key: False / None, exactly today's behaviour.
+        'seat_refused': bool(seat.get('refused')),
+        'seat_refused_at': seat.get('refused_at'),
         'plan': b.get('plan', '?'),
         'renews_day': b.get('renews_day'),
         'next_charge': nxt.isoformat() if nxt else None,
@@ -587,6 +594,11 @@ for r in rows:
         notes.append(c(f"CANCELLED, ends {fmt_date(r['ends'])}{tail}", '31'))
     elif r['status'] == 'unknown':
         notes.append(c('billing unknown, add it to billing.json', '33'))
+    if r['seat_refused']:
+        # ⚠️ A healthy-looking quota bar must not be the only signal. This leads
+        # the seat's own notes: it is the fact that makes the bar meaningless.
+        since = parse_ts(r.get('seat_refused_at'))
+        notes.insert(0, c(f"REFUSED (HTTP 403 since {fmt(since)})" if since else "REFUSED (HTTP 403)", '1;31'))
     if sv is not None:
         sleft = r['weekly_left_pct']
         if sleft == 0:
@@ -722,6 +734,7 @@ floor = (usage.get('floors') or {}).get('weekly_pct', 20)
 usable = [r for r in rows if (r['weekly_left_pct'] or 0) >= floor
           and not is_unmeasured(r)
           and not r['seat_ended']
+          and not r['seat_refused']
           and (INCLUDE_RESERVED or not r['reserved'])]
 usable.sort(key=lambda r: (loses_at(r), -(r['weekly_left_pct'] or 0)))
 
@@ -735,7 +748,7 @@ usable.sort(key=lambda r: (loses_at(r), -(r['weekly_left_pct'] or 0)))
 # owner quota that no longer exists. One seat, one reason, and the terminal one
 # wins.
 held = [r for r in rows if r['reserved'] and (r['weekly_left_pct'] or 0) >= floor
-        and not r['seat_ended'] and not INCLUDE_RESERVED]
+        and not r['seat_ended'] and not r['seat_refused'] and not INCLUDE_RESERVED]
 
 # The same sentence for the same reason, about the dead ones: these rows still
 # show a fat green bar, so an omission nobody explains reads as a bug in the
@@ -785,7 +798,7 @@ else:
     # will not exist to see it - and this line would then tell him to sit and wait
     # for it. Same field as the ranking above, for the same reason.
     cands = [r for r in rows if not is_unmeasured(r) and not r['seat_ended']
-             and next_reset(r)]
+             and not r['seat_refused'] and next_reset(r)]
     soonest = min(cands, key=next_reset, default=None)
     msg = f"nothing clears the {floor}%-weekly floor"
     if soonest:
@@ -817,6 +830,20 @@ if ended_out:
         for r in ended_out)
     print(f"\n  {c('ENDED', '1;31')}   {c(detail, '2')}")
     print(f"     {c('the subscription is over, so that quota cannot be spent by anyone; there is no flag that ranks it', '2')}")
+
+# A REFUSED seat (usage API HTTP 403) drops out of USE NEXT, so say so, like the
+# ended seats above: its row still shows a healthy bar, and an omission nobody
+# explains reads as a bug. When it is the seat you are ON, say that too (and
+# never "you are already on it": that sentence is only printed for a pick).
+refused_out = [r for r in rows if r['seat_refused'] and not r['seat_ended']]
+if refused_out:
+    detail = '  ·  '.join(
+        f"{r['alias'] or r['account']} ({r['weekly_left_pct']}% left, refused"
+        f"{' since ' + fmt(parse_ts(r.get('seat_refused_at'))) if parse_ts(r.get('seat_refused_at')) else ''}"
+        f"{', the seat you are on: switch away' if r['active_now'] else ''})"
+        for r in refused_out)
+    print(f"\n  {c('REFUSED', '1;31')}   {c(detail, '2')}")
+    print(f"     {c('the usage API answers HTTP 403: the account cannot use Claude Code, so the quota it reports cannot be spent; there is no flag that ranks it', '2')}")
 
 missing = [r['account'] for r in rows if r['status'] == 'unknown']
 if missing:

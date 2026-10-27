@@ -1005,6 +1005,17 @@ fetch_usage() {  # fetch_usage <label> <dir>
       # a persistently failing token (the live 401s) repeats every tick,
       # log ONCE per label+code, re-armed by the next successful fetch
       log_once "usage-${label//[^A-Za-z0-9]/_}" "$http" "usage fetch $label: HTTP ${http:-none}"
+      # ⚠️ 403 IS A REFUSAL, NOT STALENESS (latch t_tmembv): the seat's organisation
+      # disabled Claude subscription access, so it authenticates, its cached quota
+      # looks healthy, and every request fails. Written into the usage cache (the
+      # SAME record rota-engine.sh reads) so the dashboard, `rota billing`, the
+      # engine's recommendation and the pane restarts all see it, and it outlives
+      # this tick. Only a later HTTP 200 clears it (rota_cache_merge_row, below).
+      if rota_refusal_applies "$http" "" "$cred"; then
+        if rota_cache_write_refused "$USAGE_CACHE" "$label" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" 403; then
+          log_once "refused-${label//[^A-Za-z0-9]/_}" "403" "seat REFUSED $label: usage API HTTP 403, the account cannot use Claude Code; never an auto-switch target until a fetch succeeds"
+        fi
+      fi
       return 0
     fi
     log_state_clear "usage-${label//[^A-Za-z0-9]/_}"
@@ -1025,6 +1036,11 @@ fetch_usage() {  # fetch_usage <label> <dir>
     | join("\u001f")' 2>/dev/null || true)"
   [[ -n "$row" ]] || return 0
   IFS=$'\x1f' read -r wk wk_r se se_r <<<"$row"
+  # a 200 that carries no numbers proves nothing about the account: it neither
+  # lifts a refusal nor is worth a cache row (the engine's rule: "live" needs
+  # numbers). Only a reading with numbers falls through to the merge below.
+  [[ -n "$wk$se" ]] || return 0
+  log_state_clear "refused-${label//[^A-Za-z0-9]/_}"
   U_LBL+=("$label"); U_WK+=("$wk"); U_WKR+=("$wk_r"); U_SE+=("$se"); U_SER+=("$se_r")
   FETCHED=$((FETCHED + 1))
   # ⚠️ THE PROJECTION IS TAKEN BEFORE THE WRITE BELOW, deliberately: the row
@@ -1338,7 +1354,7 @@ main() {
 
   # 4. AUTO-SWITCH, the claim's binding weekly OR 5h utilization ≥ threshold,
   #    OR the claim's SEAT HAS ENDED (a wall no percentage can express)
-  local claim="" ui="" wk="" se="" claim_ended=0
+  local claim="" ui="" wk="" se="" claim_ended=0 claim_refused=0
   claim="$(jq -r '.oauthAccount.emailAddress // empty' "$HOME/.claude.json" 2>/dev/null || true)"
   if [[ -n "$claim" ]]; then
     ui="$(usage_for "$claim")"
@@ -1354,6 +1370,13 @@ main() {
     # PICK an ended seat, the guard in the loop below, does not cover it: the
     # seat was picked while it was alive and ended underneath the claim.
     rota_seat_ended "$BILLING_JSON" "$claim" && claim_ended=1
+    # ⚠️ A REFUSED CLAIM (usage API HTTP 403, latch t_tmembv) IS THE SAME SHAPE AS
+    # AN ENDED ONE: the account authenticates, reports nothing useful, and every
+    # request fails, so no percentage ever trips the wall. thea was the active
+    # claim when this happened and every pane stayed on it. Same path, same
+    # hysteresis, only the words differ (claim_refused).
+    claim_refused=0
+    [[ -n "$(rota_seat_refused_at "$USAGE_CACHE" "$claim")" ]] && { claim_refused=1; claim_ended=1; }
     if (( claim_ended )) \
        || { [[ -n "$wk" || -n "$se" ]] && { { [[ -n "$wk" ]] && (( wk >= AUTO_SWITCH_PCT )); } \
                                         || { [[ -n "$se" ]] && (( se >= AUTO_SWITCH_PCT )); }; }; }; then
@@ -1417,6 +1440,12 @@ main() {
         # perfectly complete and refresh cleanly on such a seat, so neither guard
         # above catches it: the account authenticates and then refuses the work.
         rota_seat_ended "$BILLING_JSON" "${LABELS[$j]}" && continue
+        # ⚠️ AND A REFUSED SEAT (usage API HTTP 403, latch t_tmembv) IS NEVER A
+        # TARGET: it authenticates and its quota looks healthy, but every request
+        # fails. This tick's fetch already skips it (no row), the cache marker is
+        # what keeps the rule true when a fetch is skipped, fails otherwise, or a
+        # row is borrowed from anywhere else.
+        [[ -z "$(rota_seat_refused_at "$USAGE_CACHE" "${LABELS[$j]}")" ]] || continue
         ui="$(usage_for "${LABELS[$j]}")"
         [[ -n "$ui" ]] || continue
         jwk="$(pct_int "${U_WK[$ui]}")"
@@ -1486,6 +1515,8 @@ main() {
         local trigger="at weekly ${wk:-?}% / 5h ${se:-?}% (threshold $AUTO_SWITCH_PCT%)"
         (( claim_ended )) \
           && trigger="ENDED $(rota_seat_field "$BILLING_JSON" "$claim" 2), the seat is over whatever quota it still reports"
+        (( claim_refused )) \
+          && trigger="REFUSED (usage API HTTP 403), the account cannot use Claude Code whatever quota it still reports"
         log "auto-switch: $claim $trigger → ${LABELS[$best]} (weekly ${best_wk}%, $why_clause, soonest-deadline pick above the ${AUTO_SWITCH_TARGET_MIN_LEFT_PCT}%-left floor)"
         set +e
         sw_out="$(bash "$FAILOVER" "${sw_args[@]}" 2>&1)"
@@ -1494,7 +1525,9 @@ main() {
         if (( sw_rc == 0 )); then
           st_switch="to:${LABELS[$best]}"
           printf '%s %s %s\n' "$(date +%s)" "${LABELS[$best]}" "$claim" > "$LAST_SWITCH_FILE"
-          if (( claim_ended )); then
+          if (( claim_refused )); then
+            notify_once "auto-switch" "Switched to ${LABELS[$best]}: $claim is REFUSED (usage API 403), it cannot use Claude Code."
+          elif (( claim_ended )); then
             notify_once "auto-switch" "Switched to ${LABELS[$best]}: $claim's seat ended $(rota_seat_field "$BILLING_JSON" "$claim" 2)."
           else
             notify_once "auto-switch" "Switched to ${LABELS[$best]}: $claim hit ${wk:-?}% weekly / ${se:-?}% 5h."
@@ -1507,7 +1540,7 @@ main() {
         fi
       elif [[ "$st_switch" == "none" ]]; then
         # persists tick after tick while the wall stands, log ONCE per state
-        log_once no-target "$claim:$wk:$se:$claim_ended" "auto-switch: $claim $( (( claim_ended )) && printf 'has ENDED' || printf "at weekly ${wk:-?}%% / 5h ${se:-?}%% ≥ $AUTO_SWITCH_PCT%%" ) but no eligible target (all above ${AUTO_SWITCH_TARGET_MAX_PCT}%, under the ${AUTO_SWITCH_TARGET_MIN_LEFT_PCT}%-left floor, ended, dead, or unmeasured)"
+        log_once no-target "$claim:$wk:$se:$claim_ended" "auto-switch: $claim $( if (( claim_refused )); then printf 'is REFUSED (HTTP 403)'; elif (( claim_ended )); then printf 'has ENDED'; else printf "at weekly ${wk:-?}%% / 5h ${se:-?}%% ≥ $AUTO_SWITCH_PCT%%"; fi ) but no eligible target (all above ${AUTO_SWITCH_TARGET_MAX_PCT}%, under the ${AUTO_SWITCH_TARGET_MIN_LEFT_PCT}%-left floor, ended, dead, or unmeasured)"
         st_switch="no-target"
       fi
     fi
