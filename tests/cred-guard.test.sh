@@ -86,15 +86,30 @@ write_identity "$POOL/personal" "$GM_EMAIL"
 write_identity "$SHARED" "$SH_EMAIL"
 
 # --- runner -----------------------------------------------------------------
+# A stub `security`: hermetic (never the developer's real keychain). It answers
+# `find-generic-password -s <svc>` with exit 0 only when <svc> is listed in
+# $FAKE_KC_SERVICES (colon separated); it can never print a value.
+cat >"$WORK/fake-security" <<'STUB'
+#!/usr/bin/env bash
+[ "${1:-}" = "find-generic-password" ] || exit 44
+svc=""; while [ $# -gt 0 ]; do [ "$1" = "-s" ] && svc="${2:-}"; shift; done
+case ":${FAKE_KC_SERVICES:-}:" in *":$svc:"*) exit 0 ;; esac
+exit 44
+STUB
+chmod +x "$WORK/fake-security"
 RC=0; OUT=""; ERR=""
 run_guard() {  # run_guard [args…]
   local outf="$WORK/out" errf="$WORK/err"
   RC=0
+  local secenv=(CLAUDE_CRED_GUARD_SECURITY_BIN="$WORK/fake-security")
+  [ -n "${UNSET_SECURITY_KNOB:-}" ] && secenv=()
   env HOME="$FAKE_HOME" \
       CLAUDE_FAILOVER_HOME="$CFG" \
       CLAUDE_POOL_DIR="$POOL" \
       CLAUDE_CRED_GUARD_KEEP="${KEEP_OVERRIDE:-10}" \
       CLAUDE_CRED_GUARD_NO_NOTIFY=1 \
+      ${secenv[@]+"${secenv[@]}"} \
+      FAKE_KC_SERVICES="${FAKE_KC_SERVICES:-}" \
       bash "$GUARD" "$@" >"$outf" 2>"$errf" || RC=$?
   OUT="$(cat "$outf")"; ERR="$(cat "$errf")"
 }
@@ -387,6 +402,100 @@ write_identity "$SHARED" "$SH_EMAIL"
 run_guard
 case "$OUT$ERR" in *"CREDENTIAL COLLISION"*) bad "collision clears once the shared dir moves to another account" ;;
                    *) ok "collision clears once the shared dir moves to another account" ;; esac
+
+# ── t_rkf7s7: a collision needs a credential on the shared side, not just an
+# identity. Durban 2026-10-18: ~/.claude.json still named the pool account, the
+# shared slot held NO credential (no file, no keychain item), and the guard
+# shouted COLLISION anyway, with a remedy (`rota switch`) that could not clear it.
+write_identity "$SHARED" "$CS_EMAIL"
+mv "$SHARED/.credentials.json" "$WORK/shared-cred.parked"
+run_guard
+case "$OUT$ERR" in *"CREDENTIAL COLLISION"*) bad "identity-only shared dir (no file, no keychain) is NOT a collision" ;;
+                   *) ok "identity-only shared dir (no file, no keychain) is NOT a collision" ;; esac
+[ "$RC" -eq 0 ] && ok "identity-only shared dir exits 0" || bad "identity-only shared dir exits 0 (got $RC)"
+[ ! -f "$CFG/cred-guard-report.txt" ] && ok "identity-only shared dir leaves no stale report" \
+  || bad "identity-only shared dir leaves no stale report"
+
+# A husk on the shared side holds no live chain either.
+write_husk "$SHARED"
+run_guard
+case "$OUT$ERR" in *"CREDENTIAL COLLISION"*) bad "a husk in the shared dir is NOT a collision" ;;
+                   *) ok "a husk in the shared dir is NOT a collision" ;; esac
+rm -f "$SHARED/.credentials.json"
+
+# A Keychain item for the shared dir IS a live second chain, and the report must
+# say so and must NOT offer `rota switch` as the fix.
+kc_svc="Claude Code-credentials-$(printf '%s' "$SHARED" | shasum -a 256 | cut -c1-8)"
+FAKE_KC_SERVICES="$kc_svc"; export FAKE_KC_SERVICES
+run_guard
+case "$OUT$ERR" in *"CREDENTIAL COLLISION"*) ok "shared Keychain item holding the account IS a collision" ;;
+                   *) bad "shared Keychain item holding the account IS a collision" ;; esac
+case "$OUT$ERR" in *"credential lives in: keychain"*) ok "collision says the shared credential lives in the keychain" ;;
+                   *) bad "collision says the shared credential lives in the keychain" ;; esac
+case "$OUT$ERR" in *"    rota switch work"*) ok "keychain collision keeps rota switch as THE command (it purges the shared keychain items)" ;;
+                   *) bad "keychain collision keeps rota switch as THE command (it purges the shared keychain items)" ;; esac
+case "$OUT$ERR" in *"    rota keeper"*) ok "keychain collision names rota keeper as the fallback" ;;
+                   *) bad "keychain collision names rota keeper as the fallback" ;; esac
+case "$OUT$ERR" in *"NOT touch the Keychain"*|*"drained separately"*) bad "keychain collision carries no false claim about rota switch and the keychain" ;;
+                   *) ok "keychain collision carries no false claim about rota switch and the keychain" ;; esac
+case "$OUT$ERR" in *"two credentials."*) ok "keychain collision headline says two credentials, not two files" ;;
+                   *) bad "keychain collision headline says two credentials, not two files" ;; esac
+case "$OUT$ERR" in *"two credential files"*) bad "keychain headline must not say files" ;; *) ok "keychain headline must not say files" ;; esac
+[ "$RC" -eq 2 ] && ok "keychain collision exits 2" || bad "keychain collision exits 2 (got $RC)"
+
+# The default-service item counts too.
+FAKE_KC_SERVICES="Claude Code-credentials"
+run_guard
+case "$OUT$ERR" in *"credential lives in: keychain"*) ok "default-service Keychain item counts as the shared credential" ;;
+                   *) bad "default-service Keychain item counts as the shared credential" ;; esac
+
+# Both file and keychain: say both.
+mv "$WORK/shared-cred.parked" "$SHARED/.credentials.json"
+run_guard
+case "$OUT$ERR" in *"credential lives in: file+keychain"*) ok "file and keychain both reported" ;;
+                   *) bad "file and keychain both reported" ;; esac
+# A file-only collision keeps the "two credential files" headline.
+FAKE_KC_SERVICES=""; export FAKE_KC_SERVICES
+run_guard
+case "$OUT$ERR" in *"two credential files"*) ok "file-only collision keeps the two credential files headline" ;;
+                   *) bad "file-only collision keeps the two credential files headline" ;; esac
+
+# A file -> keychain change of the same collision must re-notify: the dedupe
+# key carries where the shared credential lives.
+key_file="$(cat "$CFG/cred-guard-drift")"
+rm -f "$SHARED/.credentials.json"; FAKE_KC_SERVICES="$kc_svc"
+run_guard
+[ "$(cat "$CFG/cred-guard-drift")" != "$key_file" ] \
+  && ok "file to keychain change alters the collision dedupe key (re-notifies)" \
+  || bad "file to keychain change alters the collision dedupe key (re-notifies)"
+
+# A keychain item alone, with the shared identity matching NO pool dir, is not a
+# collision (nothing to race against).
+write_identity "$SHARED" "$SH_EMAIL"
+run_guard
+case "$OUT$ERR" in *"CREDENTIAL COLLISION"*) bad "keychain item + shared identity matching no pool dir is NOT a collision" ;;
+                   *) ok "keychain item + shared identity matching no pool dir is NOT a collision" ;; esac
+
+# Non-Darwin with the stub knob UNSET: the keychain is never probed. A `uname`
+# that says Linux and a `security` that records every call sit first in the
+# fake home's ~/.local/bin (the guard prepends it to PATH).
+mkdir -p "$FAKE_HOME/.local/bin"
+printf '#!/bin/sh\necho Linux\n' >"$FAKE_HOME/.local/bin/uname"
+printf '#!/bin/sh\necho called >>"%s/security-called"\nexit 0\n' "$WORK" >"$FAKE_HOME/.local/bin/security"
+chmod +x "$FAKE_HOME/.local/bin/uname" "$FAKE_HOME/.local/bin/security"
+rm -f "$WORK/security-called"
+write_identity "$SHARED" "$CS_EMAIL"
+UNSET_SECURITY_KNOB=1 run_guard
+[ ! -e "$WORK/security-called" ] \
+  && ok "non-Darwin with the knob unset never probes the keychain" \
+  || bad "non-Darwin with the knob unset never probes the keychain"
+case "$OUT$ERR" in *"CREDENTIAL COLLISION"*) bad "non-Darwin, no shared file: no collision" ;;
+                   *) ok "non-Darwin, no shared file: no collision" ;; esac
+rm -f "$FAKE_HOME/.local/bin/uname" "$FAKE_HOME/.local/bin/security"
+
+# Cleanup only: leave a clean baseline for anything appended below.
+FAKE_KC_SERVICES=""; write_identity "$SHARED" "$SH_EMAIL"
+run_guard
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

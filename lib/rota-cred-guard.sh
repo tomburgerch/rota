@@ -55,6 +55,10 @@
 #   CLAUDE_CRED_GUARD_KEEP      ring size (default 10)
 #   CLAUDE_POOL_DIR             pool root (default ~/.claude-pool)
 #   CLAUDE_CRED_GUARD_NO_NOTIFY 1 = never post a macOS notification
+#   CLAUDE_CRED_GUARD_SECURITY_BIN  the `security` binary used for every keychain
+#                               existence probe (default: security). When set it also
+#                               skips the Darwin check, so the suite never touches the
+#                               real keychain.
 
 set -euo pipefail
 
@@ -364,22 +368,64 @@ all_watched_dirs() {
   fi
 }
 
-# The drift report. Precise on purpose: which dir, who was expected, who
-# arrived, where the arrival was snapshotted, and BOTH remedies as commands you
-# can paste. Nothing here moves, copies over, or deletes anything.
+# Where does the SHARED dir actually hold a credential? Prints "file", "keychain",
+# "file+keychain" or nothing.
+#
+# The collision rule used to key on identity alone. But ~/.claude.json's
+# oauthAccount is the pool-v2 CLAIM POINTER by design: `rota switch` writes it
+# and adopt-shared keeps it (rota-engine.sh), so it always names the pool dir
+# that currently holds the claim. Under an identity-only rule every v2 box
+# therefore matched its claimed pool dir and raised a permanent false collision
+# (t_rkf7s7, Durban 2026-10-18), and that is also why `rota switch tommy`
+# "re-created" it: the switch rewrites the very pointer the rule read. A
+# collision needs a live refresh chain on the shared side: a complete file, or
+# a Keychain item (the default service or the shared dir's per-dir one).
+# Existence only, exit code of `security`, never a value.
+SECURITY_BIN="${CLAUDE_CRED_GUARD_SECURITY_BIN:-security}"
+# True when keychain probes may run: Darwin, or the suite's stub knob is set.
+security_available() {
+  { [ -n "${CLAUDE_CRED_GUARD_SECURITY_BIN:-}" ] || [ "$(uname -s 2>/dev/null)" = "Darwin" ]; } \
+    && command -v "$SECURITY_BIN" >/dev/null 2>&1
+}
+shared_credential_home() {
+  local where="" svc
+  if [ -f "$SHARED_DIR/.credentials.json" ] && cred_complete "$SHARED_DIR/.credentials.json"; then
+    where="file"
+  fi
+  if security_available; then
+    for svc in "Claude Code-credentials" \
+               "Claude Code-credentials-$(printf '%s' "$SHARED_DIR" | shasum -a 256 | cut -c1-8)"; do
+      if "$SECURITY_BIN" find-generic-password -s "$svc" >/dev/null 2>&1; then
+        where="${where:+$where+}keychain"
+        break
+      fi
+    done
+  fi
+  printf '%s' "$where"
+}
+
 # The collision report. Same contract as drift_report_for(): says exactly what
 # is doubled, why that guarantees a lockout rather than merely risking one, and
 # both remedies as pasteable commands. Moves nothing.
-collision_report_for() {  # collision_report_for <pool-dir> <shared-email>
-  local dir="${1:-}" acct="${2:-}" other
+collision_report_for() {  # collision_report_for <pool-dir> <shared-email> <where: file|keychain|file+keychain>
+  local dir="${1:-}" acct="${2:-}" where="${3:-file}"
 
-  printf 'CREDENTIAL COLLISION, one account, two credential files. This WILL husk one of them.\n'
+  if [ "$where" = "file" ]; then
+    printf 'CREDENTIAL COLLISION, one account, two credential files. This WILL husk one of them.\n'
+  else
+    printf 'CREDENTIAL COLLISION, one account, two credentials. This WILL husk one of them.\n'
+  fi
   printf '\n'
   printf '  account   : %s\n' "$acct"
-  printf '  shared    : %s\n' "$(tilde "$SHARED_DIR")"
+  if [ "$where" = "keychain" ]; then
+    printf '  shared    : %s   (credential lives in: keychain; the shared slot holds a Keychain\n' "$(tilde "$SHARED_DIR")"
+    printf '              credential, and ~/.claude.json names %s)\n' "$acct"
+  else
+    printf '  shared    : %s   (credential lives in: %s)\n' "$(tilde "$SHARED_DIR")" "$where"
+  fi
   printf '  pinned    : %s\n' "$(tilde "$dir")"
   printf '\n'
-  printf 'WHY THIS IS NOT MERELY UNTIDY. Both dirs hold their own .credentials.json for the\n'
+  printf 'WHY THIS IS NOT MERELY UNTIDY. Both places hold their own credential for the\n'
   printf 'SAME OAuth account. The refresh token is single-use: whichever process rotates\n'
   printf 'first invalidates the other copy. The loser then presents a dead token, gets a\n'
   printf '401, and the CLI hollows its file into a husk, that session is locked out until\n'
@@ -387,8 +433,14 @@ collision_report_for() {  # collision_report_for <pool-dir> <shared-email>
   printf 'shared dir, which is how a pane ends up racing a pinned one.\n'
   printf '\n'
   printf 'THE EXACT COMMAND (pool v2, the shared slot must hold NO credential; a pointer\n'
-  printf 'switch deletes the shared copy and moves only the claim, so this ENDS the race):\n'
+  printf 'switch deletes the shared file and both shared Keychain items and moves only the\n'
+  printf 'claim, so this ENDS the race):\n'
   printf '    rota switch %s\n' "$(basename "$dir")"
+  case "$where" in *keychain*)
+    printf 'The keeper also drains a shared Keychain item within one tick (every 10 minutes).\n'
+    printf 'Fallback, only if the item survives both (the switch deletes with the login name\n'
+    printf 'as account, so an item filed under another account name is left alone):\n'
+    printf '    rota keeper\n' ;; esac
   printf '\n'
   printf 'Older remedies, if you want to reason about it instead:\n'
   printf '\n'
@@ -408,6 +460,9 @@ collision_report_for() {  # collision_report_for <pool-dir> <shared-email>
   printf 'NOTHING WAS MOVED, COPIED OVER OR DELETED. Both credentials are in the ring.\n'
 }
 
+# The drift report. Precise on purpose: which dir, who was expected, who
+# arrived, where the arrival was snapshotted, and BOTH remedies as commands you
+# can paste. Nothing here moves, copies over, or deletes anything.
 drift_report_for() {  # drift_report_for <dir> <expected-label> <found-email>
   local dir="${1:-}" expect="${2:-}" found="${3:-}" key snap home_dir
   key="$(acct_key "$dir")"
@@ -491,16 +546,19 @@ detect_drift() {
     #
     # Like drift, this only DETECTS and REPORTS. Picking which side moves is a
     # judgement about live sessions, so it stays with the human.
-    local shared_ident=""
+    local shared_ident="" shared_where=""
     [ -d "$SHARED_DIR" ] && shared_ident="$(identity_of_dir "$SHARED_DIR")"
-    if [ -n "$shared_ident" ]; then
+    # Identity alone is not a credential: only collide when the shared side
+    # really holds a live chain (see shared_credential_home).
+    [ -n "$shared_ident" ] && shared_where="$(shared_credential_home)"
+    if [ -n "$shared_ident" ] && [ -n "$shared_where" ]; then
       for (( i = 0; i < ${#DIRS[@]}; i++ )); do
         dir="${DIRS[$i]}"
         [ "$dir" = "$SHARED_DIR" ] && continue
         [ -d "$dir" ] || continue
         [ "$(identity_of_dir "$dir")" = "$shared_ident" ] || continue
-        COLLISIONS+=("$dir|$shared_ident")
-        DRIFT_KEY="$DRIFT_KEY collide:$shared_ident@$dir;"
+        COLLISIONS+=("$dir|$shared_ident|$shared_where")
+        DRIFT_KEY="$DRIFT_KEY collide:$shared_ident@$dir:$shared_where;"
       done
     fi
   fi
@@ -551,12 +609,12 @@ EOF
   # keeper's keychain-unify step (first thing every 10-min tick) is the fixer,
   # so a hit here is normally gone within minutes. Nothing here reads an
   # item's VALUE, existence is probed by exit code only.
-  if [ "$(uname -s 2>/dev/null)" = "Darwin" ] && command -v security >/dev/null 2>&1; then
+  if security_available; then
     local kc_hash
     for (( i = 0; i < ${#DIRS[@]}; i++ )); do
       [ -d "${DIRS[$i]}" ] || continue
       kc_hash="$(printf '%s' "${DIRS[$i]}" | shasum -a 256 | cut -c1-8)"
-      if security find-generic-password -s "Claude Code-credentials-$kc_hash" >/dev/null 2>&1; then
+      if "$SECURITY_BIN" find-generic-password -s "Claude Code-credentials-$kc_hash" >/dev/null 2>&1; then
         printf 'NOTE: a per-dir Keychain item exists for %s ("Claude Code-credentials-%s"), a second copy of %s'\''s refresh chain. The keeper drains it on its next tick (or run `rota keeper` now).\n' \
           "$(tilde "${DIRS[$i]}")" "$kc_hash" "${LABELS[$i]}"
       fi
@@ -594,8 +652,8 @@ EOF
   fi
   if [ "${#COLLISIONS[@]}" -gt 0 ]; then
     for i in "${COLLISIONS[@]}"; do
-      IFS='|' read -r dir found <<<"$i"
-      report="$report$(collision_report_for "$dir" "$found")"$'\n'
+      IFS='|' read -r dir found where <<<"$i"
+      report="$report$(collision_report_for "$dir" "$found" "$where")"$'\n'
     done
   fi
   mkdir -p "$CFG_DIR"
