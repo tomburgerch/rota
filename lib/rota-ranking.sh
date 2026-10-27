@@ -265,6 +265,56 @@ rota_roll_forward_weekly() {  # rota_roll_forward_weekly <seen-iso> [now-epoch] 
     || date -u -d "@$(( epoch + k * week ))" '+%Y-%m-%dT%H:%M:%S+00:00' 2>/dev/null || true
 }
 
+# ── A REFUSED SEAT: the usage API answers HTTP 403 ───────────────────────────
+#
+# latch t_tmembv. A seat whose organisation has disabled Claude subscription
+# access still AUTHENTICATES, and its cached quota numbers look perfectly
+# healthy, but every Claude request fails with 403 `oauth_org_not_allowed`
+# ("Your organization has disabled Claude subscription access for Claude
+# Code"). The same seat answers the usage API with HTTP 403 (measured: the
+# keeper log shows `usage fetch tartare@codeandstate.com: HTTP 403` every tick
+# from 2026-09-02, the day after that seat ended). On 2026-09-06 21:50 `rota
+# billing` printed `USE NEXT rota switch thea` for such a seat, 16 minutes after
+# it died and BEFORE its billing.json end date, so rota_seat_ended could not
+# catch it.
+#
+# 403 is not staleness (401 / an expired token is recoverable, one session or a
+# nudge rotates it) and not rate limiting (429). It means the account cannot
+# use Claude Code, and the quota it reports cannot be spent.
+#
+# The refusal is stored IN THE USAGE-CACHE ROW as `refused_at` (ISO instant it
+# was FIRST seen) and `refused_http`. That is the simplest durable place: both
+# writers (engine cache_flush, keeper fetch_usage) already own that file, every
+# reader already opens it, and a refusal must outlive a cached "healthy" row so
+# that a run reading only cache (--no-refresh, a 429, a peer row) still knows.
+# A later SUCCESSFUL live fetch clears it for free: rota_cache_merge_row builds
+# the row from scratch (plus wk_r_seen only), so it never carries refused_*
+# forward. Nothing else may clear it.
+#
+# Prints the cache JSON with the marker set. The FIRST sighting wins for
+# `refused_at` ("since"), later 403s leave it alone. Prints nothing and returns
+# non-zero when jq refuses (same contract as rota_cache_merge_row).
+rota_cache_mark_refused() {  # rota_cache_mark_refused <cache-json> <email> <iso-now> [http]
+  local out
+  out="$(jq --arg e "${2:-}" --arg at "${3:-}" --arg h "${4:-403}" \
+            '.[$e] = ((.[$e] // {}) as $prev
+              | $prev + {refused_at: (if (($prev.refused_at // "") != "") then $prev.refused_at else $at end),
+                         refused_http: $h})' <<<"${1:-\{\}}" 2>/dev/null)" || return 1
+  [[ -n "$out" ]] || return 1
+  printf '%s' "$out"
+}
+
+# When was this seat first seen refused? Prints the ISO instant, or NOTHING when
+# the seat is not refused (no cache file, no jq, no row, no marker all read the
+# same as "not refused": a quota tool must not start failing for want of a cache).
+# THE one predicate: the engine (ranking, rows, pane restarts), the keeper's
+# auto-switch picker and, through the engine's JSON, `rota billing` all ask it.
+rota_seat_refused_at() {  # rota_seat_refused_at <usage-cache-file> <email>
+  [[ -r "${1:-}" && -n "${2:-}" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  jq -r --arg e "$2" '(.[$e].refused_at // "")' "$1" 2>/dev/null || true
+}
+
 # ── THE USAGE-CACHE ROW, MERGED ──────────────────────────────────────────────
 #
 # ONE merge, because there are TWO writers: rota-engine.sh's cache_flush (once

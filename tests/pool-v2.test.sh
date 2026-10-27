@@ -584,7 +584,7 @@ grep -q "switch=to:$(email_of primary)" "$RUN/cfg/keeper-status" \
 [ -n "$(jq -r --arg e "$(email_of wk)" '.[$e].refused_at // empty' "$RUN/cfg/usage-cache.json" 2>/dev/null)" ] \
   && ok "keeper refused → the 403 is recorded in the usage cache (refused_at), for every other reader" \
   || bad "keeper refused → cache marker (got: $(cat "$RUN/cfg/usage-cache.json" 2>/dev/null))"
-grep -q "refused" "$RUN/cfg/keeper.log" \
+grep -qi "refused" "$RUN/cfg/keeper.log" \
   && ok "keeper refused → the log names the refusal" \
   || bad "keeper refused → log line (got: $(cat "$RUN/cfg/keeper.log" 2>/dev/null))"
 # a later 200 clears it (the merge writer rebuilds the row without the marker)

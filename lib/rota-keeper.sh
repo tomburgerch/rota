@@ -1005,9 +1005,28 @@ fetch_usage() {  # fetch_usage <label> <dir>
       # a persistently failing token (the live 401s) repeats every tick,
       # log ONCE per label+code, re-armed by the next successful fetch
       log_once "usage-${label//[^A-Za-z0-9]/_}" "$http" "usage fetch $label: HTTP ${http:-none}"
+      # ⚠️ 403 IS A REFUSAL, NOT STALENESS (latch t_tmembv): the seat's organisation
+      # disabled Claude subscription access, so it authenticates, its cached quota
+      # looks healthy, and every request fails. Written into the usage cache (the
+      # SAME record rota-engine.sh reads) so the dashboard, `rota billing`, the
+      # engine's recommendation and the pane restarts all see it, and it outlives
+      # this tick. Only a later HTTP 200 clears it (rota_cache_merge_row, below).
+      if [[ "$http" == "403" ]]; then
+        local rdata rmerged rnow
+        rnow="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+        mkdir -p "$CFG_DIR"
+        rdata="$(cat "$USAGE_CACHE" 2>/dev/null || echo '{}')"
+        jq -e . <<<"$rdata" >/dev/null 2>&1 || rdata='{}'
+        if rmerged="$(rota_cache_mark_refused "$rdata" "$label" "$rnow" 403)"; then
+          printf '%s' "$rmerged" > "$USAGE_CACHE.tmp.$$" 2>/dev/null \
+            && mv "$USAGE_CACHE.tmp.$$" "$USAGE_CACHE" || rm -f "$USAGE_CACHE.tmp.$$"
+          log_once "refused-${label//[^A-Za-z0-9]/_}" "403" "seat REFUSED $label: usage API HTTP 403, the account cannot use Claude Code; never an auto-switch target until a fetch succeeds"
+        fi
+      fi
       return 0
     fi
     log_state_clear "usage-${label//[^A-Za-z0-9]/_}"
+    log_state_clear "refused-${label//[^A-Za-z0-9]/_}"
     json="${resp%$'\n'*}"
   fi
   [[ -n "$json" ]] || return 0
@@ -1417,6 +1436,12 @@ main() {
         # perfectly complete and refresh cleanly on such a seat, so neither guard
         # above catches it: the account authenticates and then refuses the work.
         rota_seat_ended "$BILLING_JSON" "${LABELS[$j]}" && continue
+        # ⚠️ AND A REFUSED SEAT (usage API HTTP 403, latch t_tmembv) IS NEVER A
+        # TARGET: it authenticates and its quota looks healthy, but every request
+        # fails. This tick's fetch already skips it (no row), the cache marker is
+        # what keeps the rule true when a fetch is skipped, fails otherwise, or a
+        # row is borrowed from anywhere else.
+        [[ -z "$(rota_seat_refused_at "$USAGE_CACHE" "${LABELS[$j]}")" ]] || continue
         ui="$(usage_for "${LABELS[$j]}")"
         [[ -n "$ui" ]] || continue
         jwk="$(pct_int "${U_WK[$ui]}")"

@@ -2549,6 +2549,25 @@ cache_flush() {
   CACHE_PEND_EMAIL=(); CACHE_PEND_WKU=(); CACHE_PEND_WKR=(); CACHE_PEND_SEU=(); CACHE_PEND_SER=()
 }
 
+# Record a usage-API 403 against the seat in the usage cache, NOW, not at the
+# end-of-run flush: the refusal is the one thing that must survive even a run
+# that dies half way. See rota_cache_mark_refused (rota-ranking.sh) for the shape
+# and for why a later live fetch clears it without anyone having to.
+cache_mark_refused() {  # cache_mark_refused <email> <iso-now>
+  [[ -n "${1:-}" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  mkdir -p "$CFG_DIR"
+  local data merged
+  data="$(cat "$USAGE_CACHE" 2>/dev/null || echo '{}')"
+  jq -e . <<<"$data" >/dev/null 2>&1 || data='{}'
+  if merged="$(rota_cache_mark_refused "$data" "$1" "${2:-}" 403)"; then
+    printf '%s' "$merged" > "$USAGE_CACHE.tmp.$$" 2>/dev/null \
+      && mv "$USAGE_CACHE.tmp.$$" "$USAGE_CACHE" || rm -f "$USAGE_CACHE.tmp.$$"
+  else
+    cache_merge_warn
+  fi
+}
+
 C_WKU=""; C_WKR=""; C_SEU=""; C_SER=""; C_TS=""; C_TE=""; C_WKR_SEEN=""
 cache_get() {  # cache_get <email> → C_* globals
   C_WKU=""; C_WKR=""; C_SEU=""; C_SER=""; C_TS=""; C_TE=""; C_WKR_SEEN=""
@@ -3142,6 +3161,20 @@ seat_ended() {  # seat_ended <slot-index>
   rota_seat_ended "$BILLING_JSON" "${U_EMAIL[$1]:-}"
 }
 
+# Is the seat REFUSED: did the usage API answer it HTTP 403, so the account
+# cannot use Claude Code and any quota it reports cannot be spent? Read out of
+# U_REFUSED, which collect_usage fills from the usage cache (the durable record,
+# see rota_seat_refused_at in rota-ranking.sh) and from this run's own 403.
+# Like seat_ended it is a fact about the ACCOUNT, so it outranks every number.
+seat_refused() {  # seat_refused <slot-index>
+  [[ -n "${U_REFUSED[$1]:-}" ]]
+}
+
+REFUSED_TEXT_PREFIX="seat refused: usage API HTTP 403, the account cannot use Claude Code (its organisation disabled subscription access); quota it reports cannot be spent"
+refused_why() {  # refused_why <slot-index>
+  printf '%s, first seen %s' "$REFUSED_TEXT_PREFIX" "${U_REFUSED[$1]}"
+}
+
 # Temporary limit changes the vendor announces on its own site and no API
 # reports.
 #
@@ -3354,11 +3387,12 @@ collect_usage() {
   U_EMAIL=(); U_STATE=(); U_WKU=(); U_WKR=(); U_SEU=(); U_SER=()
   U_WKX=(); U_SEX=(); U_WHY=(); U_TS=(); U_VIA=(); U_DUP=()
   U_WKK=(); U_WKS=(); U_SDR=(); U_SRC=(); U_MEAS=(); U_WKP=(); U_WKPF=(); U_WAU=(); U_WAR=(); U_WSC=()
+  U_REFUSED=()
   for i in "${!DIRS[@]}"; do
     U_EMAIL[i]=""; U_STATE[i]="none"; U_WKU[i]=""; U_WKR[i]=""; U_SEU[i]=""; U_SER[i]=""
     U_WKX[i]=0; U_SEX[i]=0; U_WHY[i]=""; U_TS[i]=""; U_VIA[i]=""; U_DUP[i]=-1
     U_WKK[i]=""; U_WKS[i]=""; U_SDR[i]=""; U_AGE[i]=""; U_SRC[i]=""; U_MEAS[i]=""
-    U_WKP[i]=""; U_WKPF[i]=""; U_WAU[i]=""; U_WAR[i]=""; U_WSC[i]=""
+    U_WKP[i]=""; U_WKPF[i]=""; U_WAU[i]=""; U_WAR[i]=""; U_WSC[i]=""; U_REFUSED[i]=""
   done
 
   # the shared credential FIRST: it is both the identity fingerprint and the row
@@ -3394,6 +3428,10 @@ collect_usage() {
       if [[ "${U_EMAIL[$j]}" == "$email" ]] && (( U_DUP[j] < 0 )); then U_DUP[i]=$j; break; fi
     done
     if (( U_DUP[i] >= 0 )); then U_STATE[i]="dup"; continue; fi
+    # The durable refusal record, read BEFORE any branch below can `continue`, so
+    # --no-refresh, a 429 and a peer row all still know the seat was refused. Only
+    # a live HTTP 200 with numbers (below) lifts it.
+    U_REFUSED[i]="$(rota_seat_refused_at "$USAGE_CACHE" "$email")"
 
     # v2: shared slot is credential-free / stashes are read-only history, the
     # v1 SELF-HEAL ON READ (heal_pool_credential, 2026-08-07) is short-circuited
@@ -3544,6 +3582,9 @@ collect_usage() {
       else
         U_STATE[i]="live"
         U_MEAS[i]="$RUN_MEASURED_AT"
+        # a live 200 with numbers lifts a refusal; cache_put's flush rebuilds the
+        # row without refused_at (rota_cache_merge_row), this is the in-memory twin
+        U_REFUSED[i]=""
         # BEFORE cache_put's flush, deliberately: project_weekly reads the row on
         # disk, which still holds the PREVIOUS reading, and that is exactly the
         # instant a fresh window has to be projected from.
@@ -3551,6 +3592,18 @@ collect_usage() {
         cache_put "$email" "${U_WKU[$i]}" "${U_WKR[$i]}" "${U_SEU[$i]}" "${U_SER[$i]}"
         continue
       fi
+    fi
+
+    # ⚠️ HTTP 403 IS A REFUSAL, NOT STALENESS (latch t_tmembv). The organisation
+    # disabled Claude subscription access: the seat authenticates, the cached
+    # numbers look healthy, and every request fails. Not a 401 (recoverable), not
+    # a 429 (rate limit), and an EXPIRED token is left to its own branch below
+    # exactly as before. Recorded in the usage cache at once, so it outlives this
+    # run and any healthy-looking cached row; the U_WHY text is set by the pass
+    # after the loop, from U_REFUSED, so a cache-only run words it identically.
+    if [[ "$http" == "403" && -z "$json" && -z "$tok_expired_ago" ]]; then
+      [[ -n "${U_REFUSED[$i]}" ]] || U_REFUSED[i]="$RUN_MEASURED_AT"
+      cache_mark_refused "$email" "${U_REFUSED[$i]}"
     fi
 
     # not live → fall back to the last-good cached numbers, age-marked, with any
@@ -3635,6 +3688,14 @@ collect_usage() {
   # LAST, and only for the rows still blank or still cached: everything above is
   # what this box can measure itself, and a local live fetch outranks any peer.
   # Deliberately before cache_flush only in reading order, it queues nothing.
+  # A refused seat says so, whatever else this run learned about it (a stale-token
+  # message, a 429, "--no-refresh: cached numbers only"): the refusal is the fact
+  # that decides everything downstream. Wording has no "429" and no "access token
+  # expired", which weekly_unknown reads to mean "just unmeasured".
+  for i in "${!DIRS[@]}"; do
+    [[ "${U_STATE[$i]}" == "live" || "${U_STATE[$i]}" == "dup" ]] && continue
+    seat_refused "$i" && U_WHY[i]="$(refused_why "$i")"
+  done
   peer_fill
   cache_flush
   return 0   # the loop can end on a false window_expired test, never leak that as a failure
@@ -4160,6 +4221,13 @@ compute_recommendation() {  # compute_recommendation <exclude_active 0|1> <requi
     if seat_ended "$i"; then
       U_REASON[i]="the seat itself ended $(seat_ends_on "$i"); quota it still reports cannot be spent"; continue
     fi
+    # ⚠️ AND BEFORE THE LIVE/CACHED GATE FOR THE SAME REASON: a seat whose usage
+    # API answers 403 is dead for Claude Code however healthy its cached quota
+    # looks, and the allow_cached second pass below would otherwise readmit it on
+    # those very numbers (latch t_tmembv, 2026-09-06).
+    if seat_refused "$i"; then
+      U_REASON[i]="seat refused (usage API HTTP 403 since ${U_REFUSED[$i]}); quota it reports cannot be spent"; continue
+    fi
     if [[ "${U_STATE[$i]}" != "live" ]]; then
       # `peer` rides with `cached`, in BOTH directions: it is admitted only on the
       # second (allow_cached) pass switch-auto makes, and the strict live-only
@@ -4535,6 +4603,9 @@ short_reason() {  # short_reason <slot-index>
       # refreshes each. See the seat-lifecycle block near the top.
       if seat_ended "$i"; then
         printf 'seat ended %s' "$(seat_ends_on "$i")"; return 0
+      fi
+      if seat_refused "$i"; then
+        printf 'refused, HTTP 403'; return 0
       fi
       if (( U_WKX[i] == 1 )); then
         # Never "expired", the WINDOW rolled, which is the opposite of bad: the
@@ -4925,6 +4996,7 @@ render_usage_table() {
     (( SHARED_SLOT >= 0 )) && (( i == SHARED_SLOT )) && continue
     if (( U_REC[i] == 1 )); then alts="$alts $i"
     elif seat_ended "$i"; then unav="$unav $i"
+    elif seat_refused "$i"; then unav="$unav $i"
     elif weekly_unknown "$i" && [[ "${U_STATE[$i]}" != "dup" ]]; then unmeas="$unmeas $i"
     else unav="$unav $i"; fi
   done
@@ -5934,6 +6006,13 @@ pane_seat_cannot_serve() {  # pane_seat_cannot_serve <pool-dir> <email>
     PANE_SEAT_WHY="its seat ENDED $(rota_seat_field "$BILLING_JSON" "$id" 2)"
     return 0
   fi
+  # A REFUSED seat (usage API 403) cannot serve a pane either, and a restart must
+  # never land on one: read straight from the usage cache, no network.
+  local refused_at; refused_at="$(rota_seat_refused_at "$USAGE_CACHE" "$id")"
+  if [[ -n "$refused_at" ]]; then
+    PANE_SEAT_WHY="its seat is REFUSED (usage API HTTP 403 since $refused_at), the account cannot use Claude Code"
+    return 0
+  fi
   if [[ -d "$dir" ]] && ! cred_is_complete "$dir/.credentials.json"; then
     PANE_SEAT_WHY="its credential is dead or a husk"
     return 0
@@ -6186,12 +6265,13 @@ json_usage() {
     # from "unmeasured" either, and the dashboard reads this object.
     # `unmeasured` is the state the table now calls UNMEASURED; `seat.ended` is
     # the only field that means the account is actually done.
-    local seat_status seat_ends seat_done unmeasured
+    local seat_status seat_ends seat_done unmeasured seat_refused_json=false seat_refused_at=""
     seat_status="$(seat_field "${U_EMAIL[$i]}" 1)"; : "${seat_status:=active}"
     seat_ends="$(seat_ends_on "$i")"
     seat_done=false; seat_ended "$i" && seat_done=true
+    seat_refused "$i" && { seat_refused_json=true; seat_refused_at="${U_REFUSED[$i]}"; }
     unmeasured=false
-    if [[ "$seat_done" == false ]] && weekly_unknown "$i" && [[ "${U_STATE[$i]}" != "dup" ]]; then
+    if [[ "$seat_done" == false && "$seat_refused_json" == false ]] && weekly_unknown "$i" && [[ "${U_STATE[$i]}" != "dup" ]]; then
       unmeasured=true
     fi
     logged_in=false; slot_logged_in "$i" && logged_in=true
@@ -6202,6 +6282,7 @@ json_usage() {
       --argjson logged_in "$logged_in" --argjson is_live "$is_live" \
       --argjson is_stale "$is_stale" \
       --argjson seat_done "$seat_done" --argjson unmeasured "$unmeasured" \
+      --argjson seat_refused "$seat_refused_json" --arg seat_refused_at "$seat_refused_at" \
       --arg seat_status "$seat_status" --arg seat_ends "$seat_ends" \
       --arg label "${LABELS[$i]}" \
       --arg email "${U_EMAIL[$i]}" \
@@ -6233,7 +6314,8 @@ json_usage() {
         current:$active, loggedIn:$logged_in, live:$is_live, stale:$is_stale,
         unmeasured:$unmeasured,
         seat:{status:$seat_status, ends:(if $seat_ends=="" then null else $seat_ends end),
-              ended:$seat_done},
+              ended:$seat_done, refused:$seat_refused,
+              refused_at:(if $seat_refused_at=="" then null else $seat_refused_at end)},
         data:$state, cached_at:(if $cached_at=="" then null else $cached_at end),
         quota_data:$state,
         quota_source:(if $src=="" then null else $src end),
