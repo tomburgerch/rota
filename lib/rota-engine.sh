@@ -2345,14 +2345,22 @@ five_h_clause() {  # five_h_clause <slot-index>
   printf '; 5h %s%% used · %s%% left' "$(used "${U_SEU[$i]}")" "$sl"
 }
 
-# The health-floor text: the 5h half only when some row in the pool has a 5h value.
-health_floor_text() {
-  local i has5=0
+# The health-floor text: the 5h half only when some row that could still be
+# picked (not a duplicate, ended, refused, or with an expired 5h window) has a 5h
+# value. Mode "die" is the wording of the `switch` die texts (no trailing "left").
+health_floor_text() {  # health_floor_text [die]
+  local i has5=0 mode="${1:-}"
   for i in "${!U_SEU[@]}"; do
     [[ "${U_STATE[$i]:-}" == "dup" ]] && continue
+    seat_ended "$i" && continue
+    seat_refused "$i" && continue
+    (( ${U_SEX[$i]:-0} )) && continue
     [[ -n "$(remaining "${U_SEU[$i]}")" ]] && { has5=1; break; }
   done
-  if (( has5 )); then printf '>=%s%% weekly, >=%s%% 5h left' "$MIN_WEEKLY" "$MIN_SESSION"
+  if [[ "$mode" == die ]]; then
+    if (( has5 )); then printf '>=%s%% weekly, >=%s%% 5h' "$MIN_WEEKLY" "$MIN_SESSION"
+    else printf '>=%s%% weekly' "$MIN_WEEKLY"; fi
+  elif (( has5 )); then printf '>=%s%% weekly, >=%s%% 5h left' "$MIN_WEEKLY" "$MIN_SESSION"
   else printf '>=%s%% weekly left' "$MIN_WEEKLY"; fi
 }
 
@@ -4740,7 +4748,7 @@ render_verbose_detail() {  # render_verbose_detail <slot-index>
     local all_reset=""
     [[ -n "$(all_models_note "$i")" && -n "${U_WAR[$i]:-}" ]] \
       && all_reset=" · all models $(reset_phrase "${U_WAR[$i]}")"
-    printf '%s\n' "$(paint "$CLR_DIM" "${pfx}resets  weekly $(weekly_reset_phrase "$i")${all_reset}$(no_5h_window "$i" || printf ' · 5h %s' "$(reset_phrase "${U_SER[$i]}")"))")"
+    printf '%s\n' "$(paint "$CLR_DIM" "${pfx}resets  weekly $(weekly_reset_phrase "$i")${all_reset}$(no_5h_window "$i" || printf ' · 5h %s' "$(reset_phrase "${U_SER[$i]}")")")"
   fi
   [[ -n "${U_VIA[$i]}" ]] && printf '%s\n' "$(paint "$CLR_DIM" "${pfx}note    ${U_VIA[$i]}")"
   [[ "${U_STATE[$i]}" != "live" && -n "${U_WHY[$i]}" ]] \
@@ -6263,6 +6271,8 @@ json_usage() {
     # guessing: fresh=true is "100% left, the window has not started" (remaining_pct
     # is 100, used_pct 0), fresh=false with a null resets_at and null percentages is
     # "we do not know". Additive, nothing existing is renamed or removed.
+    # A null five_hour next to a numeric weekly means the plan has NO 5h window
+    # (Ultra, 2026-10-30), not missing data; consumers (pocketmux) read it so.
     wk_fresh=false; se_fresh=false
     window_fresh "${U_WKU[$i]}" "${U_WKR[$i]}" "${U_WKX[$i]}" && wk_fresh=true
     window_fresh "${U_SEU[$i]}" "${U_SER[$i]}" "${U_SEX[$i]}" && se_fresh=true
@@ -6768,9 +6778,9 @@ main() {
         # screen, so pointing at another command would be the round trip this
         # change exists to remove.
         if (( quiet )); then
-          die "no other account clearing the health floor ($(health_floor_text); current: ${SHARED_EMAIL:-unknown}), on live OR cached numbers, see \`rota usage\`"
+          die "no other account clearing the health floor ($(health_floor_text die); current: ${SHARED_EMAIL:-unknown}), on live OR cached numbers, see \`rota usage\`"
         fi
-        die "no other account clearing the health floor ($(health_floor_text); current: ${SHARED_EMAIL:-unknown}), on live OR cached numbers, each account's numbers and the reason it was skipped are in the rows above."
+        die "no other account clearing the health floor ($(health_floor_text die); current: ${SHARED_EMAIL:-unknown}), on live OR cached numbers, each account's numbers and the reason it was skipped are in the rows above."
       fi
       # a FRESH pick has no reset instant; printing "weekly resets " with nothing after
       # it would read as a lost timestamp rather than as an unstarted window

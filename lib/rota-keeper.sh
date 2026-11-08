@@ -1513,8 +1513,7 @@ main() {
         # "weekly ?% / 5h ?% (threshold 90%)" - a switch attributed to a wall it
         # never hit, in the one log line that explains an unattended 03:00 move.
         # no 5h window (Ultra, t_zwv49y): the 5h half is left out, never "5h ?%"
-        local se_part=""; [[ -n "$se" ]] && se_part=" / 5h ${se}%"
-        local trigger="at weekly ${wk:-?}%${se_part} (threshold $AUTO_SWITCH_PCT%)"
+        local trigger="at weekly ${wk:-?}%${se:+ / 5h ${se}%} (threshold $AUTO_SWITCH_PCT%)"
         (( claim_ended )) \
           && trigger="ENDED $(rota_seat_field "$BILLING_JSON" "$claim" 2), the seat is over whatever quota it still reports"
         (( claim_refused )) \
