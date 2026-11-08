@@ -23,8 +23,9 @@ KEEPER_LOCK_STALE_SECS=1800
 
 # ── auto-switch (step 4) ────────────────────────────────────────────────────
 
-# When the ACTIVE seat's weekly OR five-hour utilization reaches this percent,
-# the keeper moves the launch pointer to another seat.
+# When the ACTIVE seat's weekly OR five-hour utilization reaches this
+# percent, the keeper moves the launch pointer to another seat. The five-hour
+# part applies only to plans that still have a 5h window (Ultra has none).
 AUTO_SWITCH_PCT=90
 
 # 1 = after switching, restart IDLE panes that are on a seat that CANNOT SERVE
@@ -52,8 +53,9 @@ AUTO_SWITCH_BOUNCE_SECS=1800
 # ── pane convergence (step 4b, tmux only) ───────────────────────────────────
 
 # 1 = each tick, restart idle tmux panes whose claude process sits on a seat
-# that CANNOT SERVE it: limited (weekly or 5h at or above AUTO_SWITCH_PCT, read
-# from the usage cache), ended, or a dead/husk credential. A pane on a healthy
+# that CANNOT SERVE it: limited (weekly, or 5h where the plan has one, at or
+# above AUTO_SWITCH_PCT, read from the usage cache), ended, or a dead/husk
+# credential. A pane on a healthy
 # seat that is simply not the active one is left alone and logged as "left on
 # <seat> (healthy, not the active seat)". A pane whose claude carries
 # CLAUDE_SEAT_OVERRIDE=1 (an explicit pick of a reserved seat, set by Dazzle
@@ -81,7 +83,8 @@ KEEPALIVE_MIN=90
 
 # ── window warming (step 6) ─────────────────────────────────────────────────
 
-# The five-hour window starts at the first request. At the first tick at or
+# The five-hour window (only plans that still have one; Ultra seats have none
+# and are never warmed) starts at the first request. At the first tick at or
 # after this local time (HH:MM), each cold seat gets exactly ONE minimal
 # request so a window opened at 03:00 has reset again by 08:00 and the
 # morning starts against a fresh one. Once per day per seat.

@@ -2354,6 +2354,56 @@ grep -Eq "^$TS_RE disabled" "$RUN/cfg/keeper-status" \
   && ok "local-time → the disabled status line is local-stamped too" \
   || bad "local-time → disabled stamp (got: $(cat "$RUN/cfg/keeper-status"))"
 
+# ── 8. keeper: a seat with NO 5-hour window (Ultra, latch t_zwv49y) ──────────
+# The usage API returns seven_day only. Nothing may print "5h ?%" or "?% 5h", the
+# claim over the wall still switches, and warming makes no call for such a seat.
+usage7() {  # usage7 <alias> <weekly-util> [weekly-resets-iso]
+  printf '{"seven_day":{"utilization":%s,"resets_at":"%s"}}' "$2" "${3:-$(iso_in +3d)}" \
+    > "$FAKE_STATE/usage-$(email_of "$1").json"
+}
+mk_pool no5h
+usage7 alpha   91
+usage7 primary 34 "$(iso_in +2d)"
+usage7 wk       6
+usage7 team    49
+run_keeper "${keeper_env[@]}"
+grep -q "switch=to:$(email_of primary)" "$RUN/cfg/keeper-status" \
+  && ok "no 5h window (keeper) → the claim at 91% weekly still auto-switches" \
+  || bad "no 5h window (keeper) → switch (status: $(cat "$RUN/cfg/keeper-status"))"
+NOTE="$(cat "$RUN/cfg/keeper-notified-auto-switch" 2>/dev/null || true)"
+[ -n "$NOTE" ] && ! grep -qE '5h|\?' <<<"$NOTE" && grep -q '91% weekly' <<<"$NOTE" \
+  && ok "no 5h window (keeper) → the notification has no 5h part and no '?' (got: $NOTE)" \
+  || bad "no 5h window (keeper) → notification (got: $NOTE)"
+SWLOG="$(grep 'auto-switch:' "$RUN/cfg/keeper.log" | grep -- '→' | head -1)"
+[ -n "$SWLOG" ] && ! grep -qE '5h|\?%' <<<"$SWLOG" \
+  && ok "no 5h window (keeper) → the trigger log has no 5h and no '?%'" \
+  || bad "no 5h window (keeper) → trigger log (got: $SWLOG)"
+# no eligible target: the no-target line names the weekly wall only
+mk_pool no5hwall
+usage7 alpha   91
+usage7 primary 95
+usage7 wk      95
+usage7 team    95
+run_keeper "${keeper_env[@]}"
+NTLOG="$(grep 'auto-switch:' "$RUN/cfg/keeper.log" | head -1)"
+[ -n "$NTLOG" ] && grep -q 'no eligible target' <<<"$NTLOG" && ! grep -qE '5h|\?%' <<<"$NTLOG" \
+  && ok "no 5h window (keeper) → the no-target log has no 5h and no '?%'" \
+  || bad "no 5h window (keeper) → no-target log (got: $NTLOG)"
+# warming: a cold-looking seat that simply has no 5h window is never nudged, and
+# the pass still completes (marker written, not 'retry')
+mk_pool no5hwarm
+usage7 alpha 10
+usage7 primary 10
+usage7 wk 10
+usage7 team 10
+run_keeper "${warm_env[@]}"
+{ [ ! -s "$FAKE_STATE/claude-calls" ] || ! grep -q . "$FAKE_STATE/claude-calls"; } \
+  && ok "no 5h window (warming) → no nudge for a seat without a 5h window" \
+  || bad "no 5h window (warming) → nudged (calls: $(cat "$FAKE_STATE/claude-calls"))"
+grep -q 'warmed=0' "$RUN/cfg/keeper-status" && ls "$RUN/cfg"/warmed-* >/dev/null 2>&1 \
+  && ok "no 5h window (warming) → the pass is decided (warmed=0, marker written), not retried every tick" \
+  || bad "no 5h window (warming) → decided (status: $(cat "$RUN/cfg/keeper-status"))"
+
 export HOME="$REAL_HOME"
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

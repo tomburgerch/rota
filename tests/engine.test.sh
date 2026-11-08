@@ -1554,7 +1554,9 @@ EOF
 printf '{"seven_day":{"utilization":18,"resets_at":"%s"},"five_hour":{"utilization":23,"resets_at":"%s"}}' \
   "$(iso_in +2d)" "$(iso_in +2H)" > "$RUN/state/usage-TOK-INC-SHARED.json"
 # no usage-TOK-INC-DEAD.json on purpose: the fake curl answers "\n000", a failed fetch
-printf '{"seven_day":{"utilization":40,"resets_at":"%s"},"five_hour":{"resets_at":"%s"}}' \
+# weekly UNMEASURED but a 5h value present: still incomplete. (A 200 with a weekly
+# and NO 5h is no longer incomplete: that is an Ultra seat, section 19b.)
+printf '{"seven_day":{"resets_at":"%s"},"five_hour":{"utilization":40,"resets_at":"%s"}}' \
   "$(iso_in +2d)" "$(iso_in +2H)" > "$RUN/state/usage-TOK-INC-PARTIAL.json"
 set +e
 OUT="$(FAKE_NEW_EMAIL=alpha@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
@@ -1578,7 +1580,7 @@ grep -q "no LIVE numbers" <<<"$(jq -r '.reason // empty' <<<"$dead_row" 2>/dev/n
   || bad "incomplete data → a failed fetch reports null (got: $dead_row)"
 part_row="$(jq -c '.accounts[] | select(.email=="partial@example.com")' <<<"$JSON_OUT" 2>/dev/null)"
 [ "$(jq -r '.recommendable' <<<"$part_row" 2>/dev/null)" = "false" ] \
-  && ok "incomplete data → a 200 missing five_hour.utilization is still excluded" \
+  && ok "incomplete data → a 200 missing the weekly utilization is still excluded" \
   || bad "incomplete data → a partial 200 is excluded (got: $part_row)"
 [ "$(jq -r '.reason' <<<"$part_row" 2>/dev/null)" = "incomplete usage data" ] \
   && ok "incomplete data → the partial 200 keeps the 'incomplete usage data' reason" \
@@ -1594,6 +1596,88 @@ grep -q "skipped incomplete usage data" <<<"$VOUT" \
 grep -qE '^  ✗ dead@example\.com +(no live numbers|stored token stale)' <<<"$(unavail_block <<<"$OUT")" \
   && ok "incomplete data → a FAILED fetch says so in its own short reason" \
   || bad "incomplete data → the failed fetch has a short reason (got: $(unavail_block <<<"$OUT"))"
+
+# --- 19b. NO 5-HOUR WINDOW (Ultra, 2026-10-30, latch t_zwv49y) -----------------
+# The usage API returns no five_hour bucket for Ultra seats. A row whose weekly is
+# measured and whose 5h is empty has no 5h window: it clears every 5h floor, is
+# recommendable, and no output mentions 5h. Before the fix such a row was
+# "incomplete usage data" and `rota switch` died "no other account clearing the
+# health floor". Both-null stays unmeasured (covered elsewhere).
+new_run no5h
+mkdir -p "$RUN/.claude-pool/alpha" "$RUN/.claude-pool/tommy" "$RUN/.claude-pool/gmail"
+printf '{"claudeAiOauth":{"accessToken":"TOK-U-SHARED"}}' > "$RUN/.claude/.credentials.json"
+cp "$RUN/.claude/.credentials.json" "$RUN/.claude-pool/alpha/.credentials.json"
+printf '{"oauthAccount":{"emailAddress":"alpha@example.com"}}' > "$RUN/.claude-pool/alpha/.claude.json"
+printf '{"claudeAiOauth":{"accessToken":"TOK-U-TOMMY"}}' > "$RUN/.claude-pool/tommy/.credentials.json"
+printf '{"oauthAccount":{"emailAddress":"tommy@example.com"}}' > "$RUN/.claude-pool/tommy/.claude.json"
+printf '{"claudeAiOauth":{"accessToken":"TOK-U-GMAIL"}}' > "$RUN/.claude-pool/gmail/.credentials.json"
+printf '{"oauthAccount":{"emailAddress":"gmail@example.com"}}' > "$RUN/.claude-pool/gmail/.claude.json"
+printf '{"oauthAccount":{"emailAddress":"alpha@example.com"}}' > "$RUN/.claude.json"
+cat > "$RUN/cfg/accounts" <<ACCT
+alpha@example.com|$RUN/.claude-pool/alpha
+tommy@example.com|$RUN/.claude-pool/tommy
+gmail@example.com|$RUN/.claude-pool/gmail
+ACCT
+printf '{"seven_day":{"utilization":60,"resets_at":"%s"}}' "$(iso_in +2d)" > "$RUN/state/usage-TOK-U-SHARED.json"
+printf '{"seven_day":{"utilization":30,"resets_at":"%s"}}' "$(iso_in +3d)" > "$RUN/state/usage-TOK-U-TOMMY.json"
+printf '{"seven_day":{"utilization":20,"resets_at":"%s"},"five_hour":null}' "$(iso_in +4d)" > "$RUN/state/usage-TOK-U-GMAIL.json"
+set +e
+OUT="$(FAKE_NEW_EMAIL=alpha@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
+VOUT="$(FAKE_NEW_EMAIL=alpha@example.com "$SCRIPT" usage --verbose 2>>"$ERRLOG")"
+JSON_OUT="$(FAKE_NEW_EMAIL=alpha@example.com "$SCRIPT" usage --json 2>>"$ERRLOG")"
+set -e
+for who in tommy gmail; do
+  grep -q "^  ✓ $who@example.com" <<<"$(alt_block <<<"$OUT")" \
+    && ok "no 5h window → $who is listed under ALTERNATIVES" \
+    || bad "no 5h window → $who under ALTERNATIVES (got: $OUT)"
+  [ "$(jq -r --arg e "$who@example.com" '.accounts[]|select(.email==$e)|.recommendable' <<<"$JSON_OUT" 2>/dev/null)" = "true" ] \
+    && ok "no 5h window → $who is recommendable" \
+    || bad "no 5h window → $who recommendable"
+done
+! grep -q "incomplete" <<<"$OUT$VOUT" \
+  && ok "no 5h window → nothing is called incomplete" \
+  || bad "no 5h window → nothing incomplete (got: $OUT)"
+! grep -qiE '5h|5-hour|five' <<<"$OUT$VOUT" \
+  && ok "no 5h window → no '5h' text anywhere in usage or usage --verbose" \
+  || bad "no 5h window → no 5h text (got: $(grep -iE '5h' <<<"$OUT$VOUT"))"
+grep -qE "^→ (switch to|stay on)" <<<"$OUT" \
+  && ok "no 5h window → a recommendation is printed" \
+  || bad "no 5h window → recommendation (got: $OUT)"
+[ "$(jq -r '.accounts[0].five_hour.remaining_pct' <<<"$JSON_OUT" 2>/dev/null)" = "null" ] \
+  && ok "no 5h window → JSON keeps the five_hour key, null" \
+  || bad "no 5h window → JSON five_hour null (got: $(jq -c '.accounts[0].five_hour' <<<"$JSON_OUT" 2>/dev/null))"
+# a MIXED pool (one Max seat with a 5h value, one Ultra seat without): the valued
+# seat keeps its 5h text and floor, the null seat is still eligible and silent
+printf '{"seven_day":{"utilization":30,"resets_at":"%s"},"five_hour":{"utilization":95,"resets_at":"%s"}}' \
+  "$(iso_in +3d)" "$(iso_in +2H)" > "$RUN/state/usage-TOK-U-TOMMY.json"
+set +e
+OUT="$(FAKE_NEW_EMAIL=alpha@example.com "$SCRIPT" usage 2>>"$ERRLOG")"
+set -e
+grep -qE '^  ✗ tommy@example\.com +5h' <<<"$(unavail_block <<<"$OUT")" \
+  && ok "mixed pool → a seat WITH a spent 5h value is still held back by the 5h floor" \
+  || bad "mixed pool → 5h floor still applies to valued seats (got: $OUT)"
+grep -q "^  ✓ gmail@example.com" <<<"$(alt_block <<<"$OUT")" \
+  && ok "mixed pool → the null-5h seat stays eligible" \
+  || bad "mixed pool → null seat eligible (got: $OUT)"
+GM_LINE="$(grep -E '^  ✓ gmail@example.com' <<<"$OUT" || true)"
+[ -n "$GM_LINE" ] && ! grep -q "5h" <<<"$GM_LINE" \
+  && ok "mixed pool → the null-5h row exists and prints no 5h cell" \
+  || bad "mixed pool → null row present with no 5h text (got: $GM_LINE)"
+# the --verbose resets line: the null seats end at their weekly phrase, the valued
+# one adds its 5h phrase, and NEITHER ends in a stray second ")" (a typo once did)
+set +e
+VOUT="$(FAKE_NEW_EMAIL=alpha@example.com "$SCRIPT" usage --verbose 2>>"$ERRLOG")"
+set -e
+RL="$(grep -E '^ +resets  weekly' <<<"$VOUT" || true)"
+[ "$(grep -c '' <<<"$RL")" -ge 3 ] && ! grep -qE '\)\)$' <<<"$RL" \
+  && ok "verbose resets line → no stray ')' on any row (null and valued)" \
+  || bad "verbose resets line → stray ')' (got: $RL)"
+[ "$(grep -cE ' · 5h resets .*[^)]\)$' <<<"$RL")" -eq 1 ] \
+  && ok "verbose resets line → the valued row ends '5h resets …(in …)' with one ')'" \
+  || bad "verbose resets line → valued row shape (got: $RL)"
+! grep -v ' · 5h ' <<<"$RL" | grep -q '5h' \
+  && ok "verbose resets line → the null rows carry no 5h" \
+  || bad "verbose resets line → null rows silent (got: $RL)"
 
 # --- 20. a CACHED fresh window must survive the round-trip --------------------
 # A fresh window is the first thing that ever put an EMPTY value in the cache
@@ -6168,6 +6252,52 @@ RP_OUT="$(bash -c '
 [ "$RP_OUT" = ABCD ] \
   && ok "refusal predicate → 403 + no JSON + in-date token only (expired token, other codes, a 200 body are not refusals)" \
   || bad "refusal predicate → rota_refusal_applies (got: '$RP_OUT')"
+
+# --- 26. a recorded seat with no 5h value, on the cached pass; die wording ------
+# `usage --record <seat> <weekly>` stores no 5h reading: such a seat counts as
+# having no 5h window and is picked on cached numbers (latch t_zwv49y).
+sa_fixture cachedno5h 30 "$(iso_in +2d)" 95
+cat > "$RUN/cfg/usage-cache.json" <<NOCACHE
+{
+  "alpha@example.com":   {"wk_u":"95","wk_r":"$(iso_in +5d)","se_u":"","se_r":"","ts":"Jul 20 02:14","ts_epoch":"1784585640"},
+  "wk@example.com":      {"wk_u":"30","wk_r":"$(iso_in +2d)","se_u":"","se_r":"","ts":"Jul 20 02:14","ts_epoch":"1784585640"},
+  "primary@example.com": {"wk_u":"99","wk_r":"$(iso_in +4d)","se_u":"","se_r":"","ts":"Jul 20 02:14","ts_epoch":"1784585640"}
+}
+NOCACHE
+set +e
+OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" switch-auto --dry-run 2>&1)"; RC=$?
+set -e
+[ "$RC" -eq 0 ] && grep -q "optimizer pick: wk@example.com" <<<"$OUT" \
+  && ok "no 5h window (cached pass) → a seat cached with weekly and no 5h is picked" \
+  || bad "no 5h window (cached pass) → picked (rc $RC: $OUT)"
+# every seat under the weekly floor, NO 5h anywhere → the die names only the weekly floor
+cat > "$RUN/cfg/usage-cache.json" <<NOCACHE
+{
+  "alpha@example.com":   {"wk_u":"95","wk_r":"$(iso_in +5d)","se_u":"","se_r":"","ts":"Jul 20 02:14","ts_epoch":"1784585640"},
+  "wk@example.com":      {"wk_u":"95","wk_r":"$(iso_in +2d)","se_u":"","se_r":"","ts":"Jul 20 02:14","ts_epoch":"1784585640"},
+  "primary@example.com": {"wk_u":"99","wk_r":"$(iso_in +4d)","se_u":"","se_r":"","ts":"Jul 20 02:14","ts_epoch":"1784585640"}
+}
+NOCACHE
+set +e
+OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" switch-auto --dry-run 2>&1)"; RC=$?
+set -e
+[ "$RC" -ne 0 ] && grep -q "clearing the health floor (>=20% weekly; current" <<<"$OUT" && ! grep -q "5h" <<<"$OUT" \
+  && ok "no 5h window (die) → the floor text names only the weekly floor" \
+  || bad "no 5h window (die) → weekly-only floor text (rc $RC: $OUT)"
+# the same with 5h values: the original wording, byte for byte
+cat > "$RUN/cfg/usage-cache.json" <<NOCACHE
+{
+  "alpha@example.com":   {"wk_u":"95","wk_r":"$(iso_in +5d)","se_u":"10","se_r":"$(iso_in +2H)","ts":"Jul 20 02:14","ts_epoch":"1784585640"},
+  "wk@example.com":      {"wk_u":"95","wk_r":"$(iso_in +2d)","se_u":"20","se_r":"$(iso_in +3H)","ts":"Jul 20 02:14","ts_epoch":"1784585640"},
+  "primary@example.com": {"wk_u":"99","wk_r":"$(iso_in +4d)","se_u":"15","se_r":"$(iso_in +1H)","ts":"Jul 20 02:14","ts_epoch":"1784585640"}
+}
+NOCACHE
+set +e
+OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" switch-auto --dry-run 2>&1)"; RC=$?
+set -e
+[ "$RC" -ne 0 ] && grep -q "clearing the health floor (>=20% weekly, >=10% 5h; current" <<<"$OUT" \
+  && ok "valued 5h (die) → the original floor wording is unchanged" \
+  || bad "valued 5h (die) → original wording (rc $RC: $OUT)"
 
 restore_home
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
