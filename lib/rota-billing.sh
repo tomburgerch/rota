@@ -520,7 +520,13 @@ print(f"\nSeats on {c(host, '1')} \u00b7 {fmt(usage.get('generated_at'))} \u00b7
 # {'':7}, never seven typed spaces: the header and the rows have to add up to the
 # same 21 or every column after 5H drifts, and a miscounted run of spaces is
 # invisible in the source and obvious in the table.
-hdr = (f"  {'SEAT':36} {'WEEKLY LEFT':>14}{'':7}  {'5H':>4}  {'GONE IN':>8}  "
+# No 5-hour window (Ultra seats, 2026-10-30; latch t_zwv49y): the usage API returns
+# no five_hour bucket for them, so when NO row has a 5h value the whole 5H column
+# goes. When at least one row does (a Max plan), the column stays and the rows
+# without one print a blank cell.
+has_5h = any(r['five_hour_left_pct'] is not None for r in rows)
+h5_hdr = f"  {'5H':>4}" if has_5h else ""
+hdr = (f"  {'SEAT':36} {'WEEKLY LEFT':>14}{'':7}{h5_hdr}  {'GONE IN':>8}  "
        f"{'QUOTA RESETS':17} {'NEXT CHARGE':>12} {'AMOUNT':>11}  NOTES")
 print(c(hdr, '2;4'))
 
@@ -575,7 +581,8 @@ for r in rows:
     # `wk` is the ALL-MODEL figure on a scoped row, so a spent Fable cap alone no
     # longer blanks a 5h window other models are still running against.
     fh = r['five_hour_left_pct']
-    fh_plain = '' if wk == 0 else (f"{fh}%" if fh is not None else '-')
+    fh_plain = '' if (wk == 0 or fh is None) else f"{fh}%"
+    h5_cell = f"  {fh_plain:>4}" if has_5h else ""
 
     notes = []
     # ⚠️ THE RESERVATION LEADS. It is the one fact that changes whether a row is
@@ -642,7 +649,7 @@ for r in rows:
     # still counts the character it is actually printing: "~Sat 05 Sep 13:00" is
     # 17 and fits exactly, and nothing to the right of it moves.
     reset_plain = reset_mark(r) + fmt(next_reset(r))
-    print(f"  {name} {pad(wk_plain, 21, wk_code)}  {fh_plain:>4}  "
+    print(f"  {name} {pad(wk_plain, 21, wk_code)}{h5_cell}  "
           f"{countdown(gone):>8}  "
           f"{pad(reset_plain, 17, '90' if r['last_window'] else None)} {nc} "
           f"{r['amount']:>11}  {'  '.join(notes)}")

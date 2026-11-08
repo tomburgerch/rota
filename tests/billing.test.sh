@@ -810,5 +810,25 @@ check "refused active: a REFUSED line names the withheld seat" 'grep -E "^ +REFU
 check "refused active: and says it is the seat you are on"   'grep -E "^ +REFUSED " <<<"$OUT" | grep -q "the seat you are on"'
 cp "$TMP/engine.good" "$LIB/rota-engine.sh"; chmod +x "$LIB/rota-engine.sh"
 
+# --- NO 5-HOUR WINDOW (Ultra, 2026-10-30, latch t_zwv49y) ---------------------
+# The usage API returns no five_hour bucket for Ultra seats. When NO row has a 5h
+# value the 5H column goes entirely; when at least one does, it stays and the
+# null rows print a blank cell. Valued behaviour is covered by every test above.
+sed 's|,"five_hour":{"remaining_pct":[0-9]*}||' "$TMP/engine.good" > "$LIB/rota-engine.sh"; chmod +x "$LIB/rota-engine.sh"
+OUT="$("$LIB/rota-billing.sh" 2>/dev/null)"
+JOUT="$("$LIB/rota-billing.sh" --json 2>/dev/null)"
+check "no 5h: the 5H column header is gone"          '! grep -q "5H" <<<"$OUT"'
+check "no 5h: the other columns are still there"     'grep -q "SEAT .*WEEKLY LEFT .*GONE IN .*NEXT CHARGE .*NOTES" <<<"$OUT"'
+check "no 5h: no '5h' text anywhere"                 '! grep -qi "5h" <<<"$OUT"'
+check "no 5h: USE NEXT still recommends"            'grep -A1 "USE NEXT" <<<"$OUT" | grep -q "rota switch personal"'
+check "no 5h (json): five_hour_left_pct is null"     '[ "$(jrow "$JOUT" work@example.com five_hour_left_pct)" = None ]'
+# mixed: only the active seat loses its 5h bucket, the others keep theirs
+sed '/"alias":"work",/,/"five_hour"/ s|,"five_hour":{"remaining_pct":[0-9]*}||' "$TMP/engine.good" > "$LIB/rota-engine.sh"; chmod +x "$LIB/rota-engine.sh"
+OUT="$("$LIB/rota-billing.sh" 2>/dev/null)"
+check "mixed: the 5H column stays when one row has a value" 'grep -q "WEEKLY LEFT .*5H .*GONE IN" <<<"$OUT"'
+check "mixed: the null row prints a blank cell, not '-'"    '! grep "work@example.com" <<<"$OUT" | grep -qE "[0-9]%  +-  "'
+check "mixed: a valued row still prints its 5h"             'grep "personal@example.com" <<<"$OUT" | grep -q "100%"'
+cp "$TMP/engine.good" "$LIB/rota-engine.sh"; chmod +x "$LIB/rota-engine.sh"
+
 printf 'billing.test.sh: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

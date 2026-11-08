@@ -1512,7 +1512,9 @@ main() {
         # percentages at all, so the threshold sentence would render as
         # "weekly ?% / 5h ?% (threshold 90%)" - a switch attributed to a wall it
         # never hit, in the one log line that explains an unattended 03:00 move.
-        local trigger="at weekly ${wk:-?}% / 5h ${se:-?}% (threshold $AUTO_SWITCH_PCT%)"
+        # no 5h window (Ultra, t_zwv49y): the 5h half is left out, never "5h ?%"
+        local se_part=""; [[ -n "$se" ]] && se_part=" / 5h ${se}%"
+        local trigger="at weekly ${wk:-?}%${se_part} (threshold $AUTO_SWITCH_PCT%)"
         (( claim_ended )) \
           && trigger="ENDED $(rota_seat_field "$BILLING_JSON" "$claim" 2), the seat is over whatever quota it still reports"
         (( claim_refused )) \
@@ -1530,7 +1532,7 @@ main() {
           elif (( claim_ended )); then
             notify_once "auto-switch" "Switched to ${LABELS[$best]}: $claim's seat ended $(rota_seat_field "$BILLING_JSON" "$claim" 2)."
           else
-            notify_once "auto-switch" "Switched to ${LABELS[$best]}: $claim hit ${wk:-?}% weekly / ${se:-?}% 5h."
+            notify_once "auto-switch" "Switched to ${LABELS[$best]}: $claim hit ${wk:-?}% weekly${se:+ / ${se}% 5h}."
           fi
           log "auto-switch: done, $sw_out"
           log_state_clear no-target
@@ -1540,7 +1542,7 @@ main() {
         fi
       elif [[ "$st_switch" == "none" ]]; then
         # persists tick after tick while the wall stands, log ONCE per state
-        log_once no-target "$claim:$wk:$se:$claim_ended" "auto-switch: $claim $( if (( claim_refused )); then printf 'is REFUSED (HTTP 403)'; elif (( claim_ended )); then printf 'has ENDED'; else printf "at weekly ${wk:-?}%% / 5h ${se:-?}%% ≥ $AUTO_SWITCH_PCT%%"; fi ) but no eligible target (all above ${AUTO_SWITCH_TARGET_MAX_PCT}%, under the ${AUTO_SWITCH_TARGET_MIN_LEFT_PCT}%-left floor, ended, dead, or unmeasured)"
+        log_once no-target "$claim:$wk:$se:$claim_ended" "auto-switch: $claim $( if (( claim_refused )); then printf 'is REFUSED (HTTP 403)'; elif (( claim_ended )); then printf 'has ENDED'; else printf "at weekly ${wk:-?}%%${se:+ / 5h ${se}%%} ≥ $AUTO_SWITCH_PCT%%"; fi ) but no eligible target (all above ${AUTO_SWITCH_TARGET_MAX_PCT}%, under the ${AUTO_SWITCH_TARGET_MIN_LEFT_PCT}%-left floor, ended, dead, or unmeasured)"
         st_switch="no-target"
       fi
     fi
@@ -1701,6 +1703,10 @@ main() {
         continue
       fi
       se="$(pct_int "${U_SE[$ui]}")"
+      # No 5h window at all (Ultra, 2026-10-30, t_zwv49y): nothing to warm and
+      # nothing to prove open or cold, so the seat is skipped, and since it is
+      # decided it never marks the pass undecided and is never pinged.
+      [[ -n "$se" ]] || continue
       [[ "$se" == "0" ]] || continue                       # already spending → open
       iso_in_past_or_empty "${U_SER[$ui]}" || continue     # future reset → open
       if nudge_account "${LABELS[$i]}" "${DIRS[$i]}" "warming (WARM_AT=$WARM_AT)"; then

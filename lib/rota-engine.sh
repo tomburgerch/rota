@@ -2326,6 +2326,36 @@ used() {
   printf '%s' "$i"
 }
 
+# NO 5-HOUR WINDOW (2026-10-30, latch t_zwv49y). Anthropic removed the 5h limit
+# for Ultra seats: the usage API returns no five_hour bucket at all, so a seat
+# whose WEEKLY is measured and whose 5h is empty simply has no 5h window. That is
+# not "incomplete data": it passes every 5h floor and threshold and prints no 5h
+# text. A seat that has BOTH empty is still unmeasured. A plan that still has a 5h
+# window (Max) returns a value and is handled exactly as before.
+no_5h_window() {  # no_5h_window <slot-index>; 0 when weekly is measured and 5h is empty
+  local i="${1:-}"
+  [[ -n "$(remaining "${U_WKU[$i]:-}")" && -z "$(remaining "${U_SEU[$i]:-}")" ]]
+}
+
+# "; 5h X% used · Y% left" for a slot, or nothing when it has no 5h value.
+five_h_clause() {  # five_h_clause <slot-index>
+  local i="${1:-}" sl
+  sl="$(remaining "${U_SEU[$i]:-}")"
+  [[ -n "$sl" ]] || return 0
+  printf '; 5h %s%% used · %s%% left' "$(used "${U_SEU[$i]}")" "$sl"
+}
+
+# The health-floor text: the 5h half only when some row in the pool has a 5h value.
+health_floor_text() {
+  local i has5=0
+  for i in "${!U_SEU[@]}"; do
+    [[ "${U_STATE[$i]:-}" == "dup" ]] && continue
+    [[ -n "$(remaining "${U_SEU[$i]}")" ]] && { has5=1; break; }
+  done
+  if (( has5 )); then printf '>=%s%% weekly, >=%s%% 5h left' "$MIN_WEEKLY" "$MIN_SESSION"
+  else printf '>=%s%% weekly left' "$MIN_WEEKLY"; fi
+}
+
 # THREE window states, which must never be conflated (fixed 2026-07-30):
 #
 #   FRESH       utilization parses, but there is no resets_at. The window has not
@@ -4272,14 +4302,15 @@ compute_recommendation() {  # compute_recommendation <exclude_active 0|1> <requi
     # "incomplete" is now strictly about the NUMBERS. A missing resets_at no longer
     # counts: that is the FRESH window described above (100% left, nothing expiring),
     # and treating it as incomplete excluded the healthiest account there was.
-    if [[ -z "$wkl" || -z "$sel" ]]; then
+    # A seat with no 5h bucket (Ultra) is complete: only a missing weekly is not.
+    if [[ -z "$wkl" ]]; then
       U_REASON[i]="incomplete usage data"; continue
     fi
     # used-first, same order as the rows and the statusline
     if (( wkl < MIN_WEEKLY )); then
       U_REASON[i]="weekly $(used "${U_WKU[$i]}")% used · ${wkl}% left$(scope_note "${U_WKS[$i]}") is under the ${MIN_WEEKLY}%-left floor"; continue
     fi
-    if (( sel < MIN_SESSION )); then
+    if [[ -n "$sel" ]] && (( sel < MIN_SESSION )); then
       U_REASON[i]="5h $(used "${U_SEU[$i]}")% used · ${sel}% left is under the ${MIN_SESSION}%-left floor"; continue
     fi
     if (( excl_active )) && [[ -n "$SHARED_EMAIL" && "${U_EMAIL[$i]}" == "$SHARED_EMAIL" ]]; then
@@ -4531,7 +4562,8 @@ render_active_window() {  # render_active_window <name> <util> <reset-iso> <expi
 render_alt_row() {  # render_alt_row <slot-index> <email-width>
   local i="$1" ew="$2" wkl sel metrics
   wkl="$(remaining "${U_WKU[$i]}")"; sel="$(remaining "${U_SEU[$i]}")"
-  metrics="$(printf 'weekly %3s%% left · 5h %3s%% left' "$wkl" "$sel")"
+  if [[ -n "$sel" ]]; then metrics="$(printf 'weekly %3s%% left · 5h %3s%% left' "$wkl" "$sel")"
+  else metrics="$(printf 'weekly %3s%% left' "$wkl")"; fi
   printf '  %s %s  %s  %s  %s\n' \
     "$(paint "$CLR_GREEN" '✓')" \
     "$(printf '%-*s' "$ew" "${U_EMAIL[$i]}")" \
@@ -4708,7 +4740,7 @@ render_verbose_detail() {  # render_verbose_detail <slot-index>
     local all_reset=""
     [[ -n "$(all_models_note "$i")" && -n "${U_WAR[$i]:-}" ]] \
       && all_reset=" · all models $(reset_phrase "${U_WAR[$i]}")"
-    printf '%s\n' "$(paint "$CLR_DIM" "${pfx}resets  weekly $(weekly_reset_phrase "$i")${all_reset} · 5h $(reset_phrase "${U_SER[$i]}")")"
+    printf '%s\n' "$(paint "$CLR_DIM" "${pfx}resets  weekly $(weekly_reset_phrase "$i")${all_reset}$(no_5h_window "$i" || printf ' · 5h %s' "$(reset_phrase "${U_SER[$i]}")"))")"
   fi
   [[ -n "${U_VIA[$i]}" ]] && printf '%s\n' "$(paint "$CLR_DIM" "${pfx}note    ${U_VIA[$i]}")"
   [[ "${U_STATE[$i]}" != "live" && -n "${U_WHY[$i]}" ]] \
@@ -4845,8 +4877,8 @@ recommendation_text() {
       "$(scope_note "${U_WKS[$SHARED_SLOT]}")" "$when_clause" "$EXHAUSTED_PCT" \
       "$sess_note" "$next_note" "$cache_note"
   elif (( REC_SLOT < 0 )); then
-    printf '→ nothing to recommend: no account has LIVE numbers clearing the health floor (>=%s%% weekly, >=%s%% 5h left). See the per-row reasons above.%s\n' \
-      "$MIN_WEEKLY" "$MIN_SESSION" "$act_note"
+    printf '→ nothing to recommend: no account has LIVE numbers clearing the health floor (%s). See the per-row reasons above.%s\n' \
+      "$(health_floor_text)" "$act_note"
   elif (( REC_SLOT == SHARED_SLOT )); then
     # A FRESH pick has no reset time, so "no healthier account resets sooner" would be
     # naming an instant that does not exist. Say what is actually true of it instead.
@@ -4855,18 +4887,18 @@ recommendation_text() {
       # really has not started (so "resets in 2d" would overstate what is known),
       # and it really does die on the seat's own cadence (so "nothing is expiring"
       # would understate what is at stake).
-      printf '→ stay on %s: it is already active, its weekly window has not started yet (weekly %s%% used · %s%% left; 5h %s%% used · %s%% left); on this seat'"'"'s own cadence that untouched week is lost %s, and no healthier account has headroom expiring sooner.%s\n' \
+      printf '→ stay on %s: it is already active, its weekly window has not started yet (weekly %s%% used · %s%% left%s); on this seat'"'"'s own cadence that untouched week is lost %s, and no healthier account has headroom expiring sooner.%s\n' \
         "$REC_EMAIL" "$(used "${U_WKU[$REC_SLOT]}")" "$(remaining "${U_WKU[$REC_SLOT]}")" \
-        "$(used "${U_SEU[$REC_SLOT]}")" "$(remaining "${U_SEU[$REC_SLOT]}")" \
+        "$(five_h_clause "$REC_SLOT")" \
         "$(rec_reset_when)" "$act_note"
     elif (( REC_FRESH )); then
-      printf '→ stay on %s: it is already active, its weekly window has not started yet (weekly %s%% used · %s%% left; 5h %s%% used · %s%% left) and no healthier account has headroom expiring sooner.%s\n' \
+      printf '→ stay on %s: it is already active, its weekly window has not started yet (weekly %s%% used · %s%% left%s) and no healthier account has headroom expiring sooner.%s\n' \
         "$REC_EMAIL" "$(used "${U_WKU[$REC_SLOT]}")" "$(remaining "${U_WKU[$REC_SLOT]}")" \
-        "$(used "${U_SEU[$REC_SLOT]}")" "$(remaining "${U_SEU[$REC_SLOT]}")" "$act_note"
+        "$(five_h_clause "$REC_SLOT")" "$act_note"
     else
-      printf '→ stay on %s, it is already active, clears the health floor (weekly %s%% used · %s%% left; 5h %s%% used · %s%% left) and no healthier account resets sooner.%s\n' \
+      printf '→ stay on %s, it is already active, clears the health floor (weekly %s%% used · %s%% left%s) and no healthier account resets sooner.%s\n' \
         "$REC_EMAIL" "$(used "${U_WKU[$REC_SLOT]}")" "$(remaining "${U_WKU[$REC_SLOT]}")" \
-        "$(used "${U_SEU[$REC_SLOT]}")" "$(remaining "${U_SEU[$REC_SLOT]}")" "$act_note"
+        "$(five_h_clause "$REC_SLOT")" "$act_note"
     fi
   else
     alias_of="$(basename "${DIRS[$REC_SLOT]}")"
@@ -4886,26 +4918,26 @@ recommendation_text() {
       # pick. REC_DEADLINE_KIND comes straight out of rota_seat_deadline, the
       # same call that produced the ordering, so the sentence and the sort can
       # never name different dates.
-      printf '  soonest deadline among the accounts clearing the health floor: this seat ENDS %s, before its weekly window would reset, so this is its LAST window (weekly %s%% used · %s%% left; 5h %s%% used · %s%% left) and whatever is unspent on it is gone for good.%s\n' \
+      printf '  soonest deadline among the accounts clearing the health floor: this seat ENDS %s, before its weekly window would reset, so this is its LAST window (weekly %s%% used · %s%% left%s) and whatever is unspent on it is gone for good.%s\n' \
         "$(seat_ends_on "$REC_SLOT")" \
         "$(used "${U_WKU[$REC_SLOT]}")" "$(remaining "${U_WKU[$REC_SLOT]}")" \
-        "$(used "${U_SEU[$REC_SLOT]}")" "$(remaining "${U_SEU[$REC_SLOT]}")" "$act_note"
+        "$(five_h_clause "$REC_SLOT")" "$act_note"
     elif (( REC_FRESH )) && (( REC_PROJECTED )); then
       # A fully unspent account that nonetheless has the soonest deadline, which
       # is the whole point of projecting: both facts, one sentence, and the
       # instant marked because this box computed it rather than read it.
-      printf '  a fully unspent account whose untouched week dies first: its weekly window has not started yet (weekly %s%% used · %s%% left; 5h %s%% used · %s%% left) and on this seat'"'"'s own cadence it is lost %s, sooner than any other account clearing the health floor.%s\n' \
+      printf '  a fully unspent account whose untouched week dies first: its weekly window has not started yet (weekly %s%% used · %s%% left%s) and on this seat'"'"'s own cadence it is lost %s, sooner than any other account clearing the health floor.%s\n' \
         "$(used "${U_WKU[$REC_SLOT]}")" "$(remaining "${U_WKU[$REC_SLOT]}")" \
-        "$(used "${U_SEU[$REC_SLOT]}")" "$(remaining "${U_SEU[$REC_SLOT]}")" \
+        "$(five_h_clause "$REC_SLOT")" \
         "$(rec_reset_when)" "$act_note"
     elif (( REC_FRESH )); then
-      printf '  a fully unspent account: its weekly window has not started yet (weekly %s%% used · %s%% left; 5h %s%% used · %s%% left), and no account clearing the health floor has headroom expiring sooner.%s\n' \
+      printf '  a fully unspent account: its weekly window has not started yet (weekly %s%% used · %s%% left%s), and no account clearing the health floor has headroom expiring sooner.%s\n' \
         "$(used "${U_WKU[$REC_SLOT]}")" "$(remaining "${U_WKU[$REC_SLOT]}")" \
-        "$(used "${U_SEU[$REC_SLOT]}")" "$(remaining "${U_SEU[$REC_SLOT]}")" "$act_note"
+        "$(five_h_clause "$REC_SLOT")" "$act_note"
     else
-      printf '  soonest weekly reset among the accounts clearing the health floor (weekly %s%% used · %s%% left; 5h %s%% used · %s%% left, resets %s), so that headroom gets spent before it expires.%s\n' \
+      printf '  soonest weekly reset among the accounts clearing the health floor (weekly %s%% used · %s%% left%s, resets %s), so that headroom gets spent before it expires.%s\n' \
         "$(used "${U_WKU[$REC_SLOT]}")" "$(remaining "${U_WKU[$REC_SLOT]}")" \
-        "$(used "${U_SEU[$REC_SLOT]}")" "$(remaining "${U_SEU[$REC_SLOT]}")" \
+        "$(five_h_clause "$REC_SLOT")" \
         "$(rec_reset_when)" "$act_note"
     fi
   fi
@@ -4996,7 +5028,8 @@ render_usage_table() {
     else
       render_active_window "weekly" "${U_WKU[$SHARED_SLOT]}" "${U_WKR[$SHARED_SLOT]}" \
         "${U_WKX[$SHARED_SLOT]}" "${U_WKS[$SHARED_SLOT]}" "${U_WKP[$SHARED_SLOT]:-}"
-      render_active_window "5h" "${U_SEU[$SHARED_SLOT]}" "${U_SER[$SHARED_SLOT]}" "${U_SEX[$SHARED_SLOT]}"
+      no_5h_window "$SHARED_SLOT" \
+        || render_active_window "5h" "${U_SEU[$SHARED_SLOT]}" "${U_SER[$SHARED_SLOT]}" "${U_SEX[$SHARED_SLOT]}"
     fi
     render_verbose_detail "$SHARED_SLOT"
     # the numbers above are cached and look fine; the refusal is the fact that
@@ -6735,9 +6768,9 @@ main() {
         # screen, so pointing at another command would be the round trip this
         # change exists to remove.
         if (( quiet )); then
-          die "no other account clearing the health floor (>=$MIN_WEEKLY% weekly, >=$MIN_SESSION% 5h; current: ${SHARED_EMAIL:-unknown}), on live OR cached numbers, see \`rota usage\`"
+          die "no other account clearing the health floor ($(health_floor_text); current: ${SHARED_EMAIL:-unknown}), on live OR cached numbers, see \`rota usage\`"
         fi
-        die "no other account clearing the health floor (>=$MIN_WEEKLY% weekly, >=$MIN_SESSION% 5h; current: ${SHARED_EMAIL:-unknown}), on live OR cached numbers, each account's numbers and the reason it was skipped are in the rows above."
+        die "no other account clearing the health floor ($(health_floor_text); current: ${SHARED_EMAIL:-unknown}), on live OR cached numbers, each account's numbers and the reason it was skipped are in the rows above."
       fi
       # a FRESH pick has no reset instant; printing "weekly resets " with nothing after
       # it would read as a lost timestamp rather than as an unstarted window
