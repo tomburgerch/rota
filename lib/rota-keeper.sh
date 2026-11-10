@@ -732,7 +732,18 @@ keychain_unify_dir() {  # keychain_unify_dir <label> <dir>
       direction="FAILED to import the newer keychain chain, file left alone"
     fi
   fi
-  # EITHER WAY the item goes: bounded drain, duplicates under one name are real
+  # ...unless it is the ONLY login this dir has. An item whose blob could not be
+  # read as a credential (no expiresAt: a locked read, a half-written login) next
+  # to NO complete file is not a stale twin, and draining it deletes the login the
+  # owner just completed (the borrowed seat, 2026-11-10 18:04: "kept the FILE",
+  # with no file to keep, then a second login was needed). Leave it for the next
+  # tick, which imports it once it reads.
+  if [[ -z "$item_exp" ]] && ! cred_is_complete "$cred"; then
+    log_once "kc-unreadable-$(basename "$dir")" "unreadable" "keychain-unify ${label:-$(basename "$dir")}: the Keychain item could not be read as a credential and $(tilde "$cred") is not a complete login, item LEFT in place (draining it would delete the only login)"
+    return 0
+  fi
+  log_state_clear "kc-unreadable-$(basename "$dir")"
+  # OTHERWISE the item goes: bounded drain, duplicates under one name are real
   while (( attempt < 8 )) && security delete-generic-password -s "$svc" >/dev/null 2>&1; do
     drained=$((drained + 1)); attempt=$((attempt + 1))
   done

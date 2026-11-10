@@ -1013,9 +1013,100 @@ cred_token_expired_ago() {  # cred_token_expired_ago <credentials-json-file>
   printf '%s' "${d#in }"
 }
 
+# ── A LOGIN THAT LANDED ONLY IN THE KEYCHAIN (2026-11-10, the akos seat) ──────
+# `rota login <seat>` from a GUI-domain terminal stores the new login in the
+# per-dir Keychain item ("Claude Code-credentials-<sha256(dir)[:8]>") and writes
+# NO <dir>/.credentials.json. Everything here reads the FILE (tmux and ssh cannot
+# read the Keychain at all), so the seat showed loggedIn=false and "not
+# measured" on both boxes until the keeper's next 10-minute tick imported it.
+# The keeper is the one context that CAN read the item, so the supported path is
+# to ASK IT NOW: kickstart com.rota.keeper (its step 0 is the import) and wait a
+# few seconds for the file. Presence is probed without -w; the secret itself is
+# never read here.
+#   ROTA_KEYCHAIN_IMPORT=0             never ask (status/usage stay read-only)
+#   ROTA_KEYCHAIN_IMPORT_WAIT_SECS=8   how long one ask waits for the file
+#   ROTA_KEYCHAIN_IMPORT_KICK_SECS=30  at most one ask per this many seconds
+#   ROTA_LAUNCHCTL_BIN                 the launchctl used (the suite stubs it)
+pool_keychain_service() {  # the per-config-dir service name the CLI uses
+  printf 'Claude Code-credentials-%s' "$(printf '%s' "${1:-}" | shasum -a 256 | cut -c1-8)"
+}
+
+# True when <dir> has NO complete credential file but its Keychain item exists.
+keychain_only_login() {  # keychain_only_login <dir>
+  local dir="${1:-}"
+  [[ -n "$dir" && -d "$dir" ]] || return 1
+  [[ "$(uname -s 2>/dev/null)" == "Darwin" ]] || return 1
+  command -v security >/dev/null 2>&1 || return 1
+  cred_is_complete "$dir/.credentials.json" && return 1
+  security find-generic-password -s "$(pool_keychain_service "$dir")" >/dev/null 2>&1
+}
+
+# Ask the keeper to import <dir>'s Keychain-only login, then wait for the file.
+# 0 = the dir now holds a complete credential file. 1 = it does not (nothing to
+# import, asking is off, no keeper agent on this box, asked too recently, or the
+# keeper did not get to it in time). "force" skips the once-per-interval throttle.
+keychain_import_request() {  # keychain_import_request <dir> [force]
+  local dir="${1:-}" force="${2:-}" stamp="$CFG_DIR/.keychain-import-kick"
+  local wait="${ROTA_KEYCHAIN_IMPORT_WAIT_SECS:-8}" every="${ROTA_KEYCHAIN_IMPORT_KICK_SECS:-30}"
+  local now mt n=0
+  cred_is_complete "$dir/.credentials.json" && return 0
+  keychain_only_login "$dir" || return 1
+  [[ "${ROTA_KEYCHAIN_IMPORT:-1}" == "1" ]] || return 1
+  [[ -f "$HOME/Library/LaunchAgents/com.rota.keeper.plist" ]] || return 1
+  [[ "$wait" =~ ^[0-9]+$ ]] || wait=8
+  [[ "$every" =~ ^[0-9]+$ ]] || every=30
+  now="$(date +%s)"
+  mt="$(stat -f %m "$stamp" 2>/dev/null || stat -c %Y "$stamp" 2>/dev/null || echo 0)"
+  if [[ "$force" != "force" ]] && (( now - mt < every )); then return 1; fi
+  mkdir -p "$CFG_DIR" 2>/dev/null || true
+  : > "$stamp" 2>/dev/null || true
+  "${ROTA_LAUNCHCTL_BIN:-launchctl}" kickstart "gui/$(id -u)/com.rota.keeper" >/dev/null 2>&1 || return 1
+  while (( n < wait * 2 )); do
+    cred_is_complete "$dir/.credentials.json" && return 0
+    sleep 0.5; n=$((n + 1))
+  done
+  cred_is_complete "$dir/.credentials.json"
+}
+
+# What a row says while its login is still Keychain-only (the ask above did not
+# land yet). Names the cure, never "log it in": the login already happened.
+keychain_only_why() {  # keychain_only_why <dir>
+  printf 'logged in, but the login sits only in the macOS Keychain, which tmux and ssh sessions cannot read; the keeper imports it into %s on its next tick (10 minutes at most), `rota import-keychain %s` asks for it now' \
+    "$(tilde "$1/.credentials.json")" "$(basename "$1")"
+}
+
+# `rota import-keychain [seat]`: import every (or one) seat's Keychain-only login
+# now. Exit 0 when no seat is left Keychain-only, 1 when one still is, 2 on an
+# unknown seat. Prints one line per seat it had to act on; never a token.
+cmd_import_keychain() {
+  local want="${1:-}" i matched=0 left=0 acted=0 wait_save="${ROTA_KEYCHAIN_IMPORT_WAIT_SECS:-}"
+  [[ -n "$wait_save" ]] || ROTA_KEYCHAIN_IMPORT_WAIT_SECS=30
+  for i in "${!DIRS[@]}"; do
+    if [[ -n "$want" && "$want" != "${LABELS[$i]}" && "$want" != "$(basename "${DIRS[$i]}")" ]]; then continue; fi
+    matched=1
+    keychain_only_login "${DIRS[$i]}" || continue
+    acted=1
+    if ROTA_KEYCHAIN_IMPORT=1 keychain_import_request "${DIRS[$i]}" force; then
+      printf '%s: imported the Keychain login into %s\n' "${LABELS[$i]}" "$(tilde "${DIRS[$i]}/.credentials.json")"
+    else
+      left=1
+      printf '%s: still Keychain-only. The keeper (launchd agent com.rota.keeper) did not import it; check `rota keeper-status`, or run `rota keeper` from a terminal on the Mac itself (Terminal.app, not ssh or tmux).\n' "${LABELS[$i]}" >&2
+    fi
+  done
+  if [[ -n "$want" ]] && (( ! matched )); then
+    printf 'import-keychain: no seat named %s (labels and dir basenames both work)\n' "$want" >&2
+    return 2
+  fi
+  (( acted )) || printf 'nothing to import: no seat has a Keychain-only login\n'
+  return "$left"
+}
+
 # Does this dir hold a usable stored credential? `status` only needs the yes/no.
+# A Keychain-only login is imported first (see above), so a seat logged in a
+# minute ago counts on the first read instead of after the keeper's next tick.
 has_credential() {
   local f="$1/.credentials.json"
+  cred_is_complete "$f" || keychain_import_request "$1" || true
   [[ -f "$f" ]] || return 1
   if command -v jq >/dev/null 2>&1; then
     [[ -n "$(cred_token "$1")" ]]
@@ -3544,8 +3635,12 @@ collect_usage() {
     local tok_expired_ago=""   # reset per slot: it feeds the reason below, whichever branch ran
     local wake_dormant=0       # reset per slot: 1 = this run decided to wake a dormant seat
     local wake_recent=0        # reset per slot: 1 = a wake was already spent within the TTL
+    # a Keychain-only login (2026-11-10): ask the keeper to import it, then read
+    cred_is_complete "$credfile" || keychain_import_request "$adir" || true
     token="$(cred_token "$adir")"
-    if [[ -z "$token" ]]; then
+    if [[ -z "$token" ]] && keychain_only_login "$adir"; then
+      U_WHY[i]="$(keychain_only_why "$adir")"
+    elif [[ -z "$token" ]]; then
       # NAME THE REAL DEFECT. On 2026-08-07 a gutted file reported "no stored
       # credential", and that one phrase sent the operator hunting for a login that had
       # already happened. A file that EXISTS but has been cleared is not a missing
@@ -7011,6 +7106,11 @@ main() {
       # busy panes are reported and picked up on a later run (keeper step 4b).
       shift || true
       cmd_pane_converge "$@"
+      ;;
+    import-keychain)
+      # a login that landed only in the Keychain: ask the keeper to import it now.
+      shift || true
+      cmd_import_keychain "$@"
       ;;
     reconcile)
       # pool v2: rewrite the accounts-file mapping from dir identities.

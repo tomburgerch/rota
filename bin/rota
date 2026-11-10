@@ -51,6 +51,7 @@ rota <verb> [args]
   accounts               the human table: quota, renewal, cost, and whose seat it is
   switch [seat]          bare: switch to the best seat; with a seat: switch-all <seat> [flags]
   login <seat>           open `claude` pinned to <seat>'s config dir so you can run /login
+  import-keychain [seat] import a login that landed only in the macOS Keychain into the seat's file now
   billing [--json]       quota + renewal + cost in one table (--local reads this box)
   status                 seats, which is current, each login state
   keeper-status          last keeper tick + the tail of keeper.log
@@ -118,7 +119,14 @@ cmd_login() {
   # to trust the whole home folder (2026-10-17). ROTA_LOGIN_CWD overrides it.
   local wd="${ROTA_LOGIN_CWD:-$HOME/code}"
   [ -d "$wd" ] && cd "$wd"
-  exec env CLAUDE_CONFIG_DIR="$dir" CLAUDE_SEAT_LOGIN=1 claude
+  # Not exec: after the session ends, a login that landed only in the Keychain
+  # (a GUI-domain terminal does that) is imported into the seat's file at once,
+  # so the seat counts as logged in and gets measured without waiting for the
+  # keeper's next tick (2026-11-10, the akos seat showed loggedIn=false).
+  local rc=0
+  env CLAUDE_CONFIG_DIR="$dir" CLAUDE_SEAT_LOGIN=1 claude || rc=$?
+  if [ -f "$ENGINE" ]; then "$ENGINE" import-keychain "$seat" >&2 || true; fi
+  exit "$rc"
 }
 
 cmd_keeper_status() {
@@ -151,7 +159,7 @@ case "$verb" in
   cred-guard)       need "$GUARD"; exec "$GUARD" run "$@" ;;
   cred-restore)     need "$GUARD"; [ $# -ge 1 ] || die "usage: rota cred-restore <seat>" 2; exec "$GUARD" restore "$@" ;;
   reserve)          need "$RESERVE"; exec "$RESERVE" "$@" ;;
-  reconcile|normalize|pool-init|adopt-shared|pane-converge|repair-nested|roster|active|next)
+  reconcile|normalize|pool-init|adopt-shared|pane-converge|repair-nested|roster|active|next|import-keychain)
                     need "$ENGINE"; exec "$ENGINE" "$verb" "$@" ;;
   failover)         need "$ENGINE"; exec "$ENGINE" "$@" ;;
   *)                printf 'rota: unknown verb: %s\n\n' "$verb" >&2; usage_text >&2; exit 2 ;;
