@@ -535,6 +535,14 @@
 #                                     ever move credential files, same-filesystem
 #                                     renames, only when provably no process holds the
 #                                     chain in memory.
+#   rota failover seat add <email> [--alias <a>] [--ends YYYY-MM-DD]
+#   rota failover seat remove <email|alias>
+#   rota failover seat expire | seat list [--json]
+#                                     Add or remove one seat without editing files; the
+#                                     end date lives in billing.json and a temporary
+#                                     seat past it is removed by the keeper. Removal
+#                                     moves the dir to $CFG_DIR/trash, never deletes.
+#                                     Exit codes: the "seat add / remove" block below.
 #   rota failover pool-init           Idempotent fresh-machine bootstrap (a laptop with
 #                                     one shared ~/.claude login and no pool yet): read
 #                                     the roster from the accounts file, create each
@@ -2223,6 +2231,401 @@ cmd_pool_init() {
     printf 'Next: `rota adopt-shared` moves this box'"'"'s shared login into its pool dir; every OTHER seat needs one browser login: rota login <seat>\n'
   fi
   return 0
+}
+
+# ── seat add / remove / expire / list (latch t_44st2m) ───────────────────────
+# Adding a seat used to be four steps by hand on every box: a roster line,
+# pool-init, `rota login`, then a billing.json row if the seat was borrowed for
+# a week. These verbs are the first, second and fourth; the login stays a login.
+#
+#   rota seat add <email> [--alias <a>] [--ends YYYY-MM-DD]
+#   rota seat remove <email|alias>
+#   rota seat expire
+#   rota seat list [--json]
+#
+# WHERE THE END DATE LIVES: billing.json, `.accounts[<email>].ends`, the row
+# every surface already reads (rota_seat_field, rota_seat_ended, `usage --json`
+# seat.ends). `seat add --ends` writes that row with `temporary: true`, and that
+# flag is the ONLY thing that lets `seat expire` remove a seat: a cancelled
+# subscription with an `ends` a human wrote goes "ended" and stays in the
+# roster, exactly as before. So `seat add` never puts an end date on a seat it
+# did not add, or a permanent seat could be scheduled for removal by a typo.
+#
+# REMOVAL NEVER DELETES A CREDENTIAL. The pool dir (and the switch stash, when
+# there is one) is MOVED to $CFG_DIR/trash/<YYYY-MM-DD>-<alias>/, mode 0700, and
+# a later `seat remove` or `seat expire` purges trash folders whose date is more
+# than ROTA_SEAT_TRASH_DAYS (30) days back. Putting a seat back by hand is `mv`
+# plus the roster line.
+#
+# The Keychain: a GUI-domain login leaves a per-dir Keychain item, and the only
+# code that deletes one is the keeper's keychain_unify, which covers seats in
+# the roster. `seat remove` therefore deletes nothing there; it says so when an
+# item exists. On the expiry path the keeper has drained it earlier in the same
+# tick.
+#
+# EXIT CODES
+#   add     0 added, or already there   2 bad input / no accounts file
+#           4 the alias is taken        7 the pool mutation lock is held
+#           1 billing.json unusable (nothing was written)
+#   remove  0 removed, or not there     2 bad input / no accounts file
+#           3 a live claude process is pinned to the seat's dir
+#           5 it is the active seat (the shared claim, or the launch slot)
+#           6 not removable: the only seat, a RESERVED seat, or a dir outside the pool
+#           7 the pool mutation lock is held
+#   expire  0 always (what it could not remove yet is printed and retried)
+#   list    0
+# add and remove print ONE JSON line on stdout; everything for a human goes to
+# stderr. expire prints `seat-expire: …` lines, one per thing it did.
+SEAT_TRASH_DIR="$CFG_DIR/trash"
+SEAT_MSG=""; SEAT_TRASH=""; SEAT_EMAIL=""; SEAT_ALIAS=""
+
+seat_fail() {  # seat_fail <exit-code> <message>
+  printf 'rota seat: %s\n' "$2" >&2
+  exit "$1"
+}
+
+seat_valid_email() {  # lowercase already; one address, nothing a roster line or a shell could misread
+  local e="${1:-}"
+  (( ${#e} >= 6 && ${#e} <= 254 )) || return 1
+  [[ "$e" =~ ^[a-z0-9][a-z0-9._+-]*@[a-z0-9]([a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}$ ]] || return 1
+  [[ "$e" != *..* ]]
+}
+seat_valid_alias() { [[ "${1:-}" =~ ^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$ ]]; }
+seat_alias_from_email() {  # the local part, folded to [a-z0-9-]
+  local a="${1%%@*}"
+  a="$(printf '%s' "$a" | tr -c 'a-z0-9' '-' | tr -s '-' | cut -c1-32)"
+  a="${a#-}"; a="${a%-}"
+  printf '%s' "$a"
+}
+seat_valid_date() {  # a real calendar date, written YYYY-MM-DD
+  local d="${1:-}" back
+  [[ "$d" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
+  back="$(date -j -f '%Y-%m-%d' "$d" '+%Y-%m-%d' 2>/dev/null || date -d "$d" '+%Y-%m-%d' 2>/dev/null || true)"
+  [[ "$back" == "$d" ]]
+}
+seat_lower() { printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]'; }
+
+# Roster lookup that needs no load_accounts (which dies on an empty roster).
+# Fills R_LABELS / R_DIRS; a name matches a label (case-folded) or a dir basename.
+R_LABELS=(); R_DIRS=()
+seat_read_roster() {
+  R_LABELS=(); R_DIRS=()
+  local label dir
+  while IFS='|' read -r label dir || [[ -n "${label:-}" ]]; do
+    label="${label//[$' \t\r']/}"; dir="${dir//[$' \t\r']/}"
+    [[ -n "$label" && "${label:0:1}" != "#" && -n "$dir" ]] || continue
+    # shellcheck disable=SC2088  # literal "~/" data value, expanded by hand
+    case "$dir" in "~/"*) dir="$HOME/${dir#\~/}" ;; esac
+    R_LABELS+=("$label"); R_DIRS+=("$dir")
+  done < "$ACCOUNTS_FILE"
+}
+seat_roster_index() {  # seat_roster_index <email|alias> → index, or nothing
+  local want i
+  want="$(seat_lower "${1:-}")"
+  for i in "${!R_LABELS[@]}"; do
+    if [[ "$(seat_lower "${R_LABELS[$i]}")" == "$want" || "$(basename "${R_DIRS[$i]}")" == "$want" ]]; then
+      printf '%s' "$i"; return 0
+    fi
+  done
+  return 0
+}
+
+seat_is_temporary() {  # seat_is_temporary <email>: did `seat add --ends` write this billing row?
+  [[ -r "$BILLING_JSON" ]] || return 1
+  jq -e --arg e "${1:-}" '(.accounts // {})[$e].temporary == true' "$BILLING_JSON" >/dev/null 2>&1
+}
+seat_billing_ends() {  # seat_billing_ends <email> → the row's end date, or nothing
+  [[ -r "$BILLING_JSON" ]] || return 0
+  jq -r --arg e "${1:-}" '(.accounts // {})[$e].ends // empty' "$BILLING_JSON" 2>/dev/null || true
+}
+seat_billing_write() {  # seat_billing_write <jq-filter> [jq args...]: atomic, 0600 kept out of it (no secret here)
+  local filter="$1" tmp; shift
+  mkdir -p "$CFG_DIR"
+  tmp="$(mktemp "$BILLING_JSON.seat.XXXXXX")" || return 1
+  if [[ -f "$BILLING_JSON" ]]; then
+    jq "$@" "$filter" "$BILLING_JSON" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  else
+    jq -n "$@" "{} | $filter" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  fi
+  mv "$tmp" "$BILLING_JSON"
+}
+
+cmd_seat_add() {
+  local email="" alias="" ends="" a
+  while (( $# )); do
+    a="$1"; shift
+    case "$a" in
+      --alias) (( $# )) || seat_fail 2 "--alias needs a value"; alias="$1"; shift ;;
+      --ends)  (( $# )) || seat_fail 2 "--ends needs a date (YYYY-MM-DD)"; ends="$1"; shift ;;
+      -*)      seat_fail 2 "unknown option for seat add (usage: rota seat add <email> [--alias <a>] [--ends YYYY-MM-DD])" ;;
+      *)       [[ -z "$email" ]] || seat_fail 2 "one email at a time (usage: rota seat add <email> [--alias <a>] [--ends YYYY-MM-DD])"
+               email="$a" ;;
+    esac
+  done
+  [[ -n "$email" ]] || seat_fail 2 "usage: rota seat add <email> [--alias <a>] [--ends YYYY-MM-DD]"
+  command -v jq >/dev/null 2>&1 || seat_fail 1 "jq is missing"
+  email="$(seat_lower "$email")"
+  seat_valid_email "$email" || seat_fail 2 "that is not an email address rota accepts (letters, digits, . _ + - around one @, and a dotted domain)"
+  if [[ -n "$alias" ]]; then
+    seat_valid_alias "$alias" || seat_fail 2 "an alias is 1 to 32 of a-z, 0-9 and -, not starting or ending with -"
+  fi
+  if [[ -n "$ends" ]]; then
+    seat_valid_date "$ends" || seat_fail 2 "--ends takes a real date written YYYY-MM-DD"
+    if [[ "$ends" < "$(date '+%Y-%m-%d')" ]]; then
+      seat_fail 2 "--ends $ends is in the past; the end date is the seat's last working day"
+    fi
+  fi
+  if [[ ! -f "$ACCOUNTS_FILE" ]]; then
+    accounts_file_missing_guidance
+    exit 2
+  fi
+  if [[ -f "$BILLING_JSON" ]] && ! jq -e 'type == "object"' "$BILLING_JSON" >/dev/null 2>&1; then
+    seat_fail 1 "$(tilde "$BILLING_JSON") does not parse as a JSON object; nothing was changed. Fix it, then re-run."
+  fi
+  pool_mutate_acquire || pool_mutate_busy_die "seat add"
+
+  seat_read_roster
+  local idx action dir cur_ends=""
+  idx="$(seat_roster_index "$email")"
+  if [[ -n "$idx" ]]; then
+    # already a seat: nothing to build. The end date moves only on a row this verb wrote.
+    action="exists"; dir="${R_DIRS[$idx]}"; email="${R_LABELS[$idx]}"
+    alias="$(basename "$dir")"
+    if [[ -n "$ends" ]]; then
+      if seat_is_temporary "$email"; then
+        seat_billing_write '.accounts[$e].ends = $d' --arg e "$email" --arg d "$ends" \
+          || seat_fail 1 "could not write $(tilde "$BILLING_JSON")"
+      else
+        printf 'rota seat: %s is already a seat and not a temporary seat (rota seat add did not give it an end date), so its end date is left alone. Edit %s to change it.\n' \
+          "$email" "$(tilde "$BILLING_JSON")" >&2
+      fi
+    fi
+    # a first run that died between the roster line and the dir is finished here
+    if [[ ! -d "$dir" ]]; then cmd_pool_init >&2; fi
+    printf 'rota seat: %s is already a seat (%s); nothing added.\n' "$email" "$(tilde "$dir")" >&2
+  else
+    [[ -n "$alias" ]] || alias="$(seat_alias_from_email "$email")"
+    seat_valid_alias "$alias" || seat_fail 2 "no usable alias can be made from $email; name one with --alias"
+    dir="$POOL_ROOT/$alias"
+    local i
+    for i in "${!R_DIRS[@]}"; do
+      if [[ "$(basename "${R_DIRS[$i]}")" == "$alias" ]]; then
+        seat_fail 4 "the alias $alias is taken by ${R_LABELS[$i]}; name another with --alias"
+      fi
+    done
+    if [[ -e "$dir" || -L "$dir" ]]; then
+      seat_fail 4 "$(tilde "$dir") already exists and is not in the roster; name another alias with --alias, or move that folder away first"
+    fi
+    local line_dir="$dir"
+    # shellcheck disable=SC2088  # the roster's own spelling: a literal ~/
+    if [[ "$POOL_ROOT" == "$HOME/.claude-pool" ]]; then line_dir="~/.claude-pool/$alias"; fi
+    # the engine's reader drops a last line that has no newline: end the file first
+    if [[ -s "$ACCOUNTS_FILE" && -n "$(tail -c 1 "$ACCOUNTS_FILE")" ]]; then printf '\n' >> "$ACCOUNTS_FILE"; fi
+    printf '%s|%s\n' "$email" "$line_dir" >> "$ACCOUNTS_FILE"
+    if [[ -n "$ends" ]]; then
+      seat_billing_write '.accounts = ((.accounts // {}) + {($e): (((.accounts // {})[$e] // {}) + {status:"active", ends:$d, temporary:true, source:$src})})' \
+        --arg e "$email" --arg d "$ends" --arg src "rota seat add, $(date '+%Y-%m-%d')" \
+        || printf 'rota seat: the seat was added but its end date could not be written to %s\n' "$(tilde "$BILLING_JSON")" >&2
+    fi
+    # the pool-init step: the dir, the shared links, the first-run state
+    cmd_pool_init >&2
+    action="added"
+    printf 'rota seat: added %s as %s. It needs one login on this box: rota login %s\n' "$email" "$alias" "$alias" >&2
+  fi
+  cur_ends="$(seat_billing_ends "$email")"
+  seat_is_temporary "$email" || cur_ends=""
+  jq -cn --arg action "$action" --arg email "$email" --arg alias "$alias" --arg dir "$dir" --arg ends "$cur_ends" \
+    '{ok:true, action:$action, email:$email, alias:$alias, dir:$dir, ends:(if $ends == "" then null else $ends end)}'
+}
+
+# Purge trash folders whose NAME date is more than the keep window back. Only
+# names this code writes (<date>-<alias>[-n]) and only real directories directly
+# under the trash folder are ever removed.
+seat_trash_purge() {
+  local days="${ROTA_SEAT_TRASH_DAYS:-30}" cutoff d name
+  [[ "$days" =~ ^[0-9]+$ ]] || days=30
+  [[ -d "$SEAT_TRASH_DIR" ]] || return 0
+  cutoff="$(date -v-"${days}"d '+%Y-%m-%d' 2>/dev/null || date -d "$days days ago" '+%Y-%m-%d' 2>/dev/null || true)"
+  [[ "$cutoff" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 0
+  for d in "$SEAT_TRASH_DIR"/*; do
+    [[ -d "$d" && ! -L "$d" ]] || continue
+    name="$(basename "$d")"
+    [[ "$name" =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2})-[a-z0-9-]+$ ]] || continue
+    [[ "${BASH_REMATCH[1]}" < "$cutoff" ]] || continue
+    rm -rf "${SEAT_TRASH_DIR:?}/$name" 2>/dev/null || continue
+    printf 'seat-expire: purged trash %s (older than %s days)\n' "$name" "$days"
+  done
+  return 0
+}
+
+# The removal itself. Returns the exit code documented above (0 = removed, 9 =
+# not in the roster) and never exits, so `seat expire` can keep going. Sets
+# SEAT_MSG (why not), SEAT_EMAIL, SEAT_ALIAS, SEAT_TRASH. The caller holds the
+# pool mutation lock.
+seat_remove_core() {  # seat_remove_core <email|alias>
+  local name="${1:-}" idx label dir alias claim cur pins
+  SEAT_MSG=""; SEAT_TRASH=""; SEAT_EMAIL=""; SEAT_ALIAS=""
+  seat_read_roster
+  idx="$(seat_roster_index "$name")"
+  [[ -n "$idx" ]] || { SEAT_MSG="$name is not in the roster"; return 9; }
+  label="${R_LABELS[$idx]}"; dir="${R_DIRS[$idx]}"; alias="$(basename "$dir")"
+  SEAT_EMAIL="$label"; SEAT_ALIAS="$alias"
+  if (( ${#R_LABELS[@]} <= 1 )); then
+    SEAT_MSG="$label is the only seat in the roster; rota needs at least one"; return 6
+  fi
+  if [[ "$dir" == "$HOME/.claude" ]] || { [[ -d "$dir" ]] && [[ "$dir" -ef "$HOME/.claude" ]]; } || [[ "$dir" != "$POOL_ROOT"/* ]]; then
+    SEAT_MSG="$label maps to $(tilde "$dir"), which is not a dir under $(tilde "$POOL_ROOT"); rota does not move it. Edit $(tilde "$ACCOUNTS_FILE") by hand."; return 6
+  fi
+  if [[ -f "$dir/${CLAUDE_RESERVED_MARKER:-RESERVED}" ]]; then
+    SEAT_MSG="$label is a RESERVED seat; release it first (rota reserve --release $alias)"; return 6
+  fi
+  claim="$(config_email "$HOME/.claude")"
+  if [[ -n "$claim" ]] && { [[ "$(seat_lower "$claim")" == "$(seat_lower "$label")" ]] || [[ "$claim" == "$(config_email "$dir")" ]]; }; then
+    SEAT_MSG="$label is the active seat; switch away first (rota switch <seat>)"; return 5
+  fi
+  cur=0
+  [[ -f "$STATE_FILE" ]] && cur="$(cat "$STATE_FILE" 2>/dev/null || echo 0)"
+  [[ "$cur" =~ ^[0-9]+$ ]] || cur=0
+  (( cur >= ${#R_LABELS[@]} )) && cur=0
+  if (( cur == idx )); then
+    SEAT_MSG="$label is the seat the launch slot points at; switch away first (rota switch <seat>)"; return 5
+  fi
+  pins="$(pids_pinned_to_dir "$dir")"
+  if [[ -n "$pins" ]]; then
+    SEAT_MSG="$label has live claude process(es) pinned to $(tilde "$dir"): pid $pins. Quit them, then retry."; return 3
+  fi
+
+  # 1. the roster line, atomically, comments and every other line as they were
+  local tmp line l d done_one=0
+  tmp="$(mktemp "$ACCOUNTS_FILE.seat.XXXXXX")" || { SEAT_MSG="could not write beside $(tilde "$ACCOUNTS_FILE")"; return 1; }
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    l="${line%%|*}"; l="${l//[$' \t\r']/}"
+    if (( ! done_one )) && [[ "$line" == *"|"* && "$l" == "$label" ]]; then done_one=1; continue; fi
+    printf '%s\n' "$line"
+  done < "$ACCOUNTS_FILE" > "$tmp"
+  mv "$tmp" "$ACCOUNTS_FILE" || { rm -f "$tmp"; SEAT_MSG="could not rewrite $(tilde "$ACCOUNTS_FILE")"; return 1; }
+  # the launch slot is an index into the roster: keep it on its seat
+  if [[ -f "$STATE_FILE" ]] && (( cur > idx )); then set_index "$((cur - 1))"; fi
+
+  # 2. the dir and the switch stash: MOVED, never deleted
+  local stamp base n=1 stash
+  stamp="$(date '+%Y-%m-%d')"; base="$SEAT_TRASH_DIR/$stamp-$alias"; SEAT_TRASH="$base"
+  while [[ -e "$SEAT_TRASH" ]]; do n=$((n + 1)); SEAT_TRASH="$base-$n"; done
+  ( umask 077; mkdir -p "$SEAT_TRASH" ) && chmod 700 "$SEAT_TRASH_DIR" "$SEAT_TRASH" 2>/dev/null || true
+  if [[ -d "$dir" ]]; then
+    mv "$dir" "$SEAT_TRASH/pool" || { SEAT_MSG="the roster line is gone but $(tilde "$dir") could not be moved to $(tilde "$SEAT_TRASH"); move it by hand"; return 1; }
+  fi
+  stash="$(cred_stash_path "$label")"
+  [[ -f "$stash" ]] && { mv "$stash" "$SEAT_TRASH/creds-stash.json" 2>/dev/null || true; }
+  printf 'seat %s (%s), removed %s from %s. Purged after %s days.\n' \
+    "$label" "$alias" "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$dir" "${ROTA_SEAT_TRASH_DAYS:-30}" > "$SEAT_TRASH/REMOVED.txt" 2>/dev/null || true
+  rm -f "$(dead_refresh_marker "$label")" "$(wake_stamp "$label")" "$CFG_DIR/keeper-kc-kept-$alias" \
+        "$(keychain_import_failed_stamp "$dir")" 2>/dev/null || true
+
+  # 3. the billing row, only when seat add wrote it
+  if seat_is_temporary "$label"; then
+    seat_billing_write 'del(.accounts[$e])' --arg e "$label" || true
+  fi
+
+  # 4. the Keychain is not ours to delete from here: say when something is left
+  if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]] && command -v security >/dev/null 2>&1 \
+     && security find-generic-password -s "$(pool_keychain_service "$dir")" >/dev/null 2>&1; then
+    SEAT_MSG="note: a Keychain item ($(pool_keychain_service "$dir")) still exists for $(tilde "$dir"). rota deletes Keychain items only in the keeper's unify step, which covers seats in the roster; delete this one in Keychain Access if it should go."
+  fi
+  return 0
+}
+
+cmd_seat_remove() {
+  [[ $# -eq 1 && "${1:0:1}" != "-" ]] || seat_fail 2 "usage: rota seat remove <email|alias>"
+  local name rc=0
+  name="$(seat_lower "$1")"
+  seat_valid_email "$name" || seat_valid_alias "$name" || seat_fail 2 "name the seat by its email or its alias"
+  command -v jq >/dev/null 2>&1 || seat_fail 1 "jq is missing"
+  if [[ ! -f "$ACCOUNTS_FILE" ]]; then
+    accounts_file_missing_guidance
+    exit 2
+  fi
+  pool_mutate_acquire || pool_mutate_busy_die "seat remove"
+  seat_remove_core "$name" || rc=$?
+  seat_trash_purge >&2
+  if (( rc == 9 )); then
+    printf 'rota seat: %s; nothing to remove.\n' "$SEAT_MSG" >&2
+    jq -cn --arg name "$name" '{ok:true, action:"absent", name:$name}'
+    return 0
+  fi
+  (( rc == 0 )) || seat_fail "$rc" "$SEAT_MSG"
+  if [[ -n "$SEAT_MSG" ]]; then printf 'rota seat: %s\n' "$SEAT_MSG" >&2; fi
+  printf 'rota seat: removed %s. Its dir is kept in %s for %s days.\n' "$SEAT_EMAIL" "$(tilde "$SEAT_TRASH")" "${ROTA_SEAT_TRASH_DAYS:-30}" >&2
+  jq -cn --arg email "$SEAT_EMAIL" --arg alias "$SEAT_ALIAS" --arg trash "$SEAT_TRASH" \
+    '{ok:true, action:"removed", email:$email, alias:$alias, trash:$trash}'
+}
+
+# Remove every TEMPORARY seat whose end date has passed (rota_seat_ended: the end
+# date is the last working day), then purge old trash. A seat that cannot go yet
+# (a live session, the active seat) stays "ended", which no picker offers, and
+# is tried again on the next run. The keeper calls this every tick.
+cmd_seat_expire() {
+  [[ $# -eq 0 ]] || seat_fail 2 "usage: rota seat expire"
+  command -v jq >/dev/null 2>&1 || return 0
+  [[ -f "$ACCOUNTS_FILE" ]] || return 0
+  local i rc due=() e
+  seat_read_roster
+  for i in "${!R_LABELS[@]}"; do
+    e="${R_LABELS[$i]}"
+    if seat_is_temporary "$e" && rota_seat_ended "$BILLING_JSON" "$e"; then due+=("$e"); fi
+  done
+  if (( ${#due[@]} )) || [[ -d "$SEAT_TRASH_DIR" ]]; then
+    pool_mutate_acquire || { printf 'seat-expire: skipped, the pool mutation lock is held\n'; return 0; }
+  fi
+  for e in ${due[@]+"${due[@]}"}; do
+    rc=0
+    seat_remove_core "$e" || rc=$?
+    if (( rc == 0 )); then
+      printf 'seat-expire: removed %s (ended %s), dir kept in %s\n' "$e" "$(rota_seat_field "$BILLING_JSON" "$e" 2)" "$(tilde "$SEAT_TRASH")"
+    else
+      printf 'seat-expire: kept %s, ended but not removable yet: %s\n' "$e" "$SEAT_MSG"
+    fi
+  done
+  seat_trash_purge
+  return 0
+}
+
+cmd_seat_list() {
+  local json=0 a
+  for a in "$@"; do
+    case "$a" in --json) json=1 ;; *) seat_fail 2 "usage: rota seat list [--json]" ;; esac
+  done
+  command -v jq >/dev/null 2>&1 || seat_fail 1 "jq is missing"
+  load_accounts
+  resolve_shared_identity --fast
+  local i rows="" logged temp ends active
+  for i in "${!DIRS[@]}"; do
+    logged=false; slot_logged_in "$i" && logged=true
+    temp=false; seat_is_temporary "${LABELS[$i]}" && temp=true
+    ends="$(rota_seat_field "$BILLING_JSON" "${LABELS[$i]}" 2)"
+    active=false; (( i == SHARED_SLOT )) && active=true
+    if (( json )); then
+      rows="$rows$(jq -cn --arg email "${LABELS[$i]}" --arg alias "$(basename "${DIRS[$i]}")" --arg dir "${DIRS[$i]}" \
+        --arg ends "$ends" --argjson loggedIn "$logged" --argjson temporary "$temp" --argjson active "$active" \
+        '{email:$email, alias:$alias, dir:$dir, loggedIn:$loggedIn, active:$active, temporary:$temporary, ends:(if $ends == "" then null else $ends end)}')"$'\n'
+    else
+      printf '%-12s %-40s loggedIn=%-5s %s%s\n' "$(basename "${DIRS[$i]}")" "${LABELS[$i]}" "$logged" \
+        "$([[ -n "$ends" ]] && printf 'ends %s' "$ends")" "$([[ "$temp" == true ]] && printf ' (temporary)')"
+    fi
+  done
+  if (( json )); then printf '%s' "$rows" | jq -cs '.'; fi
+  return 0
+}
+
+cmd_seat() {
+  local sub="${1:-}"; [[ $# -gt 0 ]] && shift
+  case "$sub" in
+    add)    cmd_seat_add "$@" ;;
+    remove) cmd_seat_remove "$@" ;;
+    expire) cmd_seat_expire "$@" ;;
+    list)   cmd_seat_list "$@" ;;
+    *)      seat_fail 2 "usage: rota seat add <email> [--alias <a>] [--ends YYYY-MM-DD] | seat remove <email|alias> | seat expire | seat list [--json]" ;;
+  esac
 }
 
 # Any live claude process AT ALL (pinned or not) blocks adopt-shared: an
@@ -6744,6 +7147,13 @@ main() {
     pool-init)
       shift || true
       cmd_pool_init "$@"
+      return 0 ;;
+    # seat add/remove/expire do their own roster reads: remove and expire must
+    # work on a roster load_accounts would refuse, and add prints the how-to
+    # when there is no file at all.
+    seat)
+      shift || true
+      cmd_seat "$@"
       return 0 ;;
     # roster prints the accounts file as the keeper consumes it: one "email|dir"
     # per line, comments and blank lines stripped, read-only. The pool keeper's
