@@ -1638,7 +1638,7 @@ set -e
 # seat that already has them is not rewritten, and oauthAccount is never touched
 mk_fresh poolinitfirstrun
 mkdir -p "$RUN/code" "$RUN/.claude-pool/alpha"
-printf '{"oauthAccount":{"emailAddress":"%s"},"hasCompletedOnboarding":true,"lastOnboardingVersion":"1.0.0","lastReleaseNotesSeen":"1.0.0","projects":{"%s":{"hasTrustDialogAccepted":true}}}' \
+printf '{"oauthAccount":{"emailAddress":"%s"},"hasCompletedOnboarding":true,"lastOnboardingVersion":"1.0.0","lastReleaseNotesSeen":"1.0.0","projects":{"%s":{"hasTrustDialogAccepted":true,"hasClaudeMdExternalIncludesApproved":true,"hasClaudeMdExternalIncludesWarningShown":true}}}' \
   "$(email_of alpha)" "$RUN/code" > "$RUN/.claude-pool/alpha/.claude.json"
 ALPHA_BEFORE="$(cat "$RUN/.claude-pool/alpha/.claude.json")"
 set +e
@@ -1664,6 +1664,59 @@ set -e
 [ "$RC" -eq 0 ] && grep -q 'already initialized' <<<"$OUT" \
   && ok "pool-init → first-run seeding is idempotent" \
   || bad "pool-init → first-run idempotence (got $RC: $OUT)"
+
+# every repo under the repo roots gets trust AND the external-imports answer (t_2cnbw6):
+# a main checkout (.git directory) is seeded, a linked worktree (.git file) and a plain
+# folder are not, a seat that already had the repo keeps its other keys, and a repo that
+# appears later is picked up by the next run
+mk_fresh poolinitrepos
+mkdir -p "$RUN/code/repo-a/.git" "$RUN/code/plain" "$RUN/worktrees/clone-b/.git" "$RUN/worktrees/linked" "$RUN/.claude-pool/alpha"
+printf 'gitdir: /nowhere\n' > "$RUN/worktrees/linked/.git"
+printf '{"oauthAccount":{"emailAddress":"%s"},"projects":{"%s":{"hasTrustDialogAccepted":true,"lastCost":7}}}' \
+  "$(email_of alpha)" "$RUN/code/repo-a" > "$RUN/.claude-pool/alpha/.claude.json"
+set +e
+OUT="$(ROTA_CLAUDE_VERSION=9.8.7 bash "$FAILOVER" pool-init 2>&1)"; RC=$?
+set -e
+RP_OK=1
+for a in "${ALIASES[@]}"; do
+  jq -e --arg a "$RUN/code/repo-a" --arg b "$RUN/worktrees/clone-b" --arg c "$RUN/code" \
+       --arg p "$RUN/code/plain" --arg l "$RUN/worktrees/linked" '
+      (.projects[$a].hasTrustDialogAccepted == true and .projects[$a].hasClaudeMdExternalIncludesApproved == true) and
+      (.projects[$b].hasTrustDialogAccepted == true and .projects[$b].hasClaudeMdExternalIncludesApproved == true) and
+      (.projects[$c].hasTrustDialogAccepted == true and .projects[$c].hasClaudeMdExternalIncludesApproved == true) and
+      (.projects | has($p) | not) and (.projects | has($l) | not)' \
+    "$RUN/.claude-pool/$a/.claude.json" >/dev/null 2>&1 || RP_OK=0
+done
+[ "$RC" -eq 0 ] && [ "$RP_OK" -eq 1 ] \
+  && ok "pool-init → every repo under ~/code and ~/worktrees is trusted with imports approved; worktrees and plain folders are not listed" \
+  || bad "pool-init → repo seeding (rc=$RC: $OUT)"
+[ "$(jq -r --arg a "$RUN/code/repo-a" '.projects[$a].lastCost' "$RUN/.claude-pool/alpha/.claude.json")" = 7 ] \
+  && [ "$(jq -r '.oauthAccount.emailAddress' "$RUN/.claude-pool/alpha/.claude.json")" = "$(email_of alpha)" ] \
+  && ok "pool-init → a repo entry a seat already had keeps its other keys, and the login is untouched" \
+  || bad "pool-init → repo seeding dropped keys (got: $(cat "$RUN/.claude-pool/alpha/.claude.json"))"
+mkdir -p "$RUN/code/repo-late/.git"
+set +e
+OUT="$(ROTA_CLAUDE_VERSION=9.8.7 bash "$FAILOVER" pool-init 2>&1)"; RC=$?
+set -e
+[ "$RC" -eq 0 ] && jq -e --arg d "$RUN/code/repo-late" '.projects[$d].hasClaudeMdExternalIncludesApproved == true' \
+    "$RUN/.claude-pool/alpha/.claude.json" >/dev/null 2>&1 \
+  && ok "pool-init → a repo cloned later is picked up by the next run" \
+  || bad "pool-init → late repo (rc=$RC: $OUT)"
+
+# seed-first-run (the keeper's hourly pass): seeds seats that exist, creates nothing
+mk_fresh seedfirstrun
+mkdir -p "$RUN/code/repo-x/.git" "$RUN/.claude-pool/alpha"
+printf '{"oauthAccount":{"emailAddress":"%s"}}' "$(email_of alpha)" > "$RUN/.claude-pool/alpha/.claude.json"
+set +e
+OUT="$(ROTA_CLAUDE_VERSION=9.8.7 bash "$FAILOVER" seed-first-run 2>&1)"; RC=$?
+set -e
+SF_MADE=0
+for a in "${ALIASES[@]}"; do [ "$a" = alpha ] && continue; [ -e "$RUN/.claude-pool/$a" ] && SF_MADE=1; done
+[ "$RC" -eq 0 ] && [ "$SF_MADE" -eq 0 ] \
+  && jq -e --arg d "$RUN/code/repo-x" '.projects[$d].hasTrustDialogAccepted == true and .projects[$d].hasClaudeMdExternalIncludesApproved == true' \
+       "$RUN/.claude-pool/alpha/.claude.json" >/dev/null 2>&1 \
+  && ok "seed-first-run → seeds the seat that exists and creates no other pool dir" \
+  || bad "seed-first-run (rc=$RC made=$SF_MADE: $OUT)"
 
 # a leading ~/ in the accounts file (what the README and the example use) means $HOME,
 # never a literal directory named "~" under the cwd

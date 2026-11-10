@@ -1210,6 +1210,17 @@ main() {
   fi
   [[ -x "$FAILOVER" || -f "$FAILOVER" ]] || { log "engine missing at $FAILOVER"; exit 1; }
 
+  # hourly: give every existing seat the first-run answers for repos cloned since the
+  # last pass, so a session started there never stops on the trust or imports screen
+  # (t_2cnbw6). Only missing keys are written; a failure never stops the tick.
+  local seed_stamp="$CFG_DIR/.first-run-seed" seed_now seed_mt
+  seed_now="$(date +%s)"
+  seed_mt="$(stat -f %m "$seed_stamp" 2>/dev/null || stat -c %Y "$seed_stamp" 2>/dev/null || echo 0)"
+  if (( seed_now - seed_mt >= ${KEEPER_FIRST_RUN_SEED_SECS:-3600} )); then
+    bash "$FAILOVER" seed-first-run >/dev/null 2>&1 || true
+    : > "$seed_stamp" 2>/dev/null || true
+  fi
+
   # the accounts map AS IT STOOD at tick start: reconcile (step 1) rewrites
   # the file to match the dirs, which erases the one record of which account
   # each dir was SUPPOSED to hold, the displaced-login detection (step 1b)
