@@ -54,8 +54,9 @@ rota <verb> [args]
   import-keychain [seat] import a login that landed only in the macOS Keychain into the seat's file now
   seat add <email> [--alias <a>] [--ends YYYY-MM-DD]
                          add a seat: roster line, pool dir, and an end date after which it is removed
-  seat remove <email|alias>
-                         remove a seat: roster line out, its dir moved to the trash for 30 days
+  seat remove <email|alias> [--permanent]
+                         remove a seat `seat add` added (--permanent: any seat): roster line out,
+                         its dir moved to the trash for 30 days
   seat list [--json]     seats with alias, login state and end date
   seat expire            remove temporary seats past their end date (the keeper runs this)
   billing [--json]       quota + renewal + cost in one table (--local reads this box)
