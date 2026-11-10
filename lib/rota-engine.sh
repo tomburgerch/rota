@@ -1903,6 +1903,14 @@ EOF
 #   hasCompletedOnboarding = true
 #   lastOnboardingVersion, lastReleaseNotesSeen = the installed claude version
 #   projects[<dir>].hasTrustDialogAccepted = true  for each ROTA_TRUST_DIRS dir
+#   and, since 2026-11-10 (latch t_2cnbw6), for every repo under ROTA_TRUST_REPO_ROOTS,
+#   plus hasClaudeMdExternalIncludesApproved on all of them. Measured on Claude Code
+#   2.1.322 with a temp config dir: the trust dialog keys on the MAIN checkout (a
+#   linked worktree takes its answer, a trusted parent folder does not count), and
+#   "Allow external CLAUDE.md file imports?" keys on the same entry. Until then a
+#   session started in a repo a seat had not seen stopped on both screens.
+#   ROTA_TRUST_REPO_ROOTS: colon-separated folders whose immediate children that are
+#   git main checkouts get both answers (default ~/code:~/worktrees:~/projects).
 # Only MISSING keys are added, so a seat that already starts clean is not
 # rewritten at all, and oauthAccount / credentials are never read or touched.
 # The theme itself lives in the shared settings.json, not here.
@@ -1934,9 +1942,10 @@ first_run_claude_version() {
 seed_first_run() {
   local dir="$1" version="$2"
   command -v python3 >/dev/null 2>&1 || return 0
-  python3 - "$dir/.claude.json" "$version" "${ROTA_TRUST_DIRS-$HOME/code}" <<'PY'
+  python3 - "$dir/.claude.json" "$version" "${ROTA_TRUST_DIRS-$HOME/code}" \
+    "${ROTA_TRUST_REPO_ROOTS-$HOME/code:$HOME/worktrees:$HOME/projects}" <<'PY'
 import json, os, sys, tempfile
-path, version, trust = sys.argv[1], sys.argv[2], sys.argv[3]
+path, version, trust, repo_roots = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 data = {}
 if os.path.exists(path):
     with open(path) as f:
@@ -1956,11 +1965,27 @@ if version:
     put("lastOnboardingVersion", version)
     put("lastReleaseNotesSeen", version)
 projects = data.setdefault("projects", {})
-for d in [d for d in trust.split(":") if d and os.path.isdir(d)]:
+# Every main checkout directly under a repo root (a child with a .git DIRECTORY;
+# a linked worktree has a .git file and takes its main checkout's answer).
+dirs = [d for d in trust.split(":") if d and os.path.isdir(d)]
+for root in [r for r in repo_roots.split(":") if r and os.path.isdir(r)]:
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        continue
+    for name in names:
+        d = os.path.join(root, name)
+        if os.path.isdir(os.path.join(d, ".git")) and d not in dirs:
+            dirs.append(d)
+for d in dirs:
     entry = projects.setdefault(d, {})
     if entry.get("hasTrustDialogAccepted") is not True:
         entry["hasTrustDialogAccepted"] = True
         changed.append(f"trust {d}")
+    if entry.get("hasClaudeMdExternalIncludesApproved") is not True:
+        entry["hasClaudeMdExternalIncludesApproved"] = True
+        entry["hasClaudeMdExternalIncludesWarningShown"] = True
+        changed.append(f"imports {d}")
 if not changed:
     sys.exit(0)
 mode = os.stat(path).st_mode & 0o777 if os.path.exists(path) else 0o600
@@ -1977,6 +2002,26 @@ except BaseException:
     raise
 print(", ".join(changed))
 PY
+}
+
+# seed-first-run: only the first-run answers, for seats that ALREADY exist. The keeper
+# runs it hourly (t_2cnbw6) so a repo cloned after pool-init never stops a session on
+# "trust this folder?" or the imports screen. Unlike pool-init it creates no dir and no
+# link, and with no accounts file it is a silent no-op.
+cmd_seed_first_run() {
+  [[ $# -eq 0 ]] || die "usage: rota failover seed-first-run"
+  [[ -f "$ACCOUNTS_FILE" ]] || return 0
+  load_accounts
+  local version i dir set_keys
+  version="$(first_run_claude_version)"
+  for i in "${!DIRS[@]}"; do
+    dir="${DIRS[$i]}"
+    [[ -d "$dir" && -f "$dir/.claude.json" ]] || continue
+    if [[ "$dir" == "$HOME/.claude" || "$dir" -ef "$HOME/.claude" ]]; then continue; fi
+    set_keys="$(seed_first_run "$dir" "$version")"
+    [[ -n "$set_keys" ]] && printf 'first-run state for %s: %s\n' "${LABELS[$i]}" "$set_keys"
+  done
+  return 0
 }
 
 cmd_pool_init() {
@@ -6552,6 +6597,10 @@ main() {
     # pool-init and roster do their own accounts-file check: with no file they
     # must print the how-to and exit 2 (a fresh box's most likely state), not
     # load_accounts' generic die.
+    seed-first-run)
+      shift || true
+      cmd_seed_first_run "$@"
+      return 0 ;;
     pool-init)
       shift || true
       cmd_pool_init "$@"
