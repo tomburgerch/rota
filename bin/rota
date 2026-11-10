@@ -125,7 +125,7 @@ cmd_login() {
   # keeper's next tick (2026-11-10, the akos seat showed loggedIn=false).
   local rc=0
   env CLAUDE_CONFIG_DIR="$dir" CLAUDE_SEAT_LOGIN=1 claude || rc=$?
-  if [ -f "$ENGINE" ]; then "$ENGINE" import-keychain "$seat" >&2 || true; fi
+  if [ -f "$ENGINE" ]; then "$ENGINE" import-keychain "$seat" --quiet >&2 || true; fi
   exit "$rc"
 }
 

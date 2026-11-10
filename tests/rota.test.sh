@@ -98,7 +98,7 @@ OUT="$("$R" login work@example.com)"
 check "login by label works too" 'grep -q "stub-claude CLAUDE_CONFIG_DIR=$TMP/home/.claude-pool/work" <<<"$OUT"'
 check "login banner says to run /login" 'grep -q "/login" <<<"$OUT"'
 OUT="$("$R" login work 2>&1)"
-check "login asks the engine for the Keychain import once the session ends" 'grep -q "^rota-engine.sh: import-keychain work\$" <<<"$OUT"'
+check "login asks the engine for the Keychain import once the session ends" 'grep -q "^rota-engine.sh: import-keychain work --quiet\$" <<<"$OUT"'
 check "the import runs after claude, never instead of it" '[ "$(grep -n stub-claude <<<"$OUT" | cut -d: -f1)" -lt "$(grep -n import-keychain <<<"$OUT" | cut -d: -f1)" ]'
 check "import-keychain is a verb" '"$R" import-keychain >/dev/null 2>&1'
 

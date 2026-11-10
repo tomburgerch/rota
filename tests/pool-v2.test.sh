@@ -2512,7 +2512,7 @@ set -e
 grep -q "$(email_of team) .*loggedIn=false" <<<"$OUT" \
   && ok "keychain-only → a login no tmux session can read yet is not reported as usable" \
   || bad "keychain-only → status before import (got: $OUT)"
-grep -q 'only in the macOS Keychain' <<<"$OUT2" && grep -q 'rota import-keychain team' <<<"$OUT2" \
+grep -q 'Keychain item exists for this seat' <<<"$OUT2" && grep -q 'rota import-keychain team' <<<"$OUT2" \
   && ! grep -q "log it in once with CLAUDE_CONFIG_DIR=[^ ]*team" <<<"$OUT2" \
   && ok "keychain-only → usage names the Keychain-only state and the verb that cures it" \
   || bad "keychain-only → usage reason (got: $(head -c 600 <<<"$OUT2"))"
@@ -2554,29 +2554,98 @@ mk_pool kcnoagent; kc_only alpha
 env "${kc_env[@]}" bash "$FAILOVER" status >/dev/null 2>&1 || true
 [ "$(kicks)" = "0" ] && ok "keychain-only → no keeper agent installed, nothing is kickstarted" || bad "keychain-only → no-agent (kicks: $(kicks))"
 
-# (e) the keeper never drains an item it could not read when it is the ONLY login
+# (e) the keeper never drains the ONLY login when it did not reach the file:
+# an EMPTY read (locked, failed) beside no complete file is left for the next tick
 mk_pool kcunread
 KSLUG="$(kslug "$RUN/.claude-pool/alpha")"
 rm -f "$RUN/.claude-pool/alpha/.credentials.json"
-printf 'not-json' > "$FAKE_STATE/kc-blob-$KSLUG"
+: > "$FAKE_STATE/kc-blob-$KSLUG"
 : > "$FAKE_STATE/kc-live-$KSLUG"
 run_keeper "${keeper_env[@]}"
 [ -f "$FAKE_STATE/kc-live-$KSLUG" ] && grep -q 'item LEFT in place' "$RUN/cfg/keeper.log" \
-  && ok "unify → an unreadable item beside NO complete file is left alone (it is the only login)" \
+  && ok "unify → an item whose read came back empty beside NO complete file is left alone (it is the only login)" \
   || bad "unify → unreadable only-login drained (got: $OUT)"
 run_keeper "${keeper_env[@]}"
 [ "$(grep -c 'item LEFT in place' "$RUN/cfg/keeper.log")" = "1" ] \
   && ok "unify → and that is logged once, not every tick" \
   || bad "unify → unreadable log repeats ($(grep -c 'item LEFT in place' "$RUN/cfg/keeper.log"))"
-# ...while an unreadable item beside a COMPLETE file is still a stale twin: drained
+# ...the next tick that CAN read it imports it
+cred_json TOK-LATE-READ > "$FAKE_STATE/kc-blob-$KSLUG"
+run_keeper "${keeper_env[@]}"
+grep -q 'TOK-LATE-READ' "$RUN/.claude-pool/alpha/.credentials.json" 2>/dev/null && [ ! -f "$FAKE_STATE/kc-live-$KSLUG" ] \
+  && ok "unify → once the item reads, it is imported and drained" \
+  || bad "unify → late import (got: $OUT)"
+# ...and the wait is bounded: after KEEPER_KC_KEEP_TICKS empty reads the item goes
+mk_pool kcstuck
+KSLUG="$(kslug "$RUN/.claude-pool/alpha")"
+rm -f "$RUN/.claude-pool/alpha/.credentials.json"
+: > "$FAKE_STATE/kc-blob-$KSLUG"; : > "$FAKE_STATE/kc-live-$KSLUG"
+run_keeper "${keeper_env[@]}" KEEPER_KC_KEEP_TICKS=2
+run_keeper "${keeper_env[@]}" KEEPER_KC_KEEP_TICKS=2
+[ -f "$FAKE_STATE/kc-live-$KSLUG" ] || bad "unify → bounded keep drained too early"
+run_keeper "${keeper_env[@]}" KEEPER_KC_KEEP_TICKS=2
+[ ! -f "$FAKE_STATE/kc-live-$KSLUG" ] && grep -q 'gave up after 2 ticks' <<<"$OUT" \
+  && ok "unify → an item that never reads is kept a bounded number of ticks, then drained" \
+  || bad "unify → bounded keep (got: $OUT)"
+# a blob that WAS read and is not a credential is no login: drained at once, file or not
+mk_pool kcgarbage
+KSLUG="$(kslug "$RUN/.claude-pool/alpha")"
+husk_json > "$RUN/.claude-pool/alpha/.credentials.json"
+printf 'not-json' > "$FAKE_STATE/kc-blob-$KSLUG"
+: > "$FAKE_STATE/kc-live-$KSLUG"
+run_keeper "${keeper_env[@]}"
+[ ! -f "$FAKE_STATE/kc-live-$KSLUG" ] \
+  && ok "unify → a garbage item beside a husk is drained at once (a revoked seat stays revoked)" \
+  || bad "unify → garbage item kept (got: $OUT)"
+set +e
+OUT2="$(env "${kc_env[@]}" bash "$FAILOVER" usage --json --no-refresh 2>&1)"
+set -e
+grep -q 'CLEARED' <<<"$OUT2" && ! grep -q 'only in the macOS Keychain' <<<"$OUT2" \
+  && ok "unify → and usage still says that seat needs a re-login" \
+  || bad "unify → revoked seat reason (got: $(head -c 400 <<<"$OUT2"))"
 mk_pool kcunread2
 KSLUG="$(kslug "$RUN/.claude-pool/alpha")"
-printf 'not-json' > "$FAKE_STATE/kc-blob-$KSLUG"
+: > "$FAKE_STATE/kc-blob-$KSLUG"
 : > "$FAKE_STATE/kc-live-$KSLUG"
 run_keeper "${keeper_env[@]}"
 [ ! -f "$FAKE_STATE/kc-live-$KSLUG" ] && grep -q 'kept the FILE' <<<"$OUT" \
   && ok "unify → an unreadable item beside a complete file is drained as before" \
   || bad "unify → unreadable twin not drained (got: $OUT)"
+
+# (f) a seat the keeper cannot import is not asked for on every poll, and its row
+# stops promising an import: one failed ask, then quiet for the retry window
+mk_pool kcbackoff; with_keeper_agent; kc_only team
+env "${kc_env[@]}" ROTA_KEYCHAIN_IMPORT_KICK_SECS=0 bash "$FAILOVER" status >/dev/null 2>&1 || true
+env "${kc_env[@]}" ROTA_KEYCHAIN_IMPORT_KICK_SECS=0 bash "$FAILOVER" status >/dev/null 2>&1 || true
+set +e
+OUT2="$(env "${kc_env[@]}" ROTA_KEYCHAIN_IMPORT_KICK_SECS=0 bash "$FAILOVER" usage --json --no-refresh 2>&1)"
+set -e
+[ "$(kicks)" = "1" ] \
+  && ok "keychain-only → a failed ask is remembered per seat: three reads past the throttle, one kickstart" \
+  || bad "keychain-only → failed-ask backoff (kicks: $(kicks))"
+grep -q 'has not imported it' <<<"$OUT2" && grep -q 'needs a re-login' <<<"$OUT2" \
+  && ok "keychain-only → after a failed ask the row says re-login, not 'on its next tick'" \
+  || bad "keychain-only → failed-ask reason (got: $(head -c 500 <<<"$OUT2"))"
+# before any ask has failed (asking off here), the row says the import is on its way
+mk_pool kcfresh; with_keeper_agent; kc_only team
+set +e
+OUT2="$(env "${kc_env[@]}" ROTA_KEYCHAIN_IMPORT=0 bash "$FAILOVER" usage --json --no-refresh 2>&1)"
+set -e
+grep -q 'only in the macOS Keychain' <<<"$OUT2" && grep -q 'rota import-keychain team' <<<"$OUT2" \
+  && ok "keychain-only → a fresh Keychain-only seat says the keeper imports it, and how to ask now" \
+  || bad "keychain-only → fresh reason (got: $(head -c 500 <<<"$OUT2"))"
+# a keeper tick in flight (or the keeper itself calling the engine): no kick, no wait
+mk_pool kclocked; with_keeper_agent; kc_only team
+mkdir -p "$RUN/cfg/keeper.lock"
+env "${kc_env[@]}" bash "$FAILOVER" status >/dev/null 2>&1 || true
+[ "$(kicks)" = "0" ] && ok "keychain-only → while a keeper tick holds the lock nothing is kickstarted" || bad "keychain-only → lock (kicks: $(kicks))"
+rmdir "$RUN/cfg/keeper.lock"
+# ROTA_KEYCHAIN_IMPORT=0 does not even probe the Keychain from has_credential
+: > "$FAKE_STATE/kc-calls"
+env "${kc_env[@]}" ROTA_KEYCHAIN_IMPORT=0 bash "$FAILOVER" status >/dev/null 2>&1 || true
+! grep -q "find $(kslug "$RUN/.claude-pool/team")" "$FAKE_STATE/kc-calls" \
+  && ok "keychain-only → with asking off, status makes no Keychain probe for the seat" \
+  || bad "keychain-only → off switch still probes"
 
 export HOME="$REAL_HOME"
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
