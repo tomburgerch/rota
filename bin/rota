@@ -52,6 +52,13 @@ rota <verb> [args]
   switch [seat]          bare: switch to the best seat; with a seat: switch-all <seat> [flags]
   login <seat>           open `claude` pinned to <seat>'s config dir so you can run /login
   import-keychain [seat] import a login that landed only in the macOS Keychain into the seat's file now
+  seat add <email> [--alias <a>] [--ends YYYY-MM-DD]
+                         add a seat: roster line, pool dir, and an end date after which it is removed
+  seat remove <email|alias> [--permanent]
+                         remove a seat `seat add` added (--permanent: any seat): roster line out,
+                         its dir moved to the trash for 30 days
+  seat list [--json]     seats with alias, login state and end date
+  seat expire            remove temporary seats past their end date (the keeper runs this)
   billing [--json]       quota + renewal + cost in one table (--local reads this box)
   status                 seats, which is current, each login state
   keeper-status          last keeper tick + the tail of keeper.log
@@ -159,7 +166,7 @@ case "$verb" in
   cred-guard)       need "$GUARD"; exec "$GUARD" run "$@" ;;
   cred-restore)     need "$GUARD"; [ $# -ge 1 ] || die "usage: rota cred-restore <seat>" 2; exec "$GUARD" restore "$@" ;;
   reserve)          need "$RESERVE"; exec "$RESERVE" "$@" ;;
-  reconcile|normalize|pool-init|adopt-shared|pane-converge|repair-nested|roster|active|next|import-keychain)
+  reconcile|normalize|pool-init|adopt-shared|pane-converge|repair-nested|roster|active|next|import-keychain|seat)
                     need "$ENGINE"; exec "$ENGINE" "$verb" "$@" ;;
   failover)         need "$ENGINE"; exec "$ENGINE" "$@" ;;
   *)                printf 'rota: unknown verb: %s\n\n' "$verb" >&2; usage_text >&2; exit 2 ;;

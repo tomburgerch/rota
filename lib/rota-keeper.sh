@@ -1259,6 +1259,35 @@ main() {
   # storage. macOS only; a no-op elsewhere. See "macOS Keychain duality" above.
   keychain_unify
 
+  # 0a. SEAT EXPIRY (latch t_44st2m): a temporary seat (`rota seat add --ends`)
+  # past its end date leaves the roster through the same path as `rota seat
+  # remove`: never while a live session is pinned to it or it is the active
+  # seat (it stays "ended", which no picker offers, and is retried next tick),
+  # and its dir is moved to the trash, not deleted. AFTER step 0 on purpose:
+  # the seat's Keychain item, if any, was harvested and drained just above.
+  # One log line per removal; a seat that cannot go yet is logged once.
+  local exp_out exp_line exp_seat exp_removed=0
+  exp_out="$(bash "$FAILOVER" seat expire 2>&1 || true)"
+  while IFS= read -r exp_line; do
+    case "$exp_line" in
+      "seat-expire: removed "*)
+        exp_removed=1
+        exp_seat="${exp_line#seat-expire: removed }"; exp_seat="${exp_seat%% *}"
+        log_state_clear "seat-expire-${exp_seat//[^A-Za-z0-9._@-]/_}"
+        log "$exp_line" ;;
+      "seat-expire: kept "*)
+        exp_seat="${exp_line#seat-expire: kept }"; exp_seat="${exp_seat%%,*}"
+        log_once "seat-expire-${exp_seat//[^A-Za-z0-9._@-]/_}" "$exp_line" "$exp_line" ;;
+      "seat-expire: "*) log "$exp_line" ;;
+    esac
+  done <<<"$exp_out"
+  if (( exp_removed )); then
+    # the roster just lost a line: every later step works from the new one
+    load_accounts || true
+    CANON_LBL=("${LABELS[@]}"); CANON_DIR=("${DIRS[@]}")
+    load_roster
+  fi
+
   # 0b. SHIM-GUARD, re-link the shim if a native auto-update clobbered it and
   # keep ~/.local/libexec/claude-real pointing at the newest native binary.
   shim_guard

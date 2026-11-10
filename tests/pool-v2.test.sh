@@ -2647,6 +2647,360 @@ env "${kc_env[@]}" ROTA_KEYCHAIN_IMPORT=0 bash "$FAILOVER" status >/dev/null 2>&
   && ok "keychain-only → with asking off, status makes no Keychain probe for the seat" \
   || bad "keychain-only → off switch still probes"
 
+# ── seat add / remove / expire (latch t_44st2m) ──────────────────────────────
+# `rota seat add <email> [--alias a] [--ends D]` appends the roster line, builds
+# the pool dir and records the end date in billing.json (the one place `ends`
+# lives); `rota seat remove` is the reverse and never deletes a credential, it
+# moves the dir to a dated trash folder; the keeper removes a temporary seat
+# whose end date has passed. Driven through bin/rota so the dispatch is covered.
+ROTA_BIN="$REPO_ROOT/bin/rota"
+seat_run() {  # seat_run <args...> → OUT (stdout), ERR (stderr), RC
+  set +e
+  OUT="$(bash "$ROTA_BIN" seat "$@" 2>"$RUN/state/seat-err")"; RC=$?
+  set -e
+  ERR="$(cat "$RUN/state/seat-err")"
+}
+last_json() { printf '%s\n' "$OUT" | tail -1; }
+TODAY="$(date '+%Y-%m-%d')"
+IN_5D="$(date -v+5d '+%Y-%m-%d')"
+IN_9D="$(date -v+9d '+%Y-%m-%d')"
+YESTERDAY="$(date -v-1d '+%Y-%m-%d')"
+
+mk_pool seatadd
+ACC_BEFORE="$(cat "$RUN/cfg/accounts")"
+seat_run add akos@example.com --ends "$IN_5D"
+[ "$RC" -eq 0 ] && ok "seat add → exit 0" || bad "seat add → exit 0 (got $RC: $OUT $ERR)"
+[ "$(last_json | jq -r '[.ok,.action,.email,.alias,.ends]|@tsv' 2>/dev/null)" = "$(printf 'true\tadded\takos@example.com\takos\t%s' "$IN_5D")" ] \
+  && ok "seat add → one machine-readable line: ok, action, email, alias, ends" \
+  || bad "seat add → machine-readable line (got: $(last_json))"
+[ "$(printf '%s\n' "$OUT" | wc -l | tr -d ' ')" = "1" ] && ok "seat add → stdout is that one line only" || bad "seat add → stdout one line (got: $OUT)"
+# shellcheck disable=SC2088  # the roster line carries a literal ~/
+[ "$(tail -1 "$RUN/cfg/accounts")" = 'akos@example.com|~/.claude-pool/akos' ] \
+  && ok "seat add → the roster line is appended as email|~/.claude-pool/<alias>" \
+  || bad "seat add → roster line (got: $(tail -1 "$RUN/cfg/accounts"))"
+[ "$(head -5 "$RUN/cfg/accounts")" = "$ACC_BEFORE" ] && ok "seat add → the existing roster lines and the comment are untouched" || bad "seat add → roster head changed"
+[ -d "$RUN/.claude-pool/akos" ] && [ -L "$RUN/.claude-pool/akos/settings.json" ] \
+  && ok "seat add → the pool dir exists with the shared links (the pool-init step ran)" \
+  || bad "seat add → pool dir + links"
+[ ! -e "$RUN/.claude-pool/akos/.credentials.json" ] && ok "seat add → no credential is created" || bad "seat add → a credential appeared"
+[ "$(jq -r '.accounts["akos@example.com"] | [.ends,.temporary,.status]|@tsv' "$RUN/cfg/billing.json" 2>/dev/null)" = "$(printf '%s\ttrue\tactive' "$IN_5D")" ] \
+  && ok "seat add → the end date is recorded in billing.json, where rota already reads ends" \
+  || bad "seat add → billing.json row (got: $(cat "$RUN/cfg/billing.json" 2>&1))"
+MARK="$RUN/.claude-pool/akos/TEMPORARY"
+[ -f "$MARK" ] && [ "$(grep '^added_as=' "$MARK")" = "added_as=akos@example.com" ] && [ "$(grep '^ends=' "$MARK")" = "ends=$IN_5D" ] && grep -q '^added_at=20' "$MARK" \
+  && ok "seat add → the pool dir itself carries the TEMPORARY marker: added-as email, end date, added-at" \
+  || bad "seat add → marker (got: $(cat "$MARK" 2>&1))"
+seat_run list --json
+[ "$(jq -r '.[] | select(.alias=="akos") | .addedAs' <<<"$OUT" 2>/dev/null)" = "akos@example.com" ] && ok "seat list --json → addedAs comes off the marker" || bad "seat list --json → addedAs (got: $OUT)"
+[ "$(jq -r '.[] | select(.email=="akos@example.com") | [.alias,.loggedIn,.ends,.temporary,.active]|@tsv' <<<"$OUT" 2>/dev/null)" = "$(printf 'akos\tfalse\t%s\ttrue\tfalse' "$IN_5D")" ] \
+  && ok "seat list --json → the new seat: alias, loggedIn=false, ends, temporary" \
+  || bad "seat list --json → new seat row (got: $OUT $ERR)"
+[ "$(jq -r '.[] | select(.email=="alpha@example.com") | [.alias,.loggedIn,.ends,.temporary,.active]|@tsv' <<<"$OUT" 2>/dev/null)" = "$(printf 'alpha\ttrue\t\tfalse\ttrue')" ] \
+  && ok "seat list --json → an old seat: logged in, no end date, the active one marked" \
+  || bad "seat list --json → old seat row (got: $OUT)"
+
+# idempotent
+seat_run add akos@example.com --ends "$IN_5D"
+[ "$RC" -eq 0 ] && [ "$(last_json | jq -r .action)" = "exists" ] && [ "$(grep -c '^akos@example.com|' "$RUN/cfg/accounts")" = "1" ] \
+  && ok "seat add → the same email again: exit 0, says it exists, one roster line" \
+  || bad "seat add → idempotent (rc $RC: $OUT)"
+seat_run add AKOS@Example.com --ends "$IN_9D"
+[ "$RC" -eq 0 ] && [ "$(last_json | jq -r '[.action,.ends]|@tsv')" = "$(printf 'exists\t%s' "$IN_9D")" ] \
+  && [ "$(jq -r '.accounts["akos@example.com"].ends' "$RUN/cfg/billing.json")" = "$IN_9D" ] && [ "$(grep '^ends=' "$MARK")" = "ends=$IN_9D" ] \
+  && ok "seat add → again with another end date updates it (the email is case-folded)" \
+  || bad "seat add → end date update (rc $RC: $OUT)"
+# an end date on a seat rota did not add would schedule a permanent seat's removal
+seat_run add wk@example.com --ends "$IN_5D"
+[ "$RC" -eq 0 ] && [ "$(last_json | jq -r '[.action,(.ends|tostring)]|@tsv')" = "$(printf 'exists\tnull')" ] \
+  && [ "$(jq -r '.accounts["wk@example.com"] // "none"' "$RUN/cfg/billing.json")" = "none" ] && grep -q 'not a temporary seat' <<<"$ERR" \
+  && ok "seat add → an existing permanent seat is never given an end date" \
+  || bad "seat add → permanent seat end date (rc $RC: $OUT / $ERR)"
+
+# bad input: exit 2, nothing written
+ACC_BEFORE="$(cat "$RUN/cfg/accounts")"
+seat_bad() {  # seat_bad <name> <args...>
+  local name="$1"; shift
+  seat_run add "$@"
+  [ "$RC" -eq 2 ] && [ "$(cat "$RUN/cfg/accounts")" = "$ACC_BEFORE" ] && [ -z "$OUT" ] \
+    && ok "seat add → refuses $name (exit 2, roster untouched)" \
+    || bad "seat add → refuses $name (rc $RC: $OUT $ERR)"
+}
+seat_bad "no email"
+seat_bad "an email with a space" 'a b@example.com'
+seat_bad "an email with a pipe" 'x@example.com|/tmp/evil'
+seat_bad "an email with a shell character" 'x;id@example.com'
+seat_bad "an email starting with a dash" '-x@example.com'
+seat_bad "an email with a newline" "$(printf 'x@example.com\ny@example.com')"
+seat_bad "an email without a domain dot" 'x@localhost'
+seat_bad "an alias with a space" new@example.com --alias 'bad alias'
+seat_bad "an alias with a slash" new@example.com --alias '../evil'
+seat_bad "an uppercase alias" new@example.com --alias Evil
+seat_bad "an impossible end date" new@example.com --ends 2026-02-31
+seat_bad "an end date that is not a date" new@example.com --ends tomorrow
+seat_bad "an end date in the past" new@example.com --ends "$YESTERDAY"
+seat_bad "an unknown flag" new@example.com --force
+[ ! -e "$RUN/.claude-pool/new" ] && ok "seat add → a refused add creates no pool dir" || bad "seat add → refused add left a dir"
+
+# alias collisions: exit 4
+seat_run add alpha@other.example.com
+[ "$RC" -eq 4 ] && [ "$(cat "$RUN/cfg/accounts")" = "$ACC_BEFORE" ] && grep -q -- '--alias' <<<"$ERR" \
+  && ok "seat add → a default alias that collides is refused (exit 4) and names --alias" \
+  || bad "seat add → alias collision (rc $RC: $OUT $ERR)"
+mkdir -p "$RUN/.claude-pool/leftover"
+seat_run add leftover@example.com
+[ "$RC" -eq 4 ] && ok "seat add → a pool dir that already exists under the alias is refused (exit 4)" || bad "seat add → existing dir collision (rc $RC)"
+seat_run add alpha@other.example.com --alias alpha2
+[ "$RC" -eq 0 ] && [ "$(last_json | jq -r '[.alias,(.ends|tostring)]|@tsv')" = "$(printf 'alpha2\tnull')" ] && [ -d "$RUN/.claude-pool/alpha2" ] \
+  && [ "$(grep '^ends=' "$RUN/.claude-pool/alpha2/TEMPORARY")" = "ends=" ] \
+  && ok "seat add → --alias names the dir; without --ends no end date is recorded" \
+  || bad "seat add → --alias (rc $RC: $OUT $ERR)"
+seat_run add first.last+x@example.com
+[ "$RC" -eq 0 ] && [ "$(last_json | jq -r .alias)" = "first-last-x" ] \
+  && ok "seat add → the default alias is the local part folded to [a-z0-9-]" \
+  || bad "seat add → default alias folding (rc $RC: $OUT $ERR)"
+# no accounts file: the how-to, exit 2
+mk_pool seatnofile; rm "$RUN/cfg/accounts"
+seat_run add akos@example.com
+[ "$RC" -eq 2 ] && [ ! -e "$RUN/cfg/accounts" ] && ok "seat add → without an accounts file: exit 2, none is invented" || bad "seat add → no accounts file (rc $RC)"
+# an unreadable billing.json is refused BEFORE the roster is touched
+mk_pool seatbadbilling; printf 'not json' > "$RUN/cfg/billing.json"
+ACC_BEFORE="$(cat "$RUN/cfg/accounts")"
+seat_run add akos@example.com --ends "$IN_5D"
+[ "$RC" -eq 1 ] && [ "$(cat "$RUN/cfg/accounts")" = "$ACC_BEFORE" ] && [ "$(cat "$RUN/cfg/billing.json")" = "not json" ] \
+  && ok "seat add → a billing.json that does not parse stops the add before the roster changes" \
+  || bad "seat add → bad billing.json (rc $RC: $OUT $ERR)"
+
+# a marker or an end date that cannot be written takes the roster line back out: never "added" with half missing
+mk_pool seatrollback
+ACC_BEFORE="$(cat "$RUN/cfg/accounts")"
+ROTA_SEAT_TEST_FAIL_AT=marker seat_run add akos@example.com --ends "$IN_5D"
+[ "$RC" -eq 1 ] && [ -z "$OUT" ] && [ "$(cat "$RUN/cfg/accounts")" = "$ACC_BEFORE" ] && [ ! -e "$RUN/.claude-pool/akos" ] \
+  && [ "$(jq -r '.accounts["akos@example.com"] // "none"' "$RUN/cfg/billing.json" 2>/dev/null || echo none)" = "none" ] && grep -q 'NOT added' <<<"$ERR" \
+  && ok "seat add → a marker that cannot be written: exit 1, roster as it was, no pool dir, nothing reported added" \
+  || bad "seat add → marker rollback (rc $RC: $OUT / $ERR / $(ls "$RUN/.claude-pool"))"
+mkdir -p "$RUN/ro"; printf '{}\n' > "$RUN/ro/billing.json"; chmod 555 "$RUN/ro"
+CLAUDE_BILLING_JSON="$RUN/ro/billing.json" seat_run add akos@example.com --ends "$IN_5D"
+chmod 755 "$RUN/ro"
+[ "$RC" -eq 1 ] && [ -z "$OUT" ] && [ "$(cat "$RUN/cfg/accounts")" = "$ACC_BEFORE" ] && [ ! -e "$RUN/.claude-pool/akos" ] \
+  && ok "seat add → an end date that cannot be recorded: exit 1 and the roster line is rolled back (never added with ends null)" \
+  || bad "seat add → billing rollback (rc $RC: $OUT / $ERR)"
+seat_run add akos@example.com --ends "$IN_5D"
+[ "$RC" -eq 0 ] && [ "$(last_json | jq -r '[.action,.ends]|@tsv')" = "$(printf 'added\t%s' "$IN_5D")" ] && ok "seat add → after a rolled-back try the same add works" || bad "seat add → add after rollback (rc $RC: $OUT $ERR)"
+
+# ── seat remove ──
+mk_pool seatrm
+printf '{"accounts":{"wk@example.com":{"plan":"Max 20x","status":"active"}}}\n' > "$RUN/cfg/billing.json"
+seat_run add akos@example.com --ends "$IN_5D"
+cred_json TOK-akos > "$RUN/.claude-pool/akos/.credentials.json"
+mkdir -p "$RUN/cfg/creds"; cred_json TOK-akos > "$RUN/cfg/creds/akos@example.com.json"
+# refused while a live claude process is pinned to the dir
+ps_pin 4242 "$RUN/.claude-pool/akos" > "$FAKE_STATE/pool-ps.txt"
+ACC_BEFORE="$(cat "$RUN/cfg/accounts")"
+seat_run remove akos
+[ "$RC" -eq 3 ] && [ "$(cat "$RUN/cfg/accounts")" = "$ACC_BEFORE" ] && [ -f "$RUN/.claude-pool/akos/.credentials.json" ] && grep -q 4242 <<<"$ERR" \
+  && ok "seat remove → refused while a live claude process is pinned to the dir (exit 3, names the pid)" \
+  || bad "seat remove → pinned refusal (rc $RC: $OUT $ERR)"
+rm -f "$FAKE_STATE/pool-ps.txt"
+# a seat rota seat add did not add is refused without --permanent
+seat_run remove wk
+[ "$RC" -eq 8 ] && [ "$(cat "$RUN/cfg/accounts")" = "$ACC_BEFORE" ] && [ -d "$RUN/.claude-pool/wk" ] && grep -q -- '--permanent' <<<"$ERR" \
+  && ok "seat remove → a seat without the TEMPORARY marker is refused (exit 8) and names --permanent" \
+  || bad "seat remove → permanent refusal (rc $RC: $OUT $ERR)"
+# a marker that is a symlink is not a marker
+ln -s "$RUN/.claude-pool/akos/TEMPORARY" "$RUN/.claude-pool/team/TEMPORARY"
+seat_run remove team
+[ "$RC" -eq 8 ] && ok "seat remove → a symlinked marker does not make a seat temporary (exit 8)" || bad "seat remove → symlinked marker (rc $RC)"
+rm "$RUN/.claude-pool/team/TEMPORARY"
+# the active seat (the shared claim) is refused
+seat_run remove alpha@example.com --permanent
+[ "$RC" -eq 5 ] && [ "$(cat "$RUN/cfg/accounts")" = "$ACC_BEFORE" ] && [ -d "$RUN/.claude-pool/alpha" ] \
+  && ok "seat remove → the active seat is refused (exit 5)" \
+  || bad "seat remove → active refusal (rc $RC: $OUT $ERR)"
+# the launch slot (the `current` index) is refused too, and a later slot shifts with the roster
+echo 2 > "$RUN/cfg/current"   # team (0-based 2)
+seat_run remove team --permanent
+[ "$RC" -eq 5 ] && ok "seat remove → the seat the launch slot points at is refused (exit 5)" || bad "seat remove → launch slot refusal (rc $RC)"
+# a reserved seat is somebody's: refused
+: > "$RUN/.claude-pool/primary/RESERVED"
+seat_run remove primary --permanent
+[ "$RC" -eq 6 ] && [ -d "$RUN/.claude-pool/primary" ] && ok "seat remove → a RESERVED seat is refused (exit 6)" || bad "seat remove → reserved refusal (rc $RC)"
+rm "$RUN/.claude-pool/primary/RESERVED"
+seat_run remove 'bad name'
+[ "$RC" -eq 2 ] && ok "seat remove → a name that is neither an email nor an alias: exit 2" || bad "seat remove → bad name (rc $RC)"
+# a Keychain item for the dir is not touched from here: it is named in a note
+: > "$FAKE_STATE/kc-live-$(kslug "$RUN/.claude-pool/akos")"
+echo 4 > "$RUN/cfg/current"   # akos is line 5 (0-based 4): refused as the launch slot…
+seat_run remove akos
+[ "$RC" -eq 5 ] || bad "seat remove → launch slot on the last seat (rc $RC)"
+echo 2 > "$RUN/cfg/current"
+seat_run remove wk --permanent # …and removing a seat ABOVE the slot moves the slot with its seat
+[ "$RC" -eq 0 ] && [ "$(cat "$RUN/cfg/current")" = "1" ] \
+  && ok "seat remove → the launch slot follows its seat when a line above it goes" \
+  || bad "seat remove → launch slot shift (rc $RC, current $(cat "$RUN/cfg/current"): $OUT $ERR)"
+[ "$(jq -r '.accounts["wk@example.com"].plan' "$RUN/cfg/billing.json")" = "Max 20x" ] \
+  && ok "seat remove → a billing row a human wrote is kept" || bad "seat remove → human billing row dropped"
+seat_run remove akos@example.com
+TRASH="$RUN/cfg/trash/$TODAY-akos"
+[ "$RC" -eq 0 ] && [ "$(last_json | jq -r '[.ok,.action,.email,.alias]|@tsv')" = "$(printf 'true\tremoved\takos@example.com\takos')" ] \
+  && ok "seat remove → exit 0 and one machine-readable line" || bad "seat remove → result (rc $RC: $OUT $ERR)"
+! grep -q 'akos' "$RUN/cfg/accounts" && grep -q '^# pool accounts, preserved comment line$' "$RUN/cfg/accounts" && [ "$(grep -c '|' "$RUN/cfg/accounts")" = "3" ] \
+  && ok "seat remove → the roster line is gone, the comment and the other seats stay" \
+  || bad "seat remove → roster after (got: $(cat "$RUN/cfg/accounts"))"
+[ ! -e "$RUN/.claude-pool/akos" ] && [ -f "$TRASH/pool/.credentials.json" ] && [ "$(jq -r .claudeAiOauth.accessToken "$TRASH/pool/.credentials.json")" = "TOK-akos" ] \
+  && ok "seat remove → the pool dir is MOVED to the dated trash folder, credential intact" \
+  || bad "seat remove → trash (ls: $(ls -la "$RUN/cfg/trash" 2>&1))"
+[ ! -e "$RUN/cfg/creds/akos@example.com.json" ] && [ -f "$TRASH/creds-stash.json" ] \
+  && ok "seat remove → the credential stash moves with it" || bad "seat remove → stash"
+[ "$(last_json | jq -r .trash)" = "$TRASH" ] && ok "seat remove → the line names the trash folder" || bad "seat remove → trash path in line (got: $(last_json))"
+[ "$(stat -f %Lp "$RUN/cfg/trash")" = "700" ] && ok "seat remove → the trash folder is private (0700)" || bad "seat remove → trash mode $(stat -f %Lp "$RUN/cfg/trash")"
+[ "$(jq -r '.accounts["akos@example.com"] // "none"' "$RUN/cfg/billing.json")" = "none" ] \
+  && ok "seat remove → the billing row seat add wrote is dropped" || bad "seat remove → temporary billing row kept"
+grep -q 'Keychain' <<<"$ERR" && [ -f "$FAKE_STATE/kc-live-$(kslug "$RUN/.claude-pool/akos")" ] && ! grep -q '^delete' "$FAKE_STATE/kc-calls" \
+  && ok "seat remove → a Keychain item for the dir is left alone and named in a note" \
+  || bad "seat remove → keychain note (err: $ERR)"
+seat_run remove akos@example.com
+[ "$RC" -eq 0 ] && [ "$(last_json | jq -r .action)" = "absent" ] && ok "seat remove → a seat that is not there: exit 0, says absent" || bad "seat remove → absent (rc $RC: $OUT)"
+# a second removal of the same alias on the same day does not overwrite the first trash folder
+seat_run add akos@example.com; seat_run remove akos
+[ "$RC" -eq 0 ] && [ -d "$TRASH/pool" ] && [ -d "$TRASH-2/pool" ] && ok "seat remove → a same-day second removal gets its own trash folder" || bad "seat remove → trash collision (ls: $(ls "$RUN/cfg/trash"))"
+# the last seat is never removed (an empty roster stops every verb)
+mk_pool seatlast; printf '%s|%s\n' "$(email_of wk)" "$RUN/.claude-pool/wk" > "$RUN/cfg/accounts"
+seat_run remove wk --permanent
+[ "$RC" -eq 6 ] && ok "seat remove → the only seat is refused (exit 6)" || bad "seat remove → last seat (rc $RC: $ERR)"
+
+# a roster line whose dir is a symlink, or outside the pool, is never moved
+mk_pool seatodd
+mkdir -p "$RUN/elsewhere/out"; ln -s "$RUN/.claude-pool/team" "$RUN/.claude-pool/link"
+printf '%s|%s\n' out@example.com "$RUN/elsewhere/out" >> "$RUN/cfg/accounts"
+printf '%s|%s\n' link@example.com "$RUN/.claude-pool/link" >> "$RUN/cfg/accounts"
+ACC_BEFORE="$(cat "$RUN/cfg/accounts")"
+seat_run remove out@example.com --permanent
+[ "$RC" -eq 6 ] && [ -d "$RUN/elsewhere/out" ] && [ "$(cat "$RUN/cfg/accounts")" = "$ACC_BEFORE" ] && ok "seat remove → a dir outside the pool is refused (exit 6), even with --permanent" || bad "seat remove → outside the pool (rc $RC: $ERR)"
+seat_run remove link@example.com --permanent
+[ "$RC" -eq 6 ] && [ -L "$RUN/.claude-pool/link" ] && [ -f "$RUN/.claude-pool/team/.credentials.json" ] && [ "$(cat "$RUN/cfg/accounts")" = "$ACC_BEFORE" ] \
+  && ok "seat remove → a dir that is a symlink is refused (exit 6); its target is untouched" || bad "seat remove → symlink dir (rc $RC: $ERR)"
+
+# an interrupted removal is finished by the next seat verb, and the same email can be added again
+mk_pool seatjournal
+seat_run add akos@example.com --ends "$IN_5D"
+cred_json TOK-akos > "$RUN/.claude-pool/akos/.credentials.json"
+ROTA_SEAT_TEST_FAIL_AT=mv seat_run remove akos
+[ "$RC" -eq 1 ] && ! grep -q akos "$RUN/cfg/accounts" && [ -f "$RUN/.claude-pool/akos/.credentials.json" ] && [ -f "$RUN/cfg/seat-remove-journal/akos" ] \
+  && ok "seat remove → a move that fails: exit 1, and the unfinished removal is on record" \
+  || bad "seat remove → interrupted (rc $RC: $OUT $ERR; journal: $(ls "$RUN/cfg/seat-remove-journal" 2>&1))"
+seat_run add akos@example.com --ends "$IN_5D"
+[ "$RC" -eq 0 ] && [ "$(last_json | jq -r .action)" = "added" ] && [ -f "$RUN/cfg/trash/$TODAY-akos/pool/.credentials.json" ] \
+  && [ ! -e "$RUN/.claude-pool/akos/.credentials.json" ] && [ -z "$(ls "$RUN/cfg/seat-remove-journal")" ] \
+  && ok "seat add → the next seat verb finishes the interrupted removal first (credential in the trash), then adds the same email afresh" \
+  || bad "seat add → after an interrupted removal (rc $RC: $OUT $ERR)"
+# …and so does the keeper's tick
+cred_json TOK-akos > "$RUN/.claude-pool/akos/.credentials.json"
+ROTA_SEAT_TEST_FAIL_AT=mv seat_run remove akos
+run_keeper "${keeper_env[@]}" CLAUDE_FAILOVER_USAGE_CMD=
+[ ! -e "$RUN/.claude-pool/akos" ] && [ -z "$(ls "$RUN/cfg/seat-remove-journal")" ] && grep -q 'seat-expire: removed akos@example.com (finishing an interrupted removal)' "$RUN/cfg/keeper.log" \
+  && ok "keeper → a removal a killed run left half done is finished on the next tick, with one log line" \
+  || bad "keeper → interrupted removal (log: $(grep seat-expire "$RUN/cfg/keeper.log" 2>&1))"
+# an entry rota did not write is never acted on
+printf 'dir=%s\nlabel=x\nalias=wk\ntrash=/tmp/x\n' "$RUN/.claude-pool/wk" > "$RUN/cfg/seat-remove-journal/wk"
+seat_run expire
+[ -d "$RUN/.claude-pool/wk" ] && grep -q "^wk@example.com|" "$RUN/cfg/accounts" && ok "seat expire → a journal entry with a trash path outside rota's trash is left alone" || bad "seat expire → foreign journal entry acted on"
+rm -f "$RUN/cfg/seat-remove-journal/wk"
+
+# ── expiry + the trash purge ──
+marker_ends() {  # marker_ends <dir> <value>: rewrite the marker's end date in place
+  sed -i '' "s|^ends=.*|ends=$2|" "$1/TEMPORARY"
+}
+# the end date is the last working day: a seat ending TODAY stays; a date that is not a date never removes
+mk_pool seatedge
+seat_run add today@example.com --ends "$IN_5D"; marker_ends "$RUN/.claude-pool/today" "$TODAY"
+seat_run add junk@example.com --ends "$IN_5D"; marker_ends "$RUN/.claude-pool/junk" "2020-13-45"
+seat_run add loose@example.com --ends "$IN_5D"; marker_ends "$RUN/.claude-pool/loose" "2020-01-01 or so"
+seat_run expire
+grep -q '^today@example.com|' "$RUN/cfg/accounts" && [ -d "$RUN/.claude-pool/today" ] && ok "seat expire → a seat whose end date is today stays" || bad "seat expire → ends today was removed ($OUT)"
+grep -q '^junk@example.com|' "$RUN/cfg/accounts" && grep -q '^loose@example.com|' "$RUN/cfg/accounts" && [ "$(grep -c 'is not a date' <<<"$OUT")" = "2" ] \
+  && ok "seat expire → an end date that is not a strict YYYY-MM-DD never removes a seat, and says so" || bad "seat expire → bad date ($OUT)"
+run_keeper "${keeper_env[@]}" CLAUDE_FAILOVER_USAGE_CMD=
+run_keeper "${keeper_env[@]}" CLAUDE_FAILOVER_USAGE_CMD=
+[ "$(grep -c 'kept junk@example.com.*is not a date' "$RUN/cfg/keeper.log")" = "1" ] && ok "keeper → a bad end date is logged once, not every tick" || bad "keeper → bad date log ($(grep -c 'is not a date' "$RUN/cfg/keeper.log"))"
+
+# the temporary flag travels with the DIR: the owner signs in as another address, reconcile renames the label
+mk_pool seatrename
+seat_run add akos@example.com --ends "$IN_5D"
+cred_json TOK-real > "$RUN/.claude-pool/akos/.credentials.json"
+jq '.oauthAccount = {emailAddress:"real@example.com"}' "$RUN/.claude-pool/akos/.claude.json" > "$RUN/cfg/j.tmp" && mv "$RUN/cfg/j.tmp" "$RUN/.claude-pool/akos/.claude.json"
+run_keeper "${keeper_env[@]}" CLAUDE_FAILOVER_USAGE_CMD=
+grep -q "^real@example.com|" "$RUN/cfg/accounts" && ! grep -q '^akos@example.com|' "$RUN/cfg/accounts" \
+  && ok "keeper → reconcile renames the seat's label to the account its dir holds (the setup for the next three)" \
+  || bad "keeper → reconcile rename (accounts: $(cat "$RUN/cfg/accounts"); out: $OUT)"
+run_keeper "${keeper_env[@]}" CLAUDE_FAILOVER_USAGE_CMD=
+[ "$(jq -r '[(.accounts["real@example.com"].ends // "none"), (.accounts["akos@example.com"] // "gone" | tostring)]|@tsv' "$RUN/cfg/billing.json")" = "$(printf '%s\tgone' "$IN_5D")" ] \
+  && ok "keeper → on the next tick the billing row moves to the new label, so the end date still shows" \
+  || bad "keeper → billing row follow (billing: $(cat "$RUN/cfg/billing.json"))"
+seat_run list --json
+[ "$(jq -r '.[] | select(.alias=="akos") | [.email,.temporary,.ends,.addedAs]|@tsv' <<<"$OUT")" = "$(printf 'real@example.com\ttrue\t%s\takos@example.com' "$IN_5D")" ] \
+  && ok "seat list → the renamed seat is still temporary, with its end date and the address it was added as" || bad "seat list → renamed seat ($OUT)"
+marker_ends "$RUN/.claude-pool/akos" "$YESTERDAY"
+run_keeper "${keeper_env[@]}" CLAUDE_FAILOVER_USAGE_CMD=
+! grep -q 'claude-pool/akos$' "$RUN/cfg/accounts" && [ -d "$RUN/cfg/trash/$TODAY-akos/pool" ] && [ "$(grep -c '|' "$RUN/cfg/accounts")" = "4" ] \
+  && ok "keeper → a seat whose label was renamed still expires on its end date" \
+  || bad "keeper → renamed seat expiry (accounts: $(cat "$RUN/cfg/accounts"); log: $(grep seat-expire "$RUN/cfg/keeper.log"))"
+
+# two roster lines with ONE label: expiry takes the marked dir, never "the first line with this label"
+mk_pool seatdup
+seat_run add tmpx@example.com --ends "$IN_5D"
+sed -i '' "s|^tmpx@example.com\||primary@example.com\||" "$RUN/cfg/accounts"
+marker_ends "$RUN/.claude-pool/tmpx" "$YESTERDAY"
+seat_run expire
+[ -f "$RUN/.claude-pool/primary/.credentials.json" ] && [ "$(grep -c '^primary@example.com|' "$RUN/cfg/accounts")" = "1" ] && grep -q "^primary@example.com|$RUN/.claude-pool/primary\$" "$RUN/cfg/accounts" \
+  && ok "seat expire → with a duplicate label the permanent seat's dir and roster line are untouched" \
+  || bad "seat expire → duplicate label hit the permanent seat (accounts: $(cat "$RUN/cfg/accounts"); out: $OUT)"
+[ ! -e "$RUN/.claude-pool/tmpx" ] && [ -d "$RUN/cfg/trash/$TODAY-tmpx/pool" ] && ok "seat expire → …and the marked dir is the one that goes" || bad "seat expire → duplicate label, marked dir stayed ($OUT)"
+seat_run add tmpy@example.com; seat_run add tmpz@example.com
+sed -i '' -e "s|^tmpy@example.com\||twin@example.com\||" -e "s|^tmpz@example.com\||twin@example.com\||" "$RUN/cfg/accounts"
+seat_run remove twin@example.com
+[ "$RC" -eq 6 ] && [ -d "$RUN/.claude-pool/tmpy" ] && [ -d "$RUN/.claude-pool/tmpz" ] && ok "seat remove → a name two added seats share is refused (exit 6): name the alias" || bad "seat remove → ambiguous name (rc $RC: $ERR)"
+
+# ── expiry + the trash purge ──
+mk_pool seatexp
+seat_run add akos@example.com --ends "$IN_5D"
+seat_run add temp2@example.com --ends "$IN_5D"
+# a seat rota did not add, cancelled and past its end: `ended`, never removed
+jq --arg d "$YESTERDAY" '.accounts["wk@example.com"] = {status:"cancelled", ends:$d}' "$RUN/cfg/billing.json" > "$RUN/cfg/b.tmp" && mv "$RUN/cfg/b.tmp" "$RUN/cfg/billing.json"
+marker_ends "$RUN/.claude-pool/akos" "$YESTERDAY"
+mkdir -p "$RUN/cfg/trash/2020-01-01-old/pool" "$RUN/cfg/trash/$(date -v-29d '+%Y-%m-%d')-young/pool" "$RUN/cfg/trash/not-a-trash-name"
+ps_pin 4243 "$RUN/.claude-pool/akos" > "$FAKE_STATE/pool-ps.txt"
+seat_run expire
+[ "$RC" -eq 0 ] && [ -d "$RUN/.claude-pool/akos" ] && grep -q '^akos@example.com|' "$RUN/cfg/accounts" && grep -q 'seat-expire: kept akos@example.com' <<<"$OUT" \
+  && ok "seat expire → an ended temporary seat with a live session stays (ended), to be retried" \
+  || bad "seat expire → kept while pinned (rc $RC: $OUT $ERR)"
+[ ! -e "$RUN/cfg/trash/2020-01-01-old" ] && [ -d "$RUN/cfg/trash/$(date -v-29d '+%Y-%m-%d')-young" ] && [ -d "$RUN/cfg/trash/not-a-trash-name" ] \
+  && ok "seat expire → trash older than 30 days is purged; younger and foreign folders stay" \
+  || bad "seat expire → purge (ls: $(ls "$RUN/cfg/trash"))"
+rm -f "$FAKE_STATE/pool-ps.txt"
+# the keeper's tick does it, and logs one line
+run_keeper "${keeper_env[@]}" CLAUDE_FAILOVER_USAGE_CMD=
+[ "$RC" -eq 0 ] && ! grep -q '^akos@example.com|' "$RUN/cfg/accounts" && [ -d "$RUN/cfg/trash/$TODAY-akos/pool" ] \
+  && ok "keeper → a temporary seat past its end date is removed by the tick" \
+  || bad "keeper → expiry removal (rc $RC: $OUT)"
+[ "$(grep -c 'seat-expire: removed akos@example.com' "$RUN/cfg/keeper.log")" = "1" ] \
+  && ok "keeper → the removal is one log line" || bad "keeper → expiry log (log: $(cat "$RUN/cfg/keeper.log" 2>&1 | tail -5))"
+grep -q '^temp2@example.com|' "$RUN/cfg/accounts" && grep -q '^wk@example.com|' "$RUN/cfg/accounts" \
+  && ok "keeper → a temporary seat still in date and a cancelled seat rota did not add both stay" \
+  || bad "keeper → expiry touched the wrong seat (accounts: $(cat "$RUN/cfg/accounts"))"
+run_keeper "${keeper_env[@]}" CLAUDE_FAILOVER_USAGE_CMD=
+[ "$(grep -c 'seat-expire' "$RUN/cfg/keeper.log")" = "1" ] && ok "keeper → a second tick has nothing to expire and logs nothing" || bad "keeper → second tick logged expiry again"
+# an ended seat that cannot be removed yet is logged once, not every tick
+marker_ends "$RUN/.claude-pool/temp2" "$YESTERDAY"
+ps_pin 4244 "$RUN/.claude-pool/temp2" > "$FAKE_STATE/pool-ps.txt"
+run_keeper "${keeper_env[@]}" CLAUDE_FAILOVER_USAGE_CMD=
+run_keeper "${keeper_env[@]}" CLAUDE_FAILOVER_USAGE_CMD=
+[ "$(grep -c 'seat-expire: kept temp2@example.com' "$RUN/cfg/keeper.log")" = "1" ] && grep -q '^temp2@example.com|' "$RUN/cfg/accounts" \
+  && ok "keeper → an ended seat with a live session stays and is logged once across ticks" \
+  || bad "keeper → kept-seat log (log: $(grep seat-expire "$RUN/cfg/keeper.log"))"
+rm -f "$FAKE_STATE/pool-ps.txt"
+run_keeper "${keeper_env[@]}" CLAUDE_FAILOVER_USAGE_CMD=
+! grep -q '^temp2@example.com|' "$RUN/cfg/accounts" && ok "keeper → …and goes on the first tick it is safe" || bad "keeper → retry removal"
+
 export HOME="$REAL_HOME"
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

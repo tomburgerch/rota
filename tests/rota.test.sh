@@ -101,6 +101,8 @@ OUT="$("$R" login work 2>&1)"
 check "login asks the engine for the Keychain import once the session ends" 'grep -q "^rota-engine.sh: import-keychain work --quiet\$" <<<"$OUT"'
 check "the import runs after claude, never instead of it" '[ "$(grep -n stub-claude <<<"$OUT" | cut -d: -f1)" -lt "$(grep -n import-keychain <<<"$OUT" | cut -d: -f1)" ]'
 check "import-keychain is a verb" '"$R" import-keychain >/dev/null 2>&1'
+check "seat passes through to the engine with its arguments" '[ "$("$R" seat add a@example.com --ends 2030-01-01)" = "rota-engine.sh: seat add a@example.com --ends 2030-01-01" ]'
+check "help lists seat add and seat remove" 'grep -q "^  seat add <email>" <<<"$HELP" && grep -q "^  seat remove <email|alias>" <<<"$HELP"'
 
 # --- login on a RESERVED seat (2026-10-17: `ssh -t ballito rota login gmail` exited 9) ---
 # Drive the REAL shim: a wrapper named `claude` on PATH runs lib/rota-shim.sh, which finds
