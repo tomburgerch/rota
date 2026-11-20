@@ -1638,7 +1638,7 @@ set -e
 # seat that already has them is not rewritten, and oauthAccount is never touched
 mk_fresh poolinitfirstrun
 mkdir -p "$RUN/code" "$RUN/.claude-pool/alpha"
-printf '{"oauthAccount":{"emailAddress":"%s"},"hasCompletedOnboarding":true,"lastOnboardingVersion":"1.0.0","lastReleaseNotesSeen":"1.0.0","projects":{"%s":{"hasTrustDialogAccepted":true,"hasClaudeMdExternalIncludesApproved":true,"hasClaudeMdExternalIncludesWarningShown":true}}}' \
+printf '{"oauthAccount":{"emailAddress":"%s"},"hasCompletedOnboarding":true,"claudeInChromeDefaultEnabled":false,"lastOnboardingVersion":"1.0.0","lastReleaseNotesSeen":"1.0.0","projects":{"%s":{"hasTrustDialogAccepted":true,"hasClaudeMdExternalIncludesApproved":true,"hasClaudeMdExternalIncludesWarningShown":true}}}' \
   "$(email_of alpha)" "$RUN/code" > "$RUN/.claude-pool/alpha/.claude.json"
 ALPHA_BEFORE="$(cat "$RUN/.claude-pool/alpha/.claude.json")"
 set +e

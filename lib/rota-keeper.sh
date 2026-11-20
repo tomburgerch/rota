@@ -1241,6 +1241,18 @@ main() {
     : > "$seed_stamp" 2>/dev/null || true
   fi
 
+  # every tick: a seat or ~/.claude.json without claudeInChromeDefaultEnabled gets false, so a
+  # resumed session never stops on Claude's "Chrome extension detected" screen (t_n8srwe).
+  # Never overwrites an existing true or false; a file that does not parse is logged once.
+  local cd_out cd_line
+  cd_out="$(bash "$FAILOVER" chrome-default 2>&1 || true)"
+  while IFS= read -r cd_line; do
+    case "$cd_line" in
+      *"is not valid JSON"*) log_once "chrome-default-bad-${cd_line//[^A-Za-z0-9]/_}" "$cd_line" "$cd_line" ;;
+      "chrome-default: "*) log "$cd_line" ;;
+    esac
+  done <<<"$cd_out"
+
   # the accounts map AS IT STOOD at tick start: reconcile (step 1) rewrites
   # the file to match the dirs, which erases the one record of which account
   # each dir was SUPPOSED to hold, the displaced-login detection (step 1b)
