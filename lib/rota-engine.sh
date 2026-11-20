@@ -2111,6 +2111,9 @@ def put(key, value):
         data[key] = value
         changed.append(key)
 put("hasCompletedOnboarding", True)
+if "claudeInChromeDefaultEnabled" not in data:   # t_n8srwe: skip the "Claude in Chrome detected" screen
+    data["claudeInChromeDefaultEnabled"] = False
+    changed.append("claudeInChromeDefaultEnabled")
 if version:
     put("lastOnboardingVersion", version)
     put("lastReleaseNotesSeen", version)
@@ -2170,6 +2173,74 @@ cmd_seed_first_run() {
     if [[ "$dir" == "$HOME/.claude" || "$dir" -ef "$HOME/.claude" ]]; then continue; fi
     set_keys="$(seed_first_run "$dir" "$version")"
     [[ -n "$set_keys" ]] && printf 'first-run state for %s: %s\n' "${LABELS[$i]}" "$set_keys"
+  done
+  return 0
+}
+
+# chrome_default_file <.claude.json path> → prints "set" when it added the key, "badjson" when
+# the file does not parse, nothing otherwise. Claude Code 2.1.327+ opens a "Claude in Chrome
+# extension detected" dialog on every start while the global config has no
+# claudeInChromeDefaultEnabled key (t_n8srwe: 8 resumed Durban sessions sat on it for hours).
+# Absent key → false. An existing true or false is never touched; every other key and the file
+# mode are preserved; the write is a temp file in the same dir plus a rename.
+chrome_default_file() {
+  command -v python3 >/dev/null 2>&1 || return 0
+  python3 - "$1" <<'PY'
+import json, os, sys, tempfile
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        data = json.load(f)
+except (ValueError, OSError):
+    print("badjson"); sys.exit(0)
+if not isinstance(data, dict):
+    print("badjson"); sys.exit(0)
+if "claudeInChromeDefaultEnabled" in data:
+    sys.exit(0)
+data["claudeInChromeDefaultEnabled"] = False
+mode = os.stat(path).st_mode & 0o7777
+fd, tmp = tempfile.mkstemp(prefix=".claude.json.chrome.", dir=os.path.dirname(path))
+try:
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+except BaseException:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+    raise
+print("set")
+PY
+}
+
+# chrome-default: one pass over every seat dir under the pool (a *.lock or hidden entry is not a
+# seat), every roster dir, and ~/.claude.json. The keeper runs it every tick (one parse per file).
+cmd_chrome_default() {
+  [[ $# -eq 0 ]] || die "usage: rota failover chrome-default"
+  local -a cands=(); local d f res seen=":"
+  for d in "$POOL_ROOT"/*/; do
+    d="${d%/}"; [[ -d "$d" ]] || continue
+    case "$(basename "$d")" in *.lock|.*) continue ;; esac
+    cands+=("$d/.claude.json")
+  done
+  if [[ -f "$ACCOUNTS_FILE" ]]; then
+    load_accounts
+    for d in "${DIRS[@]}"; do
+      [[ "$d" == "$HOME/.claude" || "$d" -ef "$HOME/.claude" ]] && continue
+      cands+=("$d/.claude.json")
+    done
+  fi
+  cands+=("$HOME/.claude.json")
+  for f in "${cands[@]}"; do
+    [[ -f "$f" ]] || continue
+    case "$seen" in *":$f:"*) continue ;; esac
+    seen="$seen$f:"
+    res="$(chrome_default_file "$f")"
+    case "$res" in
+      set) printf 'chrome-default: set claudeInChromeDefaultEnabled=false in %s\n' "$(tilde "$f")" ;;
+      badjson) printf 'chrome-default: %s is not valid JSON, left alone\n' "$(tilde "$f")" ;;
+    esac
   done
   return 0
 }
@@ -7370,6 +7441,10 @@ main() {
     # pool-init and roster do their own accounts-file check: with no file they
     # must print the how-to and exit 2 (a fresh box's most likely state), not
     # load_accounts' generic die.
+    chrome-default)
+      shift || true
+      cmd_chrome_default "$@"
+      return 0 ;;
     seed-first-run)
       shift || true
       cmd_seed_first_run "$@"
