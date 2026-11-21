@@ -17,7 +17,7 @@ Four ideas, and everything else follows from them.
 1. **One seat, one directory, one refresh chain.** Every seat lives in `~/.claude-pool/<seat>/` as its own `CLAUDE_CONFIG_DIR`. A credential is written there once by `/login` and is never copied, moved, or stashed anywhere else. Settings, skills and transcripts are shared back into `~/.claude` by symlink, so switching seats does not lose your history.
 2. **"Active seat" is a pointer, not a credential location.** Switching rewrites which seat *new* launches use. A running session keeps the seat it was born with until it restarts.
 3. **A shim pins every launch.** `rota` installs a tiny wrapper as `~/.local/bin/claude`. A bare `claude` reads the pointer, exports that seat's `CLAUDE_CONFIG_DIR`, and execs the real binary. An explicit `CLAUDE_CONFIG_DIR` in your environment always wins over the shim.
-4. **A daemon does the thinking.** Every ten minutes the keeper reads live usage for every seat, and when the active seat crosses 90% of either window it switches the pointer to the seat whose weekly window resets *soonest* and still has room. Soonest-first, because a window that resets tomorrow is the one whose remaining allowance is about to evaporate.
+4. **A daemon does the thinking.** Every ten minutes the keeper reads live usage for every seat, and when the active seat crosses 98% of either window it switches the pointer to the seat whose weekly window resets *soonest* and still has room. Soonest-first, because a window that resets tomorrow is the one whose remaining allowance is about to evaporate.
 
 ## Install
 

@@ -40,7 +40,7 @@
 #                  rate-limited bucket. Rows are written into usage-cache.json
 #                  in cache_flush's exact shape, fetched_at included, so the
 #                  dashboard's staleness rendering and this daemon read one file.
-#   4. AUTO-SWITCH at AUTO_SWITCH_PCT (90) on the ACTIVE account's binding
+#   4. AUTO-SWITCH at AUTO_SWITCH_PCT (98) on the ACTIVE account's binding
 #                  weekly OR five-hour utilization: pick the best target
 #                  (logged in, not dead, SOONEST DEADLINE among accounts
 #                  with at least AUTO_SWITCH_TARGET_MIN_LEFT_PCT (30) weekly
@@ -81,7 +81,7 @@
 #
 # Config knobs, ~/.config/claude-failover/keeper.conf (sourced, optional),
 # with the ENVIRONMENT winning over the file so a one-off run can override:
-#   AUTO_SWITCH_PCT=90  AUTO_SWITCH_RESTART_IDLE=1  KEEPALIVE_MIN=90
+#   AUTO_SWITCH_PCT=98  AUTO_SWITCH_RESTART_IDLE=1  KEEPALIVE_MIN=90
 #   KEEPER_DISABLE=0    WARM_AT=03:00               WARM_ACCOUNTS=all
 #   PANE_CONVERGE=1     0 = never restart panes off a seat that cannot serve them (step 4b)
 #   KEEPALIVE_ENABLED=0             1 = restore the pre-2026-08-16 nudging
@@ -167,7 +167,7 @@ _env_AUTO_SWITCH_BOUNCE_SECS="${AUTO_SWITCH_BOUNCE_SECS:-}"
 _env_KEEPER_LOCK_STALE_SECS="${KEEPER_LOCK_STALE_SECS:-}"
 _env_PANE_CONVERGE="${PANE_CONVERGE:-}"
 _env_RESERVED_FLOOR_PCT="${RESERVED_FLOOR_PCT:-}"
-AUTO_SWITCH_PCT=90
+AUTO_SWITCH_PCT=98
 # A RESERVED seat (one carrying a RESERVED marker, see `rota reserve`) that
 # drops below this much weekly headroom says so once, on state change.
 # 25 rather than something tighter because the point is to hear about it while
@@ -1103,7 +1103,7 @@ fetch_usage() {  # fetch_usage <label> <dir>
 # when the API answers `resets_at: null` for a window nothing has spent in yet,
 # its `jreset` is empty, rota_seat_deadline gets nothing, and rota_deadline_beats
 # ranks that seat LAST ("nothing expiring") - while `rota usage`, `rota billing`
-# and `cl` now rank it by its projected reset. The 90%-wall auto-switch would
+# and `cl` now rank it by its projected reset. The 98%-wall auto-switch would
 # then send him somewhere the dashboard says is wrong, unattended, at 03:00.
 #
 # Same guards as the engine's project_weekly, minus the ones that cannot arise
@@ -1481,7 +1481,7 @@ main() {
       # (20%-left) + MIN_SESSION (10%-left) for an interactive choice the operator
       # is watching; this one runs AUTO_SWITCH_TARGET_MIN_LEFT_PCT (30%-left) plus
       # the AUTO_SWITCH_TARGET_MAX_PCT ceiling and the bounce hysteresis, because
-      # it fires unattended at the 90% wall and must not land the operator on an
+      # it fires unattended at the 98% wall and must not land the operator on an
       # account that is nearly spent too. Changing either side's floors is
       # still a decision to weigh against the other.
       #
@@ -1582,7 +1582,7 @@ main() {
           && why_clause="seat ENDS ${best_deadline%%T*}, before its weekly reset (${best_reset:-none}), so this is its LAST window"
         # ⚠️ NAME THE TRIGGER THAT ACTUALLY FIRED. An ended claim reports no
         # percentages at all, so the threshold sentence would render as
-        # "weekly ?% / 5h ?% (threshold 90%)" - a switch attributed to a wall it
+        # "weekly ?% / 5h ?% (threshold N%)" - a switch attributed to a wall it
         # never hit, in the one log line that explains an unattended 03:00 move.
         # no 5h window (Ultra, t_zwv49y): the 5h half is left out, never "5h ?%"
         local trigger="at weekly ${wk:-?}%${se:+ / 5h ${se}%} (threshold $AUTO_SWITCH_PCT%)"

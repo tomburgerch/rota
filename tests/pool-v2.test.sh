@@ -215,6 +215,7 @@ export CLAUDE_KEEPER_PATH_PREFIX="$STUB_DIR"
 export CLAUDE_FAILOVER_PS_CMD="$STUB_DIR/pool-ps"
 export CLAUDE_FAILOVER_USAGE_CMD="$STUB_DIR/usage-cmd"
 export CLAUDE_FAILOVER_VERIFY_SLEEP=0
+export AUTO_SWITCH_PCT=90               # fixtures sit at 91-95%; pin the wall so they test mechanics (default is 98, t_rvgj65)
 export ROTA_TMUX_SESSION="rota-test-none-$$"   # belt for the tmux stub's braces
 unset TMUX_PANE CLAUDE_CONFIG_DIR
 
@@ -528,6 +529,23 @@ run_keeper "${keeper_env[@]}"
 grep -q "switch=to:$(email_of primary)" "$RUN/cfg/keeper-status" \
   && ok "keeper → at 91% weekly it auto-switches to the SOONEST-EXPIRING target above the floor (34% used, not the emptiest at 6%)" \
   || bad "keeper → 91% auto-switch soonest-reset pick (status: $(cat "$RUN/cfg/keeper-status"))"
+
+# t_rvgj65 (2026-11-21): the DEFAULT wall is 98%, not 90%. With AUTO_SWITCH_PCT
+# unset the claim at 95% stays put; at 98% it switches.
+mk_pool k98a
+usage_fixture alpha   95 50 "$(iso_in +2H)" "$(iso_in +3d)"
+usage_fixture primary 34 10 "$(iso_in +2H)" "$(iso_in +2d)"
+run_keeper -u AUTO_SWITCH_PCT "${keeper_env[@]}"
+grep -q "switch=none" "$RUN/cfg/keeper-status" \
+  && ok "keeper → default wall is 98%: a claim at 95% weekly does NOT auto-switch" \
+  || bad "keeper → default 98 wall, 95% must not switch (status: $(cat "$RUN/cfg/keeper-status"))"
+mk_pool k98b
+usage_fixture alpha   98 50 "$(iso_in +2H)" "$(iso_in +3d)"
+usage_fixture primary 34 10 "$(iso_in +2H)" "$(iso_in +2d)"
+run_keeper -u AUTO_SWITCH_PCT "${keeper_env[@]}"
+grep -q "switch=to:$(email_of primary)" "$RUN/cfg/keeper-status" \
+  && ok "keeper → default wall is 98%: a claim at 98% weekly auto-switches" \
+  || bad "keeper → default 98 wall, 98% must switch (status: $(cat "$RUN/cfg/keeper-status"))"
 [ "$(jq -r '.oauthAccount.emailAddress' "$RUN/.claude.json")" = "$(email_of primary)" ] \
   && ok "keeper → the switch really landed (claim now the target)" \
   || bad "keeper → claim after auto-switch (got: $(cat "$RUN/.claude.json"))"

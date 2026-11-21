@@ -5112,7 +5112,7 @@ active_burndown_hold() {   # 0 = hold the active account, 1 = let the ranking de
 # still tell him where `rota switch` goes once the account is spent.
 #
 # NB a SECOND picker exists (stage-2 review, 2026-08-12): the pool keeper's
-# auto-switch (rota-keeper.sh, step 4), the 90%-wall safety valve, on its
+# auto-switch (rota-keeper.sh, step 4), the 98%-wall safety valve, on its
 # own knobs (AUTO_SWITCH_PCT, AUTO_SWITCH_TARGET_MAX_PCT,
 # AUTO_SWITCH_TARGET_MIN_LEFT_PCT, AUTO_SWITCH_BOUNCE_SECS).
 #
@@ -6675,7 +6675,7 @@ pane_pin_refuse_reason() {
 
 # Is the seat a restart would land on (the active claim's pool dir) unable to
 # serve? Same test and same threshold as pane_seat_cannot_serve (ended, dead
-# credential, weekly or 5h used at/over AUTO_SWITCH_PCT, i.e. at most 10% left
+# credential, weekly or 5h used at/over AUTO_SWITCH_PCT, i.e. at most 2% left
 # by default), so "walled" means one thing for leaving a seat and for landing
 # on one. 2026-10-18: pane %19 was restarted onto tommy with 0% of its 5h left.
 # Returns 0 = walled (PANE_TARGET_WHY says why), 1 = fine or unmeasured.
@@ -6927,7 +6927,7 @@ pane_dir_is_pool() {  # pane_dir_is_pool <dir>
 #   • the seat ENDED (billing.json date compare, rota_seat_ended)
 #   • its credential is dead/husked (cred_is_complete on the pool dir)
 #   • it is limited: weekly or 5h used at/over AUTO_SWITCH_PCT, the same
-#     threshold the keeper's auto-switch fires on (default 90), read from the
+#     threshold the keeper's auto-switch fires on (default 98), read from the
 #     usage cache only (NET=0, never the network). A window whose reset has
 #     passed counts as empty. An UNMEASURED seat is treated as healthy: when in
 #     doubt the pane stays, because a wrong stay costs nothing and a wrong move
@@ -6981,7 +6981,7 @@ pane_seat_cannot_serve() {  # pane_seat_cannot_serve <pool-dir> <email>
     PANE_SEAT_WHY="its credential is dead or a husk"
     return 0
   fi
-  thr="${AUTO_SWITCH_PCT:-90}"; [[ "$thr" =~ ^[0-9]+$ ]] || thr=90
+  thr="${AUTO_SWITCH_PCT:-98}"; [[ "$thr" =~ ^[0-9]+$ ]] || thr=98
   NET=0; collect_usage; NET="$saved_net"
   for i in "${!U_EMAIL[@]}"; do
     [[ "${U_EMAIL[$i]}" == "$id" ]] || continue

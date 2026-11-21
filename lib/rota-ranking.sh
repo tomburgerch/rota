@@ -12,7 +12,7 @@
 #   rota-engine.sh   compute_recommendation, the interactive surfaces
 #                    (`rota usage`, `rota switch`). Ranked on
 #                    min(weekly reset, SEAT END) from 2026-08-27.
-#   rota-keeper.sh   the unattended auto-switch at the 90% wall. Still ranked
+#   rota-keeper.sh   the unattended auto-switch at the 98% wall. Still ranked
 #                    on the weekly reset ALONE.
 #
 # They diverge for exactly ONE shape, and it was live on the pool within days of
