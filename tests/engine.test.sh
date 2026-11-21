@@ -366,6 +366,7 @@ export PATH="$STUB_DIR:$PATH"
 export TMUX_LOG
 export FAKE_OLD_EMAIL="$OLD_EMAIL" FAKE_NEW_EMAIL="$NEW_EMAIL"
 export CLAUDE_FAILOVER_VERIFY_SLEEP=0   # keep the retry loop instant under test
+export AUTO_SWITCH_PCT=90               # fixtures below sit at 91-100%; pin the wall so they test mechanics (default is 98, t_rvgj65)
 export ROTA_PANE_RESTART_SLEEP=0         # --restart-idle's shell wait, instant under test
 # The engine has NO default tmux session name (pane convergence is opt-in): the
 # suite names one so the stub tmux is consulted at all. Scenario 44 unsets it
@@ -3954,7 +3955,7 @@ set -e
 # later pane-converge moved it onto the ACTIVE seat (16% weekly left):
 # "I'm currently not able to run new sessions, which is disastrous". The rule:
 # converge and the after-switch restart move a pane only when its seat is
-# limited (>= AUTO_SWITCH_PCT, default 90), ended, or has a dead credential. A
+# limited (>= AUTO_SWITCH_PCT, default 98, pinned to 90 here), ended, or has a dead credential. A
 # healthy seat that is merely not the active one is left alone, and a pane
 # launched with CLAUDE_SEAT_OVERRIDE=1 (an explicit pick of a reserved seat) is
 # moved only when its seat ENDED. The claim here is primary.
