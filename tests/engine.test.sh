@@ -6300,6 +6300,60 @@ set -e
   && ok "valued 5h (die) → the original floor wording is unchanged" \
   || bad "valued 5h (die) → original wording (rc $RC: $OUT)"
 
+# --- off-limits: a RESERVED seat is never an automatic pick (t_9pzwxz) --------
+# Dazzle calls the RESERVED marker "off-limits". `switch-auto` (bare `rota
+# switch`) and `rota next` must step over it, on BOTH reservation sources.
+sa_fixture offlimits-ctl 30 "$(iso_in +2d)" 40
+set +e
+OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" switch-auto --dry-run 2>&1)"
+set -e
+grep -q "optimizer pick: wk@example.com" <<<"$OUT" \
+  && ok "off-limits control → unreserved wk is the pick" \
+  || bad "off-limits control → wk is the pick (got: $OUT)"
+sa_fixture offlimits-marker 30 "$(iso_in +2d)" 40
+printf 'owner=Ákos\nwhy=off-limits (set in Dazzle)\n' > "$RUN/.claude-pool/wk/RESERVED"
+set +e
+OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" switch-auto --dry-run 2>&1)"
+set -e
+grep -q "optimizer pick: alpha@example.com" <<<"$OUT" && ! grep -q "optimizer pick: wk@example.com" <<<"$OUT" \
+  && ok "off-limits (RESERVED marker) → switch-auto skips wk and picks alpha" \
+  || bad "off-limits (marker) → switch-auto skips wk (got: $OUT)"
+sa_fixture offlimits-cfg 30 "$(iso_in +2d)" 40
+printf 'wk Akos off-limits\n' > "$RUN/cfg/reserved"
+set +e
+OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" switch-auto --dry-run 2>&1)"
+JSON_OUT="$("$SCRIPT" usage --no-refresh --json 2>>"$ERRLOG")"
+set -e
+grep -q "optimizer pick: alpha@example.com" <<<"$OUT" \
+  && ok "off-limits (\$CFG_DIR/reserved line) → switch-auto skips wk and picks alpha" \
+  || bad "off-limits (cfg line) → switch-auto skips wk (got: $OUT)"
+[ "$(jq -r '.accounts[] | select(.email=="wk@example.com") | .recommendable' <<<"$JSON_OUT" 2>/dev/null)" = "false" ] \
+  && ok "off-limits → usage --json marks the reserved seat not recommendable" \
+  || bad "off-limits → usage --json recommendable false (got: $(jq -c '.accounts[]|select(.email=="wk@example.com")' <<<"$JSON_OUT" 2>/dev/null))"
+sa_fixture offlimits-all 30 "$(iso_in +2d)" 40
+touch "$RUN/.claude-pool/wk/RESERVED" "$RUN/.claude-pool/alpha/RESERVED"
+set +e
+OUT="$(FAKE_NEW_EMAIL=primary@example.com "$SCRIPT" switch-auto --dry-run 2>&1)"; RC=$?
+set -e
+[ "$RC" -ne 0 ] && ! grep -q "optimizer pick:" <<<"$OUT" \
+  && ok "off-limits (all others reserved) → switch-auto finds no pick instead of falling back" \
+  || bad "off-limits (all reserved) → no pick (rc $RC: $OUT)"
+sa_fixture offlimits-next 30 "$(iso_in +2d)" 40
+touch "$RUN/.claude-pool/wk/RESERVED"
+set +e
+OUT="$("$SCRIPT" next 2>&1)"
+set -e
+grep -q "Claude on account \[3/3\] primary@example.com" <<<"$OUT" \
+  && ok "off-limits → \`next\` steps over the reserved seat" \
+  || bad "off-limits → next skips reserved wk (got: $OUT)"
+sa_fixture offlimits-next2 30 "$(iso_in +2d)" 40
+set +e
+OUT="$("$SCRIPT" next 2>&1)"
+set -e
+grep -q "Claude on account \[2/3\] wk@example.com" <<<"$OUT" \
+  && ok "off-limits control → \`next\` lands on wk when it is not reserved" \
+  || bad "off-limits control → next lands on wk (got: $OUT)"
+
 restore_home
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

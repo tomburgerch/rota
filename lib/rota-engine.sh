@@ -5166,6 +5166,13 @@ compute_recommendation() {  # compute_recommendation <exclude_active 0|1> <requi
     if (( need_pool )) && [[ "${DIRS[$i]}" -ef "$HOME/.claude" ]]; then
       U_REASON[i]="its home IS the shared ~/.claude, nothing to swap in"; continue
     fi
+    # ⚠️ A RESERVED (Dazzle: "off-limits") SEAT IS NEVER AN AUTOMATIC PICK, before
+    # any number is read. It is signed in and measured, but it is somebody's seat:
+    # no quota figure makes it available. `rota switch <seat>` (switch-all) is the
+    # deliberate manual route and is untouched. Pinned by tests/off-limits.test.sh.
+    if seat_is_reserved "${LABELS[$i]}" "${DIRS[$i]}"; then
+      U_REASON[i]="reserved seat (off-limits): nothing is picked here automatically"; continue
+    fi
     # ⚠️ BEFORE THE NUMBERS, because an ended seat is not a measurement problem.
     # Every filter below this line asks how much quota a row has left; this one
     # asks whether the account still exists, and the answer outranks any number
@@ -7490,7 +7497,14 @@ main() {
     next)
       shift || true
       local i; i="$(current_index)"
-      local nxt=$(( (i + 1) % ${#DIRS[@]} ))
+      # round-robin, but a RESERVED seat (off-limits) is stepped over; if every
+      # other seat is reserved, stay where we are rather than land on one
+      local nxt="$i" step cand
+      for (( step = 1; step <= ${#DIRS[@]}; step++ )); do
+        cand=$(( (i + step) % ${#DIRS[@]} ))
+        seat_is_reserved "${LABELS[$cand]}" "${DIRS[$cand]}" && continue
+        nxt="$cand"; break
+      done
       launch "$nxt" --continue "$@"
       ;;
     reset)
