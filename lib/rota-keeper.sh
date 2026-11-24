@@ -1426,7 +1426,7 @@ main() {
 
   # 4. AUTO-SWITCH, the claim's binding weekly OR 5h utilization ≥ threshold,
   #    OR the claim's SEAT HAS ENDED (a wall no percentage can express)
-  local claim="" ui="" wk="" se="" claim_ended=0 claim_refused=0
+  local claim="" ui="" wk="" se="" claim_ended=0 claim_refused=0 claim_reserved=0 claim_dir=""
   claim="$(jq -r '.oauthAccount.emailAddress // empty' "$HOME/.claude.json" 2>/dev/null || true)"
   if [[ -n "$claim" ]]; then
     ui="$(usage_for "$claim")"
@@ -1449,6 +1449,22 @@ main() {
     # hysteresis, only the words differ (claim_refused).
     claim_refused=0
     [[ -n "$(rota_seat_refused_at "$USAGE_CACHE" "$claim")" ]] && { claim_refused=1; claim_ended=1; }
+    # ⚠️ AN OFF-LIMITS (RESERVED) CLAIM IS ALSO A WALL NO PERCENTAGE EXPRESSES
+    # (t_9pzwxz, 24 Nov). Setting akos off-limits in Dazzle left it the ACTIVE
+    # seat on durban, so every bare `claude` there still opened on Akos's seat.
+    # Move the claim off it on the same path as an ended seat. Panes stay where
+    # they are: pane converge moves a pane only when its seat cannot SERVE it
+    # (ended, dead, limited), and a reserved seat still serves the sessions
+    # already on it. Only NEW launches follow the claim.
+    if (( ! claim_ended )); then
+      local cj
+      for cj in "${!DIRS[@]}"; do
+        [[ "${LABELS[$cj]}" == "$claim" ]] || continue
+        claim_dir="${DIRS[$cj]}"
+        seat_is_reserved "$claim" "$claim_dir" && { claim_reserved=1; claim_ended=1; }
+        break
+      done
+    fi
     if (( claim_ended )) \
        || { [[ -n "$wk" || -n "$se" ]] && { { [[ -n "$wk" ]] && (( wk >= AUTO_SWITCH_PCT )); } \
                                         || { [[ -n "$se" ]] && (( se >= AUTO_SWITCH_PCT )); }; }; }; then
@@ -1593,6 +1609,8 @@ main() {
           && trigger="ENDED $(rota_seat_field "$BILLING_JSON" "$claim" 2), the seat is over whatever quota it still reports"
         (( claim_refused )) \
           && trigger="REFUSED (usage API HTTP 403), the account cannot use Claude Code whatever quota it still reports"
+        (( claim_reserved )) \
+          && trigger="is RESERVED (off-limits, owner $(sed -n 's/^owner=//p' "$claim_dir/${CLAUDE_RESERVED_MARKER:-RESERVED}" 2>/dev/null | head -1)), new sessions must not start on it"
         log "auto-switch: $claim $trigger → ${LABELS[$best]} (weekly ${best_wk}%, $why_clause, soonest-deadline pick above the ${AUTO_SWITCH_TARGET_MIN_LEFT_PCT}%-left floor)"
         set +e
         sw_out="$(bash "$FAILOVER" "${sw_args[@]}" 2>&1)"
@@ -1601,7 +1619,9 @@ main() {
         if (( sw_rc == 0 )); then
           st_switch="to:${LABELS[$best]}"
           printf '%s %s %s\n' "$(date +%s)" "${LABELS[$best]}" "$claim" > "$LAST_SWITCH_FILE"
-          if (( claim_refused )); then
+          if (( claim_reserved )); then
+            notify_once "auto-switch" "Switched to ${LABELS[$best]}: $claim is off-limits, new sessions start on ${LABELS[$best]}."
+          elif (( claim_refused )); then
             notify_once "auto-switch" "Switched to ${LABELS[$best]}: $claim is REFUSED (usage API 403), it cannot use Claude Code."
           elif (( claim_ended )); then
             notify_once "auto-switch" "Switched to ${LABELS[$best]}: $claim's seat ended $(rota_seat_field "$BILLING_JSON" "$claim" 2)."
@@ -1616,7 +1636,7 @@ main() {
         fi
       elif [[ "$st_switch" == "none" ]]; then
         # persists tick after tick while the wall stands, log ONCE per state
-        log_once no-target "$claim:$wk:$se:$claim_ended" "auto-switch: $claim $( if (( claim_refused )); then printf 'is REFUSED (HTTP 403)'; elif (( claim_ended )); then printf 'has ENDED'; else printf "at weekly ${wk:-?}%%${se:+ / 5h ${se}%%} ≥ $AUTO_SWITCH_PCT%%"; fi ) but no eligible target (all above ${AUTO_SWITCH_TARGET_MAX_PCT}%, under the ${AUTO_SWITCH_TARGET_MIN_LEFT_PCT}%-left floor, ended, dead, or unmeasured)"
+        log_once no-target "$claim:$wk:$se:$claim_ended" "auto-switch: $claim $( if (( claim_reserved )); then printf 'is RESERVED (off-limits)'; elif (( claim_refused )); then printf 'is REFUSED (HTTP 403)'; elif (( claim_ended )); then printf 'has ENDED'; else printf "at weekly ${wk:-?}%%${se:+ / 5h ${se}%%} ≥ $AUTO_SWITCH_PCT%%"; fi ) but no eligible target (all above ${AUTO_SWITCH_TARGET_MAX_PCT}%, under the ${AUTO_SWITCH_TARGET_MIN_LEFT_PCT}%-left floor, ended, dead, or unmeasured)"
         st_switch="no-target"
       fi
     fi
