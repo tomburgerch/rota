@@ -629,6 +629,33 @@ grep -E "auto-switch: .*→" "$RUN/cfg/keeper.log" | grep -q "REFUSED" \
   && ok "keeper refused claim → the log names REFUSED as the trigger, not a threshold" \
   || bad "keeper refused claim → trigger wording (log: $(cat "$RUN/cfg/keeper.log"))"
 
+# (t_9pzwxz) the keeper's claim set OFF-LIMITS (RESERVED): it moves the claim
+# off it with no percentage near the wall, so new launches stop landing there
+mk_pool kclaimreserved
+for rf_a in alpha primary wk team; do
+  usage_fixture "$rf_a" 30 10 "$(iso_in +2H)" "$(iso_in +3d)"
+  mv "$FAKE_STATE/usage-$(email_of "$rf_a").json" "$FAKE_STATE/usage-TOK-$rf_a.json"
+done
+printf 'owner=Ákos\nwhy=off-limits (set in Dazzle)\n' > "$RUN/.claude-pool/alpha/RESERVED"
+run_keeper "${keeper_env[@]}" CLAUDE_FAILOVER_USAGE_CMD=
+grep -q "switch=to:" "$RUN/cfg/keeper-status" \
+  && [ "$(jq -r '.oauthAccount.emailAddress' "$RUN/.claude.json")" != "$(email_of alpha)" ] \
+  && ok "keeper reserved claim → the keeper moves the claim OFF an off-limits seat at 30% used" \
+  || bad "keeper reserved claim → must leave it (status: $(cat "$RUN/cfg/keeper-status"), log: $OUT)"
+grep -E "auto-switch: .*→" "$RUN/cfg/keeper.log" | grep -q "RESERVED (off-limits, owner Ákos)" \
+  && ok "keeper reserved claim → the log names RESERVED and the owner as the trigger" \
+  || bad "keeper reserved claim → trigger wording (log: $(cat "$RUN/cfg/keeper.log"))"
+# an unreserved claim at 30% used stays put (the new trigger fires only on the marker)
+mk_pool kclaimfree
+for rf_a in alpha primary wk team; do
+  usage_fixture "$rf_a" 30 10 "$(iso_in +2H)" "$(iso_in +3d)"
+  mv "$FAKE_STATE/usage-$(email_of "$rf_a").json" "$FAKE_STATE/usage-TOK-$rf_a.json"
+done
+run_keeper "${keeper_env[@]}" CLAUDE_FAILOVER_USAGE_CMD=
+[ "$(jq -r '.oauthAccount.emailAddress' "$RUN/.claude.json")" = "$(email_of alpha)" ] \
+  && ok "keeper free claim → an unreserved claim under the wall is not moved" \
+  || bad "keeper free claim → moved without cause (status: $(cat "$RUN/cfg/keeper-status"))"
+
 # (review) a 200 with NO numbers does not clear a refusal (matches the engine)
 mk_pool knonumbers
 for rf_a in alpha primary wk team; do
