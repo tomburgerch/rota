@@ -1500,6 +1500,9 @@ main() {
       local j jwk jreset jends jpair jdeadline jkind jproj
       for j in "${!DIRS[@]}"; do
         [[ "${LABELS[$j]}" == "$claim" ]] && continue
+        # ⚠️ A RESERVED (off-limits) SEAT IS NEVER AN UNATTENDED TARGET: it is
+        # somebody else's seat, whatever quota it has left. tests/off-limits.test.sh.
+        seat_is_reserved "${LABELS[$j]}" "${DIRS[$j]}" && continue
         cred="${DIRS[$j]}/.credentials.json"
         cred_is_complete "$cred" || continue
         refresh_known_dead "${LABELS[$j]}" "$cred" && continue

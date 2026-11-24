@@ -66,6 +66,7 @@ rota <verb> [args]
   cred-guard             run the credential guard once
   cred-restore <seat>    restore <seat>'s credential from its backup
   reserve [args]         bare: list reserved seats; <seat> <owner> [why] to reserve; --release <seat>
+                         (Dazzle calls this "off-limits": signed in, never picked automatically)
   reconcile              rewrite the accounts file from the dirs' real identities
   normalize              untangle two pool dirs holding each other's seats
   pool-init              create ~/.claude-pool dirs + the accounts file from $CFG_DIR/accounts
